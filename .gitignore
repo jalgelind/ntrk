@@ -1,0 +1,15 @@
+# Build output: `make` here writes everything under out/, except the renderer,
+# which is built beside its source.
+out/
+ntrk_render
+
+.DS_Store
+
+# Local music for checking the importer and the replayer. These are other
+# people's work and are not this repository's to carry; see README.md. The
+# contents, not the directory itself -- git does not descend into an ignored
+# directory, so ignoring the directory would make testdata/.gitignore
+# permanently untrackable, and that file is where the rule is explained to
+# whoever drops a module in.
+testdata/*
+!testdata/.gitignore
