@@ -1,0 +1,10 @@
+# Nothing in here is committed, and that is deliberate rather than incidental:
+# these are other people's music. The repository's own rule is in README.md --
+# put modules here to check the importer and the replayer against real files,
+# and they stay on your machine.
+#
+# The root .gitignore already covers this directory. This file repeats it where
+# the files actually are, so the rule survives someone tidying that entry, and
+# so anyone dropping a module in can see the rule without going looking.
+*
+!.gitignore

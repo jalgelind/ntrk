@@ -1,0 +1,14 @@
+# Header-only, and authored here rather than synced -- the header sits at the
+# root of this directory instead of under source/, which is the only way this
+# differs from the vendored ones beside it.
+config("ntrk_public") {
+  include_dirs = [
+    "."
+  ]
+}
+
+source_set("ntrk") {
+  public_configs = [
+    ":ntrk_public"
+  ]
+}
