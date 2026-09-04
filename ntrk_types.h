@@ -251,6 +251,20 @@ const int kNoteOff = 97;
 // check SYNP already makes.
 const int kNameBytes = 22;
 
+// TUNE: how the grid is divided, and how far the odd rows of a pair are pushed.
+//
+// **Eight bytes, and the swing field is here from the first day even though no
+// player reads it until T50.** A block that grows a field later is a layout
+// change; one that gains a reader later is not — and swing zero is the straight
+// grid every file already has, so carrying it costs nothing.
+const int kTuneBytes = 8;
+
+// Q12, as MIXR's gain and width are: 4096 is one whole row. Bounded strictly
+// below half a row, because a swing that reached one would put the odd row on
+// top of the next one, which is not a groove but a missing row.
+const int kSwingUnit = 4096;
+const int kSwingMax = 2047;
+
 struct Instrument {
   const int8_t *data = nullptr;   // frames, into the file buffer or a built-in
   uint32_t length = 0;            // frames
@@ -463,6 +477,22 @@ struct Macro {
 
 struct Module {
   int version = 2;           // the only one; module_save refuses any other
+
+  // The tune's own division of its grid, out of an optional TUNE block. **A
+  // default rather than a sentinel**: four rows to a beat and sixteen to a bar
+  // is what a tracker means by a sixteenth, so a file with no block behaves as
+  // every file always has and an editor has a number to draw its bands from
+  // without asking whether one was set.
+  //
+  // A bar is a whole number of beats, checked at load — otherwise the two
+  // bands an editor draws cannot line up and one of them is lying.
+  int rows_per_beat = 4;
+  int rows_per_bar = 16;
+
+  // How far the odd row of a pair is pushed late, in kSwingUnit. **Nothing
+  // reads this yet.** It is carried so that the day a player learns swing, no
+  // file layout changes and no existing file means something different.
+  int swing = 0;
   int channels = 0;
   int rows = 0;              // per pattern
   int speed = 6;             // ticks per row

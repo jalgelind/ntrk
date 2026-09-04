@@ -5188,6 +5188,19 @@ test_describe_player_range() {
   check_bounded(ntrk::fxpl_repr, 0x4A, 0x80);
 }
 
+// The directory follows every positional block, so it is walked to rather than
+// guessed at.
+static size_t
+tune_directory_at(const ntrk::Module &m, const uint8_t *bytes) {
+  (void) bytes;
+  size_t at = (size_t) ntrk::kHeaderBytes + (size_t) m.order_count +
+              (size_t) m.instrument_count * (size_t) ntrk::kInstrumentBytes +
+              (size_t) m.pattern_count * (size_t) m.rows * (size_t) m.channels * 4u;
+  for (int i = 0; i < m.instrument_count; ++i)
+    at += (size_t) m.instruments[i].length * (m.instruments[i].bits == 16 ? 2u : 1u);
+  return at;
+}
+
 // ---- NAME -------------------------------------------------------------------
 
 static void
@@ -5286,6 +5299,94 @@ test_names() {
   CHECK(saw);
 }
 
+// ---- TUNE --------------------------------------------------------------------
+
+static void
+test_tune() {
+  printf("the grid division round-trips, and is critical only when it swings\n");
+
+  Spec s;
+  s.channels = 1;
+  s.rows = 8;
+  s.orders = 1;
+  s.patterns = 1;
+  s.sample_len = 32;
+  build(s);
+
+  // No block: the defaults are what a file has always meant.
+  ntrk::Module plain;
+  CHECK(ntrk::module_load(&plain, g_bytes, g_size));
+  CHECK(plain.rows_per_beat == 4);
+  CHECK(plain.rows_per_bar == 16);
+  CHECK(plain.swing == 0);
+  size_t plain_need = 0;
+  CHECK(ntrk::module_save(&plain, nullptr, 0, &plain_need));
+  CHECK(plain_need == g_size);          // and writes no block, so the file is unchanged
+
+  // Three in a bar, and a shuffle. 0.19 of a row is the deepest figure in the
+  // starter tunes, which is where the number comes from rather than taste.
+  ntrk::Module m = plain;
+  m.rows_per_beat = 6;
+  m.rows_per_bar = 18;
+  m.swing = (int) (0.19 * ntrk::kSwingUnit);
+
+  size_t need = 0;
+  CHECK(ntrk::module_save(&m, nullptr, 0, &need));
+  CHECK(need == plain_need + (size_t) ntrk::kDirectoryEntryBytes +
+                    (size_t) ntrk::kTuneBytes);
+  size_t wrote = 0;
+  CHECK(ntrk::module_save(&m, g_saved, sizeof g_saved, &wrote));
+
+  ntrk::Module back;
+  CHECK(ntrk::module_load(&back, g_saved, wrote));
+  CHECK(back.rows_per_beat == 6);
+  CHECK(back.rows_per_bar == 18);
+  CHECK(back.swing == m.swing);
+
+  // Swinging, so the block is CRITICAL: a reader that skipped it would play the
+  // tune straight and sound wrong with nothing to point at.
+  const size_t dir = tune_directory_at(back, g_saved);
+  bool saw = false;
+  const int blocks = (int) ntrk::read_u16(g_saved + 26);
+  for (int i = 0; i < blocks; ++i) {
+    const uint8_t *e = g_saved + dir + (size_t) i * (size_t) ntrk::kDirectoryEntryBytes;
+    if (ntrk::read_u16(e + 0) != ntrk::kBlockTune) continue;
+    saw = true;
+    CHECK((ntrk::read_u16(e + 2) & (uint16_t) ntrk::kBlockCritical) != 0u);
+  }
+  CHECK(saw);
+
+  // ...and NOT critical without one, because a division is drawn, not played.
+  ntrk::Module bars = plain;
+  bars.rows_per_bar = 8;
+  size_t w2 = 0;
+  CHECK(ntrk::module_save(&bars, g_saved, sizeof g_saved, &w2));
+  ntrk::Module b2;
+  CHECK(ntrk::module_load(&b2, g_saved, w2));
+  const size_t dir2 = tune_directory_at(b2, g_saved);
+  const int blocks2 = (int) ntrk::read_u16(g_saved + 26);
+  saw = false;
+  for (int i = 0; i < blocks2; ++i) {
+    const uint8_t *e = g_saved + dir2 + (size_t) i * (size_t) ntrk::kDirectoryEntryBytes;
+    if (ntrk::read_u16(e + 0) != ntrk::kBlockTune) continue;
+    saw = true;
+    CHECK((ntrk::read_u16(e + 2) & (uint16_t) ntrk::kBlockCritical) == 0u);
+  }
+  CHECK(saw);
+
+  // Every bound refuses on both sides, because a writer looser than its reader
+  // makes a file that will not load back.
+  ntrk::Module bad = plain;
+  size_t junk = 0;
+  bad.rows_per_beat = 0;   CHECK(!ntrk::module_save(&bad, nullptr, 0, &junk));
+  bad = plain; bad.rows_per_bar = 256;  CHECK(!ntrk::module_save(&bad, nullptr, 0, &junk));
+  // A bar that is not a whole number of beats: the two bands could not agree.
+  bad = plain; bad.rows_per_beat = 4; bad.rows_per_bar = 6;
+  CHECK(!ntrk::module_save(&bad, nullptr, 0, &junk));
+  bad = plain; bad.swing = ntrk::kSwingMax + 1;
+  CHECK(!ntrk::module_save(&bad, nullptr, 0, &junk));
+}
+
 int
 main(void) {
   test_loads();
@@ -5299,6 +5400,7 @@ main(void) {
   test_tremolo();
   test_save_round_trip();
   test_names();
+  test_tune();
   test_mute();
   test_seek();
   test_geometry_shrinks_under_player();

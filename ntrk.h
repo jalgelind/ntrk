@@ -195,7 +195,7 @@ const int kInstrumentBytes = 32;
 const int kDirectoryEntryBytes = 12;
 const int kMaxBlocks = 32;
 
-// Block ids. FXPL, NAME, SYNP, MACR and MIXR are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
+// Block ids. FXPL, NAME, SYNP, MACR, MIXR and TUNE are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
 // stays spent rather than reused so a file written against the older sketch
 // cannot be misread as something else. An id this reader does not know is
 // skipped when the file says it is optional and refused when it says it is
@@ -203,6 +203,7 @@ const int kMaxBlocks = 32;
 // later one.
 const uint16_t kBlockFxpl = 0x0001;
 const uint16_t kBlockName = 0x0002;
+const uint16_t kBlockTune = 0x0006;
 const uint16_t kBlockMacr = 0x0004;
 const uint16_t kBlockMixr = 0x0005;
 const uint16_t kBlockCritical = 0x0001;   // a directory entry's flags, bit 0
@@ -352,6 +353,8 @@ module_load(Module *module, const uint8_t *data, size_t size) {
   size_t synp_bytes = 0;
   const uint8_t *name = nullptr;
   size_t name_bytes = 0;
+  const uint8_t *tune = nullptr;
+  size_t tune_bytes = 0;
   const uint8_t *macr = nullptr;
   size_t macr_bytes = 0;
   for (int i = 0; i < block_count; ++i) {
@@ -411,6 +414,13 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // in either order.
       macr = data + offset;
       macr_bytes = (size_t) bytes;
+    } else if (id == kBlockTune) {
+      // Fixed size and self-contained -- it is judged against nothing else, so
+      // unlike NAME and SYNP it could be parsed here. It is parsed with them
+      // anyway, so that every optional block is validated in one place rather
+      // than half here and half below.
+      tune = data + offset;
+      tune_bytes = (size_t) bytes;
     } else if (id == kBlockName) {
       // Judged against the instrument count, which is parsed below -- the same
       // reason SYNP is checked there rather than here.
@@ -615,6 +625,29 @@ module_load(Module *module, const uint8_t *data, size_t size) {
     }
   }
 
+  // TUNE. Exact length, like every block here.
+  if (tune != nullptr) {
+    if (tune_bytes != (size_t) kTuneBytes)
+      return false;
+    if (read_u16(tune + 6) != 0u)             // reserved
+      return false;
+    const int rpbeat = (int) read_u16(tune + 0);
+    const int rpbar = (int) read_u16(tune + 2);
+    const int sw = (int) read_u16(tune + 4);
+    if (rpbeat < 1 || rpbeat > 255 || rpbar < 1 || rpbar > 255)
+      return false;
+    // **A bar is a whole number of beats.** Without this the beat band and the
+    // bar band an editor draws cannot agree, and one of them is wrong on every
+    // row where they cross.
+    if (rpbar % rpbeat != 0)
+      return false;
+    if (sw > kSwingMax)
+      return false;
+    module->rows_per_beat = rpbeat;
+    module->rows_per_bar = rpbar;
+    module->swing = sw;
+  }
+
   // NAME, once the instrument table has said how many instruments there are.
   // **Exact, like every other block** -- a block that disagrees with the count
   // is refused rather than read as far as it goes. Absent is legal and is the
@@ -717,6 +750,16 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   if (module->speed < 1 || module->speed > 31)
     return false;
   if (module->bpm < 32 || module->bpm > 255)
+    return false;
+  // The TUNE bounds, mirrored from the loader -- a writer stricter or looser
+  // than its reader breaks the round trip in one direction or the other.
+  if (module->rows_per_beat < 1 || module->rows_per_beat > 255)
+    return false;
+  if (module->rows_per_bar < 1 || module->rows_per_bar > 255)
+    return false;
+  if (module->rows_per_bar % module->rows_per_beat != 0)
+    return false;
+  if (module->swing < 0 || module->swing > kSwingMax)
     return false;
   if (module->order_count < 1 || module->order_count > 256)
     return false;
@@ -853,14 +896,18 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   // A NAME block is written only where a name is actually set. All-empty names
   // are what a module without one already has, so writing 22 zero bytes per
   // instrument would grow every file to say nothing.
+  // Written only where it says something the default does not.
+  const bool want_tune = module->rows_per_beat != 4 ||
+                         module->rows_per_bar != 16 || module->swing != 0;
+
   bool want_name = false;
   for (int i = 0; i < module->instrument_count && !want_name; ++i)
     if (module->instruments[i].name[0] != '\0')
       want_name = true;
 
-  const int block_count = (want_fx ? 1 : 0) + (want_name ? 1 : 0) +
-                          (want_synp ? 1 : 0) + (want_macr ? 1 : 0) +
-                          (want_mixr ? 1 : 0);
+  const int block_count = (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
+                          (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
+                          (want_macr ? 1 : 0) + (want_mixr ? 1 : 0);
   const size_t directory_bytes =
       (size_t) block_count * (size_t) kDirectoryEntryBytes;
   // Lanes rather than channels, and the four-byte prefix that says how many.
@@ -869,6 +916,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
                              (size_t) module_lanes(module);
   const size_t fx_bytes =
       want_fx ? (size_t) kFxplPrefixBytes + plane_cells * 2u : 0u;
+  const size_t tune_bytes = want_tune ? (size_t) kTuneBytes : 0u;
   const size_t name_bytes =
       want_name ? (size_t) module->instrument_count * (size_t) kNameBytes : 0u;
   const size_t synp_bytes =
@@ -880,7 +928,8 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const size_t mixr_bytes = want_mixr ? (size_t) kMixrBytes : 0u;
   const size_t total = (size_t) kHeaderBytes + order_bytes + instrument_bytes +
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
-                       name_bytes + synp_bytes + macr_bytes + mixr_bytes;
+                       tune_bytes + name_bytes + synp_bytes + macr_bytes +
+                       mixr_bytes;
 
   *written = total;
   if (out == nullptr)
@@ -999,6 +1048,27 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
       out[at + 1] = module->fx[i].param;
       at += 2;
     }
+  }
+
+  if (want_tune) {
+    // **Critical exactly when the swing is non-zero**, which is the rule every
+    // block here follows: a block is critical when its contents change what is
+    // heard. A division of the grid is drawn and not played, so a reader that
+    // skips it renders the tune correctly; a swing figure is played, so a
+    // reader that skips one would play the tune straight and sound wrong with
+    // nothing to point at.
+    write_u16(out + entry + 0, kBlockTune);
+    write_u16(out + entry + 2,
+              module->swing != 0 ? (uint16_t) kBlockCritical : (uint16_t) 0u);
+    write_u32(out + entry + 4, (uint32_t) at);
+    write_u32(out + entry + 8, (uint32_t) tune_bytes);
+    entry += (size_t) kDirectoryEntryBytes;
+
+    write_u16(out + at + 0, (uint16_t) module->rows_per_beat);
+    write_u16(out + at + 2, (uint16_t) module->rows_per_bar);
+    write_u16(out + at + 4, (uint16_t) module->swing);
+    write_u16(out + at + 6, 0u);
+    at += (size_t) kTuneBytes;
   }
 
   if (want_name) {
