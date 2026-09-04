@@ -1339,9 +1339,12 @@ test_v2_refusals() {
   CHECK(!ntrk::module_load(&m, g_bytes, g_size));
 
   // An unknown id is skipped when the file says the tune plays without it, and
-  // refused when it says it does not.
+  // refused when it says it does not. **0x7FFF rather than a low number**: this
+  // case used 0x0002 while that was reserved-and-unimplemented, and the day
+  // NAME claimed the id the case started asserting the opposite of what it
+  // says. A far id cannot be claimed out from under it.
   build_v2(s);
-  put_u16(v2_directory_at(s) + 0, 0x0002u);
+  put_u16(v2_directory_at(s) + 0, 0x7fffu);
   CHECK(ntrk::module_load(&m, g_bytes, g_size));
   CHECK(m.fx == NULL);
   put_u16(v2_directory_at(s) + 2, 1u);
@@ -5185,6 +5188,104 @@ test_describe_player_range() {
   check_bounded(ntrk::fxpl_repr, 0x4A, 0x80);
 }
 
+// ---- NAME -------------------------------------------------------------------
+
+static void
+test_names() {
+  printf("instrument names round-trip, and are optional\n");
+
+  Spec s;
+  s.channels = 2;
+  s.rows = 8;
+  s.patterns = 1;
+  s.orders = 1;
+  s.instruments = 3;      // the names below are set on two of them
+  s.sample_len = 32;
+  build(s);
+
+  // A file with no NAME block: every name is empty, and saving writes none --
+  // so the round trip is byte-identical to the module that never had one.
+  ntrk::Module plain;
+  CHECK(ntrk::module_load(&plain, g_bytes, g_size));
+  CHECK(plain.instruments[0].name[0] == '\0');
+  size_t plain_need = 0;
+  CHECK(ntrk::module_save(&plain, nullptr, 0, &plain_need));
+  // NOT compared against g_size: these instruments share one sample, and
+  // `module_save` rebuilds the blob from what each points at, so a shared
+  // buffer is written once per instrument. The claim that matters is the
+  // delta below -- a nameless module carries no NAME block at all.
+
+  // Now name two of them. One short, one exactly kNameBytes long with no room
+  // for a terminator in the file -- which is the case that catches a writer
+  // emitting the in-memory NUL, and a reader trusting one.
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+  const char *shortn = "kick";
+  const char *fulln = "0123456789012345678901";   // 22 characters exactly
+  CHECK((int) strlen(fulln) == ntrk::kNameBytes);
+  for (int k = 0; k < (int) strlen(shortn); ++k) m.instruments[0].name[k] = shortn[k];
+  for (int k = 0; k < ntrk::kNameBytes; ++k) m.instruments[1].name[k] = fulln[k];
+
+  size_t need = 0;
+  CHECK(ntrk::module_save(&m, nullptr, 0, &need));
+  // Exactly one directory entry and one payload more than the nameless file.
+  CHECK(need == plain_need + (size_t) ntrk::kDirectoryEntryBytes +
+                    (size_t) m.instrument_count * (size_t) ntrk::kNameBytes);
+
+  size_t wrote = 0;
+  CHECK(ntrk::module_save(&m, g_saved, sizeof g_saved, &wrote));
+  CHECK(wrote == need);
+
+  ntrk::Module back;
+  CHECK(ntrk::module_load(&back, g_saved, wrote));
+  CHECK(strcmp(back.instruments[0].name, "kick") == 0);
+  CHECK(strcmp(back.instruments[1].name, fulln) == 0);
+  CHECK(back.instruments[2].name[0] == '\0');
+  // The full-width name is terminated in memory even though the file's field
+  // is not -- a reader that forgot would run into the next record.
+  CHECK(back.instruments[1].name[ntrk::kNameBytes] == '\0');
+
+  // Saving what was loaded is byte-identical, so names survive any number of
+  // round trips rather than only the first.
+  static uint8_t again[sizeof g_saved];
+  size_t wrote2 = 0;
+  CHECK(ntrk::module_save(&back, again, sizeof again, &wrote2));
+  CHECK(wrote2 == wrote);
+  CHECK(memcmp(again, g_saved, wrote) == 0);
+
+  // The block is OPTIONAL, and that is the whole point of the id: a reader
+  // that does not know NAME must skip it and play the tune. Assert the flag
+  // rather than the intent.
+  const int blocks = (int) ntrk::read_u16(g_saved + 26);
+  // The directory follows every positional block -- order, instruments,
+  // patterns, then the sample blob -- so it is found by walking, not guessed.
+  size_t dir = (size_t) ntrk::kHeaderBytes + (size_t) back.order_count +
+               (size_t) back.instrument_count * (size_t) ntrk::kInstrumentBytes +
+               (size_t) back.pattern_count * (size_t) back.rows *
+                   (size_t) back.channels * 4u;
+  for (int i = 0; i < back.instrument_count; ++i)
+    dir += (size_t) back.instruments[i].length *
+           (back.instruments[i].bits == 16 ? 2u : 1u);
+  bool saw = false;
+  for (int i = 0; i < blocks; ++i) {
+    const uint8_t *e = g_saved + dir + (size_t) i * (size_t) ntrk::kDirectoryEntryBytes;
+    if (ntrk::read_u16(e + 0) != ntrk::kBlockName)
+      continue;
+    saw = true;
+    CHECK((ntrk::read_u16(e + 2) & (uint16_t) ntrk::kBlockCritical) == 0u);
+
+    // A length that disagrees with the instrument count is refused, not read
+    // as far as it goes -- the rule every other block here is held to.
+    static uint8_t bad[sizeof g_saved];
+    memcpy(bad, g_saved, wrote);
+    uint8_t *be = bad + (dir + (size_t) i * (size_t) ntrk::kDirectoryEntryBytes);
+    ntrk::write_u32(be + 8, (uint32_t) (ntrk::read_u32(be + 8) - ntrk::kNameBytes));
+    ntrk::Module refused;
+    CHECK(!ntrk::module_load(&refused, bad, wrote));
+  }
+  CHECK(saw);
+}
+
 int
 main(void) {
   test_loads();
@@ -5197,6 +5298,7 @@ main(void) {
   test_slides();
   test_tremolo();
   test_save_round_trip();
+  test_names();
   test_mute();
   test_seek();
   test_geometry_shrinks_under_player();

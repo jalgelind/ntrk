@@ -195,14 +195,14 @@ const int kInstrumentBytes = 32;
 const int kDirectoryEntryBytes = 12;
 const int kMaxBlocks = 32;
 
-// Block ids. FXPL, SYNP, MACR and MIXR are understood; 0x0002 NAME is reserved, and
-// so is 0x0010 AUTO — automation lanes were what MACR replaced, and the id
+// Block ids. FXPL, NAME, SYNP, MACR and MIXR are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
 // stays spent rather than reused so a file written against the older sketch
 // cannot be misread as something else. An id this reader does not know is
 // skipped when the file says it is optional and refused when it says it is
 // critical, which is how this reader stays honest against a file written by a
 // later one.
 const uint16_t kBlockFxpl = 0x0001;
+const uint16_t kBlockName = 0x0002;
 const uint16_t kBlockMacr = 0x0004;
 const uint16_t kBlockMixr = 0x0005;
 const uint16_t kBlockCritical = 0x0001;   // a directory entry's flags, bit 0
@@ -350,6 +350,8 @@ module_load(Module *module, const uint8_t *data, size_t size) {
   int seen_count = 0;
   const uint8_t *synp = nullptr;
   size_t synp_bytes = 0;
+  const uint8_t *name = nullptr;
+  size_t name_bytes = 0;
   const uint8_t *macr = nullptr;
   size_t macr_bytes = 0;
   for (int i = 0; i < block_count; ++i) {
@@ -409,6 +411,11 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // in either order.
       macr = data + offset;
       macr_bytes = (size_t) bytes;
+    } else if (id == kBlockName) {
+      // Judged against the instrument count, which is parsed below -- the same
+      // reason SYNP is checked there rather than here.
+      name = data + offset;
+      name_bytes = (size_t) bytes;
     } else if (id == kBlockSynp) {
       // The payload is already inside the file -- that was the subtraction two
       // checks up, and it ran before this pointer was formed. Its *length* can
@@ -605,6 +612,23 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       ins.length = (uint32_t) kBuiltinWaveFrames;
       ins.loop_start = 0;
       ins.loop_len = (uint32_t) kBuiltinWaveFrames;
+    }
+  }
+
+  // NAME, once the instrument table has said how many instruments there are.
+  // **Exact, like every other block** -- a block that disagrees with the count
+  // is refused rather than read as far as it goes. Absent is legal and is the
+  // normal case: every instrument keeps the empty name it was born with.
+  if (name != nullptr) {
+    if (name_bytes != (size_t) module->instrument_count * (size_t) kNameBytes)
+      return false;
+    for (int i = 0; i < module->instrument_count; ++i) {
+      const uint8_t *src = name + (size_t) i * (size_t) kNameBytes;
+      for (int k = 0; k < kNameBytes; ++k)
+        module->instruments[i].name[k] = (char) src[k];
+      // The field is fixed-width and not NUL-terminated in the file; the extra
+      // byte here is what makes it a C string.
+      module->instruments[i].name[kNameBytes] = '\0';
     }
   }
 
@@ -825,8 +849,18 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const bool want_synp = synth_count > 0;
   const bool want_macr = module->macro_count > 0;
   const bool want_mixr = module->has_mix;
-  const int block_count = (want_fx ? 1 : 0) + (want_synp ? 1 : 0) +
-                          (want_macr ? 1 : 0) + (want_mixr ? 1 : 0);
+
+  // A NAME block is written only where a name is actually set. All-empty names
+  // are what a module without one already has, so writing 22 zero bytes per
+  // instrument would grow every file to say nothing.
+  bool want_name = false;
+  for (int i = 0; i < module->instrument_count && !want_name; ++i)
+    if (module->instruments[i].name[0] != '\0')
+      want_name = true;
+
+  const int block_count = (want_fx ? 1 : 0) + (want_name ? 1 : 0) +
+                          (want_synp ? 1 : 0) + (want_macr ? 1 : 0) +
+                          (want_mixr ? 1 : 0);
   const size_t directory_bytes =
       (size_t) block_count * (size_t) kDirectoryEntryBytes;
   // Lanes rather than channels, and the four-byte prefix that says how many.
@@ -835,6 +869,8 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
                              (size_t) module_lanes(module);
   const size_t fx_bytes =
       want_fx ? (size_t) kFxplPrefixBytes + plane_cells * 2u : 0u;
+  const size_t name_bytes =
+      want_name ? (size_t) module->instrument_count * (size_t) kNameBytes : 0u;
   const size_t synp_bytes =
       want_synp ? (size_t) synth_count * (size_t) kSynthParamBytes : 0u;
   const size_t macr_bytes =
@@ -844,7 +880,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const size_t mixr_bytes = want_mixr ? (size_t) kMixrBytes : 0u;
   const size_t total = (size_t) kHeaderBytes + order_bytes + instrument_bytes +
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
-                       synp_bytes + macr_bytes + mixr_bytes;
+                       name_bytes + synp_bytes + macr_bytes + mixr_bytes;
 
   *written = total;
   if (out == nullptr)
@@ -962,6 +998,29 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
       out[at + 0] = module->fx[i].cmd;
       out[at + 1] = module->fx[i].param;
       at += 2;
+    }
+  }
+
+  if (want_name) {
+    // **Not critical, and that is the whole point of the id.** A reader that
+    // does not know NAME skips it and plays the tune correctly, because a name
+    // changes nothing that is heard.
+    write_u16(out + entry + 0, kBlockName);
+    write_u16(out + entry + 2, 0u);
+    write_u32(out + entry + 4, (uint32_t) at);
+    write_u32(out + entry + 8, (uint32_t) name_bytes);
+    entry += (size_t) kDirectoryEntryBytes;
+
+    // One fixed-width record per instrument, in instrument order -- which is
+    // the only thing binding a name to an instrument, so the loop that reads
+    // them and this one have to walk the table the same way. The in-memory
+    // field carries a NUL the file's does not, so only the first kNameBytes go
+    // out and a short name is zero-padded to the width.
+    for (int i = 0; i < module->instrument_count; ++i) {
+      const char *nm = module->instruments[i].name;
+      for (int k = 0; k < kNameBytes; ++k)
+        out[at + (size_t) k] = (uint8_t) nm[k];
+      at += (size_t) kNameBytes;
     }
   }
 

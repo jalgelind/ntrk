@@ -240,6 +240,17 @@ enum class EnvStage : uint8_t {
 // ignored as a stray byte. A v1 file cannot name it; 98..255 are reserved.
 const int kNoteOff = 97;
 
+// How many bytes an instrument name occupies in a NAME block.
+//
+// **Twenty-two because that is what a tracker name has always been** -- it is
+// ProTracker's sample-name field and XM's instrument-name field alike, so an
+// importer that starts preserving names has somewhere to put them that is
+// exactly the right size, and a name that survived a `.mod` round trip through
+// another program still fits. Fixed width rather than counted: the block's
+// length is then one multiply against the instrument count, which is the same
+// check SYNP already makes.
+const int kNameBytes = 22;
+
 struct Instrument {
   const int8_t *data = nullptr;   // frames, into the file buffer or a built-in
   uint32_t length = 0;            // frames
@@ -283,6 +294,21 @@ struct Instrument {
   uint8_t synth_dist = 0;
   uint8_t synth_dist_mix = 0;
   uint8_t synth_wave = 0;
+
+  // The instrument's name, out of an optional NAME block, and **copied rather
+  // than pointed at** for the reason the SYNP record is: twenty-two bytes is
+  // cheaper to copy once than to bounds-check at every use.
+  //
+  // `kNameBytes + 1`, and the extra byte is always zero, so this is directly
+  // usable as a C string -- the file's field is fixed-width and NOT
+  // NUL-terminated, and a reader that forgot would run into the next name.
+  // Empty on every instrument of a file that carries no block.
+  //
+  // **The bytes are whatever the file said.** A `.mod` name is Latin-1 or
+  // somebody's ASCII art, so this is not guaranteed to be UTF-8 and a caller
+  // that draws it has to say what it does about that -- the format has no
+  // business having an opinion on an encoding.
+  char name[kNameBytes + 1] = {};
 };
 
 // One cell. Four bytes, because that is what a pattern is mostly made of and a
@@ -378,6 +404,7 @@ const int kMixrSlotBytes = 2 + kMixrSlotParams * 2;
 const int kMixrHeaderBytes = 8;
 const int kMixrBytes = kMixrHeaderBytes + kMixrSlots * kMixrSlotBytes;
 const int kMixrQUnit = 4096;       // Q12: what 1.0 is stored as
+
 
 // A macro's `flags`. Everything above bit 0 is reserved and a file that sets
 // any of it is refused, so those bits stay free to mean something.
