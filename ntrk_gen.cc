@@ -153,6 +153,16 @@ static const int kRiffSteps = (int) (sizeof(kRiff) / sizeof(kRiff[0]));
 // `note_max` changes in the tick path.
 static const uint8_t kLeadNotes[8] = { 37, 44, 49, 44, 52, 49, 44, 37 };
 
+// Copy a name into an instrument's fixed-width field. The field is not
+// NUL-terminated in the file and the in-memory one carries a terminator the
+// writer does not emit, so a name of exactly kNameBytes is a real case and this
+// has to stop at the width rather than at the NUL.
+static void
+set_name(ntrk::Instrument *ins, const char *text) {
+  for (int i = 0; i < ntrk::kNameBytes && text[i] != '\0'; ++i)
+    ins->name[i] = text[i];
+}
+
 static void
 build_instruments(ntrk::Module *m) {
   // 1 — the 303. Enough resonance and env mod that the ladder is doing the
@@ -238,6 +248,16 @@ build_instruments(ntrk::Module *m) {
   pcm->env_release_ms = 140;
   pcm->filter_cutoff_hz = 1400;
   pcm->filter_res = 180;
+
+  // NAME, on every instrument, and one of them exactly kNameBytes long -- the
+  // width case a shorter set would never reach. These are also what an editor's
+  // instrument list draws, so the coverage module doubles as the fixture that
+  // proves names are wired end to end rather than only in a unit test.
+  set_name(&m->instruments[kInsBass - 1], "303 bass");
+  set_name(&m->instruments[kInsKick - 1], "kick");
+  set_name(&m->instruments[kInsHat - 1], "hihat");
+  set_name(&m->instruments[kInsWave - 1], "wavetable pluck");
+  set_name(&m->instruments[kInsPcm - 1], "0123456789012345678901");
 }
 
 // **The macro is the whole reason a meta lane is here**, and the two records
@@ -369,6 +389,15 @@ main(int argc, char **argv) {
   module.instrument_count = kInsCount;
   module.restart = 0;
   module.note_max = ntrk::kMaxNote;
+
+  // TUNE, with a division that is not the default, so the block is written and
+  // the loader's "a bar is a whole number of beats" rule is exercised by a file
+  // rather than only by a unit test. Swing stays zero: no player reads it yet,
+  // and a non-zero one here would make this module critical for readers that
+  // are otherwise entitled to skip the block.
+  module.rows_per_beat = 8;
+  module.rows_per_bar = 32;
+  module.swing = 0;
   module.fx_columns = kFxColumns;
   module.meta_columns = kMetaColumns;
   module.order = g_order;
