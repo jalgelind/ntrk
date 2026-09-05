@@ -478,23 +478,54 @@ mixr_unit(float v) {
 
 }  // namespace
 
-FxKind
-config_slot_kind(const uint8_t *block, int slot) {
-  if (block == nullptr || slot < 0 || slot >= kMixrSlots)
-    return FxKind::kNone;
-  // The same header check the reader makes, so the two cannot come to disagree
-  // about which blocks are readable.
+namespace {
+
+// Whether a block is one `mixer_config_read` would accept. **Asked before every
+// read below**, so an editor cannot draw a value out of a file the player will
+// refuse whole -- which would describe a mixer nobody can hear.
+bool
+config_readable(const uint8_t *block) {
+  if (block == nullptr)
+    return false;
   if (ntrk::read_u16(block) != (uint16_t) kMixrVersion ||
       ntrk::read_u16(block + 2) != (uint16_t) kMixrSlots)
-    return FxKind::kNone;
-  const uint8_t kind = block[kMixrHeaderBytes + slot * kMixrSlotBytes];
-  // `mixer_config_read` refuses the WHOLE block when any slot names an effect
-  // this build has not got, so a caller drawing one slot must not report a kind
-  // out of a block the player will reject.
+    return false;
   for (int i = 0; i < kMixrSlots; ++i)
     if (block[kMixrHeaderBytes + i * kMixrSlotBytes] > (uint8_t) FxKind::kReverb)
-      return FxKind::kNone;
-  return (FxKind) kind;
+      return false;
+  return true;
+}
+
+}  // namespace
+
+FxKind
+config_slot_kind(const uint8_t *block, int slot) {
+  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots)
+    return FxKind::kNone;
+  return (FxKind) block[kMixrHeaderBytes + slot * kMixrSlotBytes];
+}
+
+float
+config_slot_param(const uint8_t *block, int slot, int param) {
+  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots || param < 0 ||
+      param >= kMixrSlotParams)
+    return 0.f;
+  const uint8_t *r = block + kMixrHeaderBytes + slot * kMixrSlotBytes;
+  return (float) ntrk::read_u16(r + 2 + param * 2) / 65535.f;
+}
+
+float
+config_master_gain(const uint8_t *block) {
+  if (!config_readable(block))
+    return 1.f;
+  return (float) ntrk::read_u16(block + 4) / (float) kMixrQUnit;
+}
+
+float
+config_width(const uint8_t *block) {
+  if (!config_readable(block))
+    return 1.f;
+  return (float) ntrk::read_u16(block + 6) / (float) kMixrQUnit;
 }
 
 bool

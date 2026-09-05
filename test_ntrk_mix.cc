@@ -3229,6 +3229,51 @@ test_config_slot_kind_reads_without_a_mixer() {
     CHECK(mix::config_slot_kind(&bad, i) == mix::FxKind::kNone);
 }
 
+static void
+test_config_reads_params_without_a_mixer() {
+  printf("a slot's parameters and the master read back without a mixer\n");
+
+  static mix::Mixer a;
+  mixr_configure(&a);
+  a.send[0].param[0] = 0.25f;
+  mix::slot_set_kind(&a.send[0], a.send[0].kind);   // base takes the value
+  a.master_gain = 0.5f;
+  a.width = 0.75f;
+
+  Module m;
+  mix::mixer_config_write(&a, &m);
+
+  // **Agrees with the reader, parameter for parameter.** An editor drawing a
+  // slot's knobs must not describe a different mixer from the one the player
+  // will build.
+  static mix::Mixer b;
+  mix::mixer_reset(&b);
+  CHECK(mix::mixer_config_read(&b, &m));
+  for (int s = 0; s < kMixrSlots; ++s)
+    for (int p = 0; p < kMixrSlotParams; ++p)
+      CHECK(fabsf(mix::config_slot_param(&m, s, p) -
+                  mix::mixr_slot_at(&b, s)->base[p]) < 2.f / 65534.f);
+
+  CHECK(fabsf(mix::config_master_gain(&m) - b.master_gain) < 1.f / 1000.f);
+  CHECK(fabsf(mix::config_width(&m) - b.width) < 1.f / 1000.f);
+
+  // Out of range answers zero rather than reading past the record.
+  CHECK(mix::config_slot_param(&m, -1, 0) == 0.f);
+  CHECK(mix::config_slot_param(&m, kMixrSlots, 0) == 0.f);
+  CHECK(mix::config_slot_param(&m, 0, -1) == 0.f);
+  CHECK(mix::config_slot_param(&m, 0, kMixrSlotParams) == 0.f);
+
+  // A module with no block, and a block the reader would refuse: nothing is
+  // described, because describing it would name a mixer nobody can hear.
+  Module bare;
+  CHECK(mix::config_slot_param(&bare, 0, 0) == 0.f);
+  Module bad = m;
+  bad.mix[kMixrHeaderBytes] = 200u;
+  CHECK(mix::config_slot_param(&bad, 0, 0) == 0.f);
+  CHECK(mix::config_master_gain(&bad) == 1.f);
+  CHECK(mix::config_width(&bad) == 1.f);
+}
+
 int
 main(void) {
   test_bypass_is_render_add();
@@ -3276,6 +3321,7 @@ main(void) {
   test_mixr_refuses_an_unknown_kind();
   test_mixr_writes_the_setting_not_the_slide();
   test_config_slot_kind_reads_without_a_mixer();
+  test_config_reads_params_without_a_mixer();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

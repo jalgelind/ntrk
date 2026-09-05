@@ -625,11 +625,40 @@ bool mixer_config_read(Mixer *mx, const uint8_t *block);
 // describing a tune nobody can hear.
 FxKind config_slot_kind(const uint8_t *block, int slot);
 
+// One saved parameter of a saved slot, 0..1, without building a mixer.
+//
+// The sibling of `config_slot_kind` and for the same reason: an editor drawing
+// a slot's eight knobs would otherwise instantiate a `Mixer` to read sixteen
+// bytes back out of it. Answers 0 for a block the reader would refuse, so an
+// editor cannot draw a value out of a file the player will not load.
+float config_slot_param(const uint8_t *block, int slot, int param);
+
+// The master gain and the stereo width the block carries, 0..1 and 0..1.
+float config_master_gain(const uint8_t *block);
+float config_width(const uint8_t *block);
+
 // The same, for a module: `kNone` when it carries no `MIXR` block at all.
 inline FxKind
 config_slot_kind(const ntrk::Module *module, int slot) {
   return module != nullptr && module->has_mix ? config_slot_kind(module->mix, slot)
                                               : FxKind::kNone;
+}
+
+inline float
+config_slot_param(const ntrk::Module *module, int slot, int param) {
+  return module != nullptr && module->has_mix
+             ? config_slot_param(module->mix, slot, param)
+             : 0.f;
+}
+
+inline float
+config_master_gain(const ntrk::Module *module) {
+  return module != nullptr && module->has_mix ? config_master_gain(module->mix) : 1.f;
+}
+
+inline float
+config_width(const ntrk::Module *module) {
+  return module != nullptr && module->has_mix ? config_width(module->mix) : 1.f;
 }
 
 // The mirror: the mixer's current configuration into `module->mix`, and
