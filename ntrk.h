@@ -2533,6 +2533,27 @@ player_run_end(Player *player, int run) {
     player->until_tick -= (double) run;
 }
 
+// Walk every sounding voice `run` frames and throw the samples away.
+//
+// **One copy, called by both skip paths.** `render_add` keeps its own walk
+// because it needs each value to mix; these two need only the state the walk
+// leaves behind, and two copies of "what a frame does to a voice" is precisely
+// the drift T52 was warned about.
+inline void
+player_walk_run(Player *player, int run) {
+  const Module *m = player->module;
+  for (int i = 0; i < run; ++i) {
+    for (int c = 0; c < m->channels; ++c) {
+      Channel *ch = &player->channels[c];
+      if (ch->instrument <= 0)
+        continue;
+      // Muted channels are walked too, exactly as in `render_add` -- a channel
+      // that stopped being read would freeze and jump back in when unmuted.
+      (void) channel_sample(ch, m->instruments[ch->instrument - 1]);
+    }
+  }
+}
+
 // ---- Advancing without rendering (T52) -------------------------------------
 //
 // **The same loop `render_add` runs, with the audio half not written.** It calls
@@ -2565,23 +2586,12 @@ player_skip(Player *player, double rate, int frames) {
   if (frames <= 0)
     return;
 
-  const Module *m = player->module;
   int frame = 0;
   while (frame < frames) {
     const int run = player_run_begin(player, rate, frames - frame);
     if (run == 0)
       return;
-    for (int i = 0; i < run; ++i) {
-      for (int c = 0; c < m->channels; ++c) {
-        Channel *ch = &player->channels[c];
-        if (ch->instrument <= 0)
-          continue;
-        // The value is discarded; the state it advances is the whole reason
-        // this is here. Muted channels are walked too, exactly as they are in
-        // `render_add` -- a channel that stopped being read would freeze.
-        (void) channel_sample(ch, m->instruments[ch->instrument - 1]);
-      }
-    }
+    player_walk_run(player, run);
     frame += run;
     player_run_end(player, run);
   }
@@ -2618,14 +2628,7 @@ player_skip_to(Player *player, double rate, int order, int row,
     const int run = player_run_begin(player, rate, kMaxBlock);
     if (run == 0)
       return false;
-    for (int i = 0; i < run; ++i) {
-      for (int c = 0; c < m->channels; ++c) {
-        Channel *ch = &player->channels[c];
-        if (ch->instrument <= 0)
-          continue;
-        (void) channel_sample(ch, m->instruments[ch->instrument - 1]);
-      }
-    }
+    player_walk_run(player, run);
     player_run_end(player, run);
   }
   return false;
