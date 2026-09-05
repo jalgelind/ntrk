@@ -1267,6 +1267,26 @@ player_start(Player *player, const Module *module) {
   player->until_tick = 0.0;
 }
 
+// Set the host's loop over an inclusive range of order entries, or clear it with
+// any negative argument. Refuses a range the module does not have rather than
+// clamping: a caller that asked for one it has not got has a bug, and a clamped
+// loop would hide it behind a section that plays the wrong bars.
+inline bool
+player_loop_range(Player *player, int first, int last) {
+  if (player == nullptr || player->module == nullptr)
+    return false;
+  if (first < 0 || last < 0) {
+    player->loop_first = -1;
+    player->loop_last = -1;
+    return true;
+  }
+  if (first > last || last >= player->module->order_count)
+    return false;
+  player->loop_first = first;
+  player->loop_last = last;
+  return true;
+}
+
 inline void
 player_stop(Player *player) {
   player->playing = false;
@@ -2294,6 +2314,17 @@ player_advance(Player *player) {
       player->row = 0;
       player->order++;
     }
+  }
+
+  // **The host's loop, and it wins over everything above.** A `Bxx` that jumps
+  // out of the section, a `Dxx` break at its last row, and the ordinary walk off
+  // the end all land here, and a section a jump could escape is not a section.
+  // Checked before the end-of-song wrap so a range ending on the last entry
+  // loops rather than restarting the tune.
+  if (player->loop_last >= 0 &&
+      (player->order > player->loop_last || player->order < player->loop_first)) {
+    player->order = player->loop_first;
+    player->row = 0;
   }
 
   if (player->order >= m->order_count) {

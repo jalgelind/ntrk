@@ -684,6 +684,20 @@ struct Player {
   Channel channels[kMaxChannels];
   bool playing = false;
   bool loop = true;          // start the tune again rather than stopping
+
+  // A host's loop over a range of the ORDER LIST, inclusive, or -1 for none.
+  //
+  // **Looping by not advancing, which is why this is not `player_seek` in a
+  // wrapper.** A seek resets speed and tempo to the module's own — they are
+  // things a tune *sets* with Fxx as it plays, so where they stand at a row is
+  // a function of every row before it — and a loop built on one is a section
+  // that will not hold its own tempo, wrong every time round. Not advancing
+  // past the end touches neither.
+  //
+  // Cleared by `player_start`, unlike `muted`: an order index names a position
+  // in one module and means nothing in the next.
+  int loop_first = -1;
+  int loop_last = -1;
   float gain = 0.7f;
 
   // **Both of these are for an editor and inert in a replay-only build.**

@@ -5299,6 +5299,101 @@ test_names() {
   CHECK(saw);
 }
 
+// ---- T51, the host's loop over an order range ---------------------------------
+
+static void
+test_loop_range() {
+  printf("a looped range repeats without seeking, and keeps its tempo\n");
+
+  // Four orders, each its own pattern with its own note, so where the player is
+  // is audible in the bytes rather than only visible in a field.
+  Spec s;
+  s.channels = 1;
+  s.rows = 4;
+  s.orders = 4;
+  s.patterns = 4;
+  s.sample_len = 32;
+  build(s);
+  for (int p = 0; p < 4; ++p) {
+    g_bytes[32u + (size_t) p] = (uint8_t) p;                      // order[p] -> pattern p
+    const size_t at = patterns_at(s) +
+                      (size_t) p * (size_t) s.rows * (size_t) s.channels * 4u;
+    g_bytes[at + 0] = (uint8_t) (13 + p * 5);                     // a note per pattern
+    g_bytes[at + 1] = 1u;
+  }
+
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+
+  ntrk::Player p0;
+  ntrk::player_start(&p0, &m);
+  // A range the module has not got is refused rather than clamped: a caller
+  // that asked for one has a bug, and a clamp would hide it behind a section
+  // that plays the wrong bars.
+  CHECK(!ntrk::player_loop_range(&p0, 1, 4));
+  CHECK(!ntrk::player_loop_range(&p0, 2, 1));
+  CHECK(ntrk::player_loop_range(&p0, 1, 2));
+  CHECK(p0.loop_first == 1);
+  CHECK(ntrk::player_loop_range(&p0, -1, -1));
+  CHECK(p0.loop_last == -1);
+
+  // player_start clears it -- an order index names a position in one module.
+  CHECK(ntrk::player_loop_range(&p0, 1, 2));
+  ntrk::player_start(&p0, &m);
+  CHECK(p0.loop_first == -1);
+
+  // THE GATE: rendering past the end of the range is the range again, sample
+  // for sample. Orders 1 and 2 are eight rows between them.
+  ntrk::Player pa;
+  ntrk::player_start(&pa, &m);
+  pa.order = 1;
+  CHECK(ntrk::player_loop_range(&pa, 1, 2));
+
+  const double per_row = ntrk::frames_per_tick(&pa, 48000.0) * (double) m.speed;
+  const int n = (int) (per_row * (double) (2 * s.rows));
+
+  static double a[300000];
+  static double b[300000];
+  CHECK((size_t) n * 2u <= sizeof a / sizeof a[0]);
+
+  for (int i = 0; i < n * 2; ++i) a[i] = 0.0;
+  ntrk::render_add(&pa, a, n, 2, 48000.f);          // one lap of the range
+  const int speed_lap = pa.speed;
+  const int bpm_lap = pa.bpm;
+  for (int i = 0; i < n * 2; ++i) b[i] = 0.0;
+  ntrk::render_add(&pa, b, n, 2, 48000.f);          // the next, across the wrap
+
+  CHECK(memcmp(a, b, (size_t) n * 2u * sizeof(double)) == 0);
+
+  // The tempo is untouched across the wrap, which is the whole reason this is
+  // not player_seek in a wrapper: a seek resets both to the module's own.
+  CHECK(pa.speed == speed_lap);
+  CHECK(pa.bpm == bpm_lap);
+  CHECK(pa.order >= 1 && pa.order <= 2);
+
+  // **The negative control**, so the assertions above are about the loop and not
+  // about a tune that never moves. One lap without a range walks out the far
+  // side into order 3; with one, the same render is back at the range's start.
+  // Compared after ONE lap on purpose: the module's own `loop` wraps a
+  // rangeless player around the whole song, so after two it is back inside
+  // [1,2] by coincidence and the check would pass while testing nothing.
+  ntrk::Player pn;
+  ntrk::player_start(&pn, &m);
+  pn.order = 1;
+  static double c[300000];
+  for (int i = 0; i < n * 2; ++i) c[i] = 0.0;
+  ntrk::render_add(&pn, c, n, 2, 48000.f);
+  CHECK(pn.order == 3);
+
+  ntrk::Player pr;
+  ntrk::player_start(&pr, &m);
+  pr.order = 1;
+  CHECK(ntrk::player_loop_range(&pr, 1, 2));
+  for (int i = 0; i < n * 2; ++i) c[i] = 0.0;
+  ntrk::render_add(&pr, c, n, 2, 48000.f);
+  CHECK(pr.order == 1);
+}
+
 // ---- TUNE --------------------------------------------------------------------
 
 static void
@@ -5401,6 +5496,7 @@ main(void) {
   test_save_round_trip();
   test_names();
   test_tune();
+  test_loop_range();
   test_mute();
   test_seek();
   test_geometry_shrinks_under_player();
