@@ -5201,6 +5201,114 @@ tune_directory_at(const ntrk::Module &m, const uint8_t *bytes) {
   return at;
 }
 
+// ---- the module field table ---------------------------------------------------
+
+static void
+test_module_param_table() {
+  printf("every module field names itself, and one written past its range is refused\n");
+
+  CHECK(ntrk::module_param_count() == (int) ntrk::ModParam::kCount);
+  CHECK(ntrk::module_param_at(-1) == NULL);
+  CHECK(ntrk::module_param_at(ntrk::module_param_count()) == NULL);
+  for (int id = 0; id < ntrk::module_param_count(); ++id) {
+    const ntrk::ModParamInfo *info = ntrk::module_param_at(id);
+    CHECK(info != NULL && info->name != NULL && info->name[0] != '\0');
+    CHECK(info->lo <= info->hi);
+  }
+
+  RtSpec s;
+  s.channels = 4;
+  size_t need = 0;
+
+  // A restart names an entry of THIS order list, so its ceiling follows the
+  // list rather than sitting at a constant.
+  {
+    ntrk::Module m;
+    rt_build(&m, s);
+    int lo = 0, hi = 0;
+    ntrk::module_param_range(&m, (int) ntrk::ModParam::kRestart, &lo, &hi);
+    CHECK(lo == 0);
+    CHECK(hi == m.order_count - 1);
+    // ...and with no module there is nothing to measure, which answers 0 rather
+    // than the file-side constant it looks like.
+    ntrk::module_param_range(NULL, (int) ntrk::ModParam::kRestart, &lo, &hi);
+    CHECK(hi == 0);
+  }
+
+  // **The negative control.** Thirteen rows, each written past its bound by
+  // hand and each required to be refused at the save -- because a table whose
+  // ranges were all far too wide would pass every other check here.
+#define MOD_REFUSED(setup)                                                     \
+  do {                                                                         \
+    ntrk::Module m;                                                            \
+    rt_build(&m, s);                                                           \
+    CHECK(ntrk::module_save(&m, NULL, 0, &need));   /* sound before the poke */\
+    setup;                                                                     \
+    CHECK(!ntrk::module_fields_valid(&m));                                     \
+    CHECK(!ntrk::module_save(&m, NULL, 0, &need));                             \
+  } while (0)
+
+  MOD_REFUSED(m.channels = 0);
+  MOD_REFUSED(m.channels = ntrk::kMaxChannels + 1);
+  MOD_REFUSED(m.rows = 0);
+  MOD_REFUSED(m.rows = ntrk::kMaxRows + 1);
+  MOD_REFUSED(m.speed = 0);
+  MOD_REFUSED(m.speed = 32);
+  MOD_REFUSED(m.bpm = 31);
+  MOD_REFUSED(m.bpm = 256);
+  MOD_REFUSED(m.order_count = 0);
+  MOD_REFUSED(m.order_count = 257);
+  MOD_REFUSED(m.pattern_count = 0);
+  MOD_REFUSED(m.pattern_count = ntrk::kMaxPatterns + 1);
+  MOD_REFUSED(m.instrument_count = -1);
+  MOD_REFUSED(m.instrument_count = ntrk::kMaxInstruments + 1);
+  MOD_REFUSED(m.restart = -1);
+  MOD_REFUSED(m.restart = m.order_count);
+  MOD_REFUSED(m.fx_columns = 0);
+  MOD_REFUSED(m.fx_columns = ntrk::kMaxFxColumns + 1);
+  MOD_REFUSED(m.meta_columns = -1);
+  MOD_REFUSED(m.meta_columns = ntrk::kMaxMetaColumns + 1);
+  MOD_REFUSED(m.rows_per_beat = 0);
+  MOD_REFUSED(m.rows_per_beat = 256);
+  MOD_REFUSED(m.rows_per_bar = 0);
+  MOD_REFUSED(m.rows_per_bar = 256);
+  MOD_REFUSED(m.swing = -1);
+  MOD_REFUSED(m.swing = ntrk::kSwingMax + 1);
+
+#undef MOD_REFUSED
+
+  // The relation the table cannot express, still checked where it was: a bar
+  // that is not a whole number of beats is two fields disagreeing, which no
+  // per-field bound can see.
+  {
+    ntrk::Module m;
+    rt_build(&m, s);
+    m.rows_per_beat = 6;
+    m.rows_per_bar = 16;
+    CHECK(ntrk::module_fields_valid(&m));      // both in range...
+    CHECK(!ntrk::module_save(&m, NULL, 0, &need));   // ...and still refused
+  }
+
+  // And every field of a module that came off disk reads back inside its own
+  // range, which is what says the walk and the loader agree.
+  {
+    ntrk::Module m;
+    rt_build(&m, s);
+    size_t wrote = 0;
+    CHECK(ntrk::module_save(&m, g_saved, sizeof g_saved, &wrote));
+    ntrk::Module b;
+    CHECK(ntrk::module_load(&b, g_saved, wrote));
+    for (int id = 0; id < ntrk::module_param_count(); ++id) {
+      int lo = 0, hi = 0;
+      ntrk::module_param_range(&b, id, &lo, &hi);
+      const int v = ntrk::module_param_get(&b, id);
+      if (v < lo || v > hi)
+        printf("  %s: %d outside %d..%d\n", ntrk::module_param_at(id)->name, v, lo, hi);
+      CHECK(v >= lo && v <= hi);
+    }
+  }
+}
+
 // ---- the instrument parameter table -------------------------------------------
 //
 // The table is the only writer of what an instrument may hold, and both ends of
@@ -5256,18 +5364,26 @@ test_instrument_param_shape() {
   ntrk::Instrument bass;
   bass.type = (uint8_t) ntrk::InstrumentType::kSynth;
   bass.synth_voice = (uint8_t) ntrk::SynthVoice::kBass;
-  int live = 0, inert = 0;
-  for (int id = 0; id < ntrk::instrument_param_count(); ++id) {
-    const ntrk::ParamState st = ntrk::instrument_param_state(&bass, id);
-    if (st == ntrk::ParamState::Live)
+  int live = 0;
+  for (int id = 0; id < ntrk::instrument_param_count(); ++id)
+    if (ntrk::instrument_param_state(&bass, id) == ntrk::ParamState::Live)
       ++live;
-    else if (st == ntrk::ParamState::Inert)
-      ++inert;
-  }
-  // The 303 reads nine of the synth rows and ignores five; a table that
-  // answered "everything is live" would pass every other check in this file.
-  CHECK(inert == 5);
   CHECK(live > 0);
+
+  // The five synth rows the 303 does not read, named rather than counted: a
+  // count drifts the moment an unrelated row changes state, and a table that
+  // answered "everything is live" would pass every other check in this file.
+  const ntrk::InsParam kBassIgnores[5] = {
+      ntrk::InsParam::kSynthTune, ntrk::InsParam::kSynthSweep,
+      ntrk::InsParam::kSynthTone, ntrk::InsParam::kSynthNoise,
+      ntrk::InsParam::kSynthNoiseDecay};
+  for (int i = 0; i < 5; ++i)
+    CHECK(ntrk::instrument_param_state(&bass, (int) kBassIgnores[i]) ==
+          ntrk::ParamState::Inert);
+  // ...and one it does, so the check above is not passing on a function that
+  // answers Inert for everything.
+  CHECK(ntrk::instrument_param_state(&bass, (int) ntrk::InsParam::kSynthCutoff) ==
+        ntrk::ParamState::Live);
 
   // A drum's `tune` is Inert on a hihat and Live on a kick -- stored either
   // way, which is the whole reason Inert is not Absent.
@@ -5283,6 +5399,30 @@ test_instrument_param_shape() {
   // SYNP record to put it in.
   ntrk::Instrument pcm;
   CHECK(ntrk::instrument_param_state(&pcm, tune) == ntrk::ParamState::Absent);
+
+  // A synth walks no sample -- `channel_sample` returns before the sample
+  // fields are read -- so its loop is stored, checked and unread. Inert, not
+  // Absent: the bytes round-trip, and an editor that hid them would drop the
+  // loop someone set before changing the type to SYNTH.
+  const int lstart = (int) ntrk::InsParam::kLoopStart;
+  const int llen = (int) ntrk::InsParam::kLoopLen;
+  ntrk::Instrument sl;
+  sl.type = (uint8_t) ntrk::InstrumentType::kSynth;
+  sl.length = 64u;
+  sl.loop_start = 8u;
+  sl.loop_len = 16u;
+  CHECK(ntrk::instrument_param_state(&sl, lstart) == ntrk::ParamState::Inert);
+  CHECK(ntrk::instrument_param_state(&sl, llen) == ntrk::ParamState::Inert);
+  // Still checked, because Inert is checked: a loop off the end of a synth's
+  // blob is a file that has gone wrong however little the voice reads it.
+  sl.loop_len = 200u;
+  CHECK(!ntrk::instrument_fields_valid(sl));
+  // A PCM instrument's loop is what the mixer actually walks.
+  ntrk::Instrument pl;
+  pl.length = 64u;
+  pl.loop_start = 8u;
+  pl.loop_len = 16u;
+  CHECK(ntrk::instrument_param_state(&pl, lstart) == ntrk::ParamState::Live);
 }
 
 static void
@@ -5942,6 +6082,7 @@ main(void) {
   test_instrument_param_clamps();
   test_instrument_param_enforced();
   test_instrument_param_round_trip();
+  test_module_param_table();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

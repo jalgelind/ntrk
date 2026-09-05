@@ -353,6 +353,14 @@ instrument_param_state(const Instrument *ins, int id) {
     // first, which is also how a sample editor's loop drag works.
     if (p == InsParam::kLoopStart && ins->loop_len == 0u)
       return ParamState::Absent;
+    // **A synth walks no sample.** `channel_sample` returns before the sample
+    // fields are read and `channel_trigger` skips the length test outright, so
+    // a loop on a SYNTH instrument is stored, range-checked and round-tripped
+    // and nothing plays it -- which is Inert exactly. Not Absent: the bytes are
+    // in the entry and come back, so an editor greys these and does not drop
+    // the loop someone set before changing the type.
+    if (type == (uint8_t) InstrumentType::kSynth)
+      return ParamState::Inert;
     return ParamState::Live;
   }
   if (p >= InsParam::kSynthVoice) {
@@ -570,6 +578,140 @@ instrument_fields_valid(const Instrument &ins) {
 }
 
 // ----------------------------------------------------------------------------
+// -- Module fields: the header's own bounds, in one place
+// ----------------------------------------------------------------------------
+//
+// **The same fix as `InsParam`, one struct up.** `module_load` and `module_save`
+// spelled these thirteen ranges verbatim in both directions, and the writer's
+// comment admitted it in as many words: "the TUNE bounds, mirrored from the
+// loader -- a writer stricter or looser than its reader breaks the round trip
+// in one direction or the other". A comment naming a duplication is a
+// duplication with a note attached; this is the version with one writer.
+//
+// Only genuine RANGES are here. `note_max` is deliberately two values rather
+// than a range -- a file that could choose its own ceiling would be a file that
+// chooses its own bounds -- and `rows_per_bar % rows_per_beat`, a null `order`
+// and the order-names-a-pattern sweep are relations, not bounds. Those stay at
+// the end that has the context for them, exactly as the instrument table leaves
+// the blob offset and the one-frame-loop coercion where they are.
+//
+// An editor gets the ranges as a consequence: a BPM stepper that knows 32..255
+// because it asked, rather than because someone typed it in a widget.
+
+enum class ModParam {
+  kChannels = 0, kRows, kSpeed, kBpm,
+  kOrderCount, kPatternCount, kInstrumentCount, kRestart,
+  kFxColumns, kMetaColumns,
+  kRowsPerBeat, kRowsPerBar, kSwing,
+  kCount
+};
+
+// The format's own word for the field, and the range it accepts. The name is
+// the format's -- an editor's three-letter band label ("BPM", "LEN") is its own
+// abbreviation for a 26 px strip and not a second copy of anything.
+struct ModParamInfo {
+  const char *name;
+  int         lo, hi;
+};
+
+inline const ModParamInfo *
+module_param_table(int *count) {
+  static const ModParamInfo kTable[(int) ModParam::kCount] = {
+      {"channels", 1, kMaxChannels},
+      {"rows", 1, kMaxRows},
+      {"speed", 1, 31},
+      {"bpm", 32, 255},
+      {"order count", 1, 256},
+      {"pattern count", 1, kMaxPatterns},
+      {"instrument count", 0, kMaxInstruments},
+      // The one whose ceiling is another field's. `module_param_range` is the
+      // only honest reader of it; the zero here is what a caller gets with no
+      // module to measure.
+      {"restart", 0, 0},
+      {"fx columns", 1, kMaxFxColumns},
+      {"meta columns", 0, kMaxMetaColumns},
+      {"rows per beat", 1, 255},
+      {"rows per bar", 1, 255},
+      {"swing", 0, kSwingMax},
+  };
+  static_assert(sizeof(kTable) / sizeof(*kTable) == (size_t) ModParam::kCount,
+                "the table and ModParam are one list");
+  if (count != nullptr)
+    *count = (int) ModParam::kCount;
+  return kTable;
+}
+
+inline int
+module_param_count() {
+  return (int) ModParam::kCount;
+}
+
+inline const ModParamInfo *
+module_param_at(int id) {
+  if (id < 0 || id >= (int) ModParam::kCount)
+    return nullptr;
+  return module_param_table(nullptr) + id;
+}
+
+inline int
+module_param_get(const Module *m, int id) {
+  if (m == nullptr)
+    return 0;
+  switch ((ModParam) id) {
+    case ModParam::kChannels:       return m->channels;
+    case ModParam::kRows:           return m->rows;
+    case ModParam::kSpeed:          return m->speed;
+    case ModParam::kBpm:            return m->bpm;
+    case ModParam::kOrderCount:     return m->order_count;
+    case ModParam::kPatternCount:   return m->pattern_count;
+    case ModParam::kInstrumentCount: return m->instrument_count;
+    case ModParam::kRestart:        return m->restart;
+    case ModParam::kFxColumns:      return m->fx_columns;
+    case ModParam::kMetaColumns:    return m->meta_columns;
+    case ModParam::kRowsPerBeat:    return m->rows_per_beat;
+    case ModParam::kRowsPerBar:     return m->rows_per_bar;
+    case ModParam::kSwing:          return m->swing;
+    case ModParam::kCount:          break;
+  }
+  return 0;
+}
+
+inline void
+module_param_range(const Module *m, int id, int *lo, int *hi) {
+  const ModParamInfo *info = module_param_at(id);
+  int l = 0, h = 0;
+  if (info != nullptr) {
+    l = info->lo;
+    h = info->hi;
+    // A restart names an entry of THIS order list, so its ceiling moves with
+    // the list. An editor shortening the order list has to bring it down, which
+    // is what makes the range dynamic rather than the constant 255 it looks
+    // like from the file's side.
+    if (m != nullptr && (ModParam) id == ModParam::kRestart)
+      h = m->order_count > 0 ? m->order_count - 1 : 0;
+  }
+  if (lo != nullptr)
+    *lo = l;
+  if (hi != nullptr)
+    *hi = h;
+}
+
+// Every module-level range, in one walk, called by both ends of the format.
+inline bool
+module_fields_valid(const Module *m) {
+  if (m == nullptr)
+    return false;
+  for (int id = 0; id < (int) ModParam::kCount; ++id) {
+    int lo = 0, hi = 0;
+    module_param_range(m, id, &lo, &hi);
+    const int v = module_param_get(m, id);
+    if (v < lo || v > hi)
+      return false;
+  }
+  return true;
+}
+
+// ----------------------------------------------------------------------------
 // -- Loading
 // ----------------------------------------------------------------------------
 //
@@ -717,22 +859,10 @@ module_load(Module *module, const uint8_t *data, size_t size) {
   module->instrument_count = (int) read_u16(data + 18);
   module->restart = (int) read_u16(data + 20);
 
-  if (module->channels < 1 || module->channels > kMaxChannels)
-    return false;
-  if (module->rows < 1 || module->rows > kMaxRows)
-    return false;
-  if (module->speed < 1 || module->speed > 31)
-    return false;
-  if (module->bpm < 32 || module->bpm > 255)
-    return false;
-  if (module->order_count < 1 || module->order_count > 256)
-    return false;
-  if (module->pattern_count < 1 || module->pattern_count > kMaxPatterns)
-    return false;
-  if (module->instrument_count < 0 ||
-      module->instrument_count > kMaxInstruments)
-    return false;
-  if (module->restart < 0 || module->restart >= module->order_count)
+  // Every header range, from the one table `module_save` also walks. The block
+  // fields it covers -- the plane's geometry and TUNE's -- are still at their
+  // defaults here and are checked again once their blocks have been read.
+  if (!module_fields_valid(module))
     return false;
 
   // The tail of the header. `note_max` is one of two values rather than a
@@ -856,9 +986,9 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       const uint8_t *p = data + offset;
       module->fx_columns = (int) read_u16(p + 0);
       module->meta_columns = (int) read_u16(p + 2);
-      if (module->fx_columns < 1 || module->fx_columns > kMaxFxColumns)
-        return false;
-      if (module->meta_columns > kMaxMetaColumns)
+      // The plane's geometry, from the same table -- the fields were at their
+      // defaults when the header was walked and carry the file's values now.
+      if (!module_fields_valid(module))
         return false;
 
       // **Exact rather than sufficient.** One `{cmd, param}` per lane per row
@@ -1182,32 +1312,15 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   if (module->version != 2)
     return false;
 
-  if (module->channels < 1 || module->channels > kMaxChannels)
+  // **The same table the loader walks**, so a file this writes is a file that
+  // loads. These were the loader's ranges written out a second time, and the
+  // comment that used to sit here said as much.
+  if (!module_fields_valid(module))
     return false;
-  if (module->rows < 1 || module->rows > kMaxRows)
-    return false;
-  if (module->speed < 1 || module->speed > 31)
-    return false;
-  if (module->bpm < 32 || module->bpm > 255)
-    return false;
-  // The TUNE bounds, mirrored from the loader -- a writer stricter or looser
-  // than its reader breaks the round trip in one direction or the other.
-  if (module->rows_per_beat < 1 || module->rows_per_beat > 255)
-    return false;
-  if (module->rows_per_bar < 1 || module->rows_per_bar > 255)
-    return false;
+  // A relation rather than a range, so it stays here and at the loader's TUNE
+  // parse: a bar that is not a whole number of beats is two fields disagreeing,
+  // which no per-field bound can see.
   if (module->rows_per_bar % module->rows_per_beat != 0)
-    return false;
-  if (module->swing < 0 || module->swing > kSwingMax)
-    return false;
-  if (module->order_count < 1 || module->order_count > 256)
-    return false;
-  if (module->pattern_count < 1 || module->pattern_count > kMaxPatterns)
-    return false;
-  if (module->instrument_count < 0 ||
-      module->instrument_count > kMaxInstruments)
-    return false;
-  if (module->restart < 0 || module->restart >= module->order_count)
     return false;
   if (module->order == nullptr || module->patterns == nullptr)
     return false;
@@ -1221,10 +1334,6 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   // The plane's geometry, and the macro table, judged exactly as the loader
   // judges them -- so a file this writes is a file that loads, which is the
   // whole contract between these two functions.
-  if (module->fx_columns < 1 || module->fx_columns > kMaxFxColumns)
-    return false;
-  if (module->meta_columns < 0 || module->meta_columns > kMaxMetaColumns)
-    return false;
   // A geometry with no plane to describe has nowhere to be written down: the
   // counts live in the FXPL payload's prefix, so a module carrying columns and
   // no plane would save and load back as something else.
