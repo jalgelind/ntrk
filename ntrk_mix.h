@@ -612,6 +612,26 @@ Slot *mixr_slot_at(Mixer *mx, int index);
 // on that send until it has been.
 bool mixer_config_read(Mixer *mx, const uint8_t *block);
 
+// What kind of effect a saved slot names, WITHOUT building a mixer to find out.
+//
+// **An editor needs this and a `Mixer` is the wrong price for it.** Drawing five
+// squares that say which sends a module uses would otherwise mean instantiating
+// one -- four reverb tanks and four delay lines, megabytes, on the UI thread --
+// to read five bytes back out of it.
+//
+// Answers `kNone` for a block that is absent, malformed, or names an effect this
+// build does not have, which is the same refusal `mixer_config_read` makes: a
+// caller that drew "reverb" for a block the player will reject would be
+// describing a tune nobody can hear.
+FxKind config_slot_kind(const uint8_t *block, int slot);
+
+// The same, for a module: `kNone` when it carries no `MIXR` block at all.
+inline FxKind
+config_slot_kind(const ntrk::Module *module, int slot) {
+  return module != nullptr && module->has_mix ? config_slot_kind(module->mix, slot)
+                                              : FxKind::kNone;
+}
+
 // The mirror: the mixer's current configuration into `module->mix`, and
 // `has_mix` set. What a slide has moved is deliberately *not* what is written
 // -- `Slot::base` is, which is the setting the automation departs from.

@@ -3190,6 +3190,45 @@ test_mixr_writes_the_setting_not_the_slide() {
   CHECK(fabsf(mix::mixr_slot_at(&b, 0)->base[0] - 0.74f) < 1.f / 65534.f);
 }
 
+static void
+test_config_slot_kind_reads_without_a_mixer() {
+  printf("a slot names its kind without a mixer being built to ask\n");
+
+  static mix::Mixer a;
+  mixr_configure(&a);
+  Module m;
+  mix::mixer_config_write(&a, &m);
+  CHECK(m.has_mix);
+
+  // **It agrees with the reader, slot for slot.** That is the whole contract: an
+  // editor drawing what a module's sends are must not describe a different
+  // mixer from the one the player will build.
+  static mix::Mixer b;
+  mix::mixer_reset(&b);
+  CHECK(mix::mixer_config_read(&b, &m));
+  for (int i = 0; i < kMixrSlots; ++i)
+    CHECK(mix::config_slot_kind(&m, i) == mix::mixr_slot_at(&b, i)->kind);
+
+  // Out of range, and a module with no block at all: kNone rather than a read
+  // past the end or a kind out of uninitialised bytes.
+  CHECK(mix::config_slot_kind(&m, -1) == mix::FxKind::kNone);
+  CHECK(mix::config_slot_kind(&m, kMixrSlots) == mix::FxKind::kNone);
+  Module bare;
+  CHECK(mix::config_slot_kind(&bare, 0) == mix::FxKind::kNone);
+  CHECK(mix::config_slot_kind((const uint8_t *) 0, 0) == mix::FxKind::kNone);
+
+  // **A block the player would refuse describes nothing.** `mixer_config_read`
+  // rejects the whole block when any slot names an effect this build has not
+  // got, so reporting a kind out of one would label a tune nobody can hear.
+  Module bad = m;
+  bad.mix[kMixrHeaderBytes] = 200u;              // slot 0: not a kind we have
+  static mix::Mixer c;
+  mix::mixer_reset(&c);
+  CHECK(!mix::mixer_config_read(&c, &bad));
+  for (int i = 0; i < kMixrSlots; ++i)
+    CHECK(mix::config_slot_kind(&bad, i) == mix::FxKind::kNone);
+}
+
 int
 main(void) {
   test_bypass_is_render_add();
@@ -3236,6 +3275,7 @@ main(void) {
   test_mixr_round_trip();
   test_mixr_refuses_an_unknown_kind();
   test_mixr_writes_the_setting_not_the_slide();
+  test_config_slot_kind_reads_without_a_mixer();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

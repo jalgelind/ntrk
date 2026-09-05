@@ -478,6 +478,25 @@ mixr_unit(float v) {
 
 }  // namespace
 
+FxKind
+config_slot_kind(const uint8_t *block, int slot) {
+  if (block == nullptr || slot < 0 || slot >= kMixrSlots)
+    return FxKind::kNone;
+  // The same header check the reader makes, so the two cannot come to disagree
+  // about which blocks are readable.
+  if (ntrk::read_u16(block) != (uint16_t) kMixrVersion ||
+      ntrk::read_u16(block + 2) != (uint16_t) kMixrSlots)
+    return FxKind::kNone;
+  const uint8_t kind = block[kMixrHeaderBytes + slot * kMixrSlotBytes];
+  // `mixer_config_read` refuses the WHOLE block when any slot names an effect
+  // this build has not got, so a caller drawing one slot must not report a kind
+  // out of a block the player will reject.
+  for (int i = 0; i < kMixrSlots; ++i)
+    if (block[kMixrHeaderBytes + i * kMixrSlotBytes] > (uint8_t) FxKind::kReverb)
+      return FxKind::kNone;
+  return (FxKind) kind;
+}
+
 bool
 mixer_config_read(Mixer *mx, const uint8_t *block) {
   if (mx == nullptr || block == nullptr)
