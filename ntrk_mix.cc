@@ -1505,8 +1505,9 @@ slot_cmd_mnemonic(uint8_t cmd, char out[4]) {
 // in the slot, which is runtime state. `command_slot_fill` builds those.
 static const CmdInfo *
 plane_fixed_table(int *count) {
-  static const char *const kFilterTypes[4] = {"lowpass", "highpass",
-                                              "bandpass", "notch"};
+  // One list, in `ntrk.h`. These four names were written out twice in this file
+  // before, and an editor's instrument panel would have been the third copy.
+  const char *const *kFilterTypes = filter_mode_names(nullptr);
   static const CmdInfo kTable[19] = {
       {0x01, "PAN", "Set pan", ParamShape::Continuous, 0, nullptr},
       {0x02, "PNS", "Pan slide", ParamShape::Continuous, 0, nullptr},
@@ -1619,8 +1620,7 @@ fxpl_describe(const Mixer *mx, const Module *m, int channel, FxCell cell,
     return t.len;
   }
   if (cmd == kFxplTypeSet) {
-    static const char *const types[4] = {"lowpass", "highpass", "bandpass",
-                                         "notch"};
+    const char *const *types = filter_mode_names(nullptr);
     text_add(&t, "Set filter type");
     if (cell.param == 0) {
       text_add(&t, " -> (last parameter)");

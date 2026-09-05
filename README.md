@@ -294,6 +294,61 @@ the name in a completion list and the mnemonic in the grid cannot come to mean
 different commands. A meta lane's macro invocations are not in it: a macro's
 name and targets belong to the module, and `macro_describe` is what reads one.
 
+### Instrument parameters
+
+The same question again, one struct along: **what may go in this field.** An
+editor that answered it itself would keep its own table of bounds, and that
+table has already been written and has already gone wrong — `transpose` was
+narrowed to ±48 by the loader, the check turned out to be a guess and was
+deleted, and three copies of the old number outlived it, one under a comment
+claiming it was the format's.
+
+```cpp
+for (int id = 0; id < ntrk::instrument_param_count(); ++id) {
+  if (ntrk::instrument_param_state(&ins, id) == ntrk::ParamState::Absent)
+    continue;                       // not in this instrument's file at all
+  const ntrk::InsParamInfo *p = ntrk::instrument_param_at(id);
+  int lo, hi;
+  ntrk::instrument_param_range(&ins, id, &lo, &hi);     // may be the sample's
+  draw(p->name, ntrk::instrument_param_get(&ins, id), lo, hi);
+}
+ntrk::instrument_param_set(&ins, id, typed);            // clamps; never refuses
+```
+
+`ParamShape` is the command table's, unchanged — an instrument field is a
+magnitude or one of a named list, and reusing the enum means one control draws
+an FXPL filter-type dropdown and an instrument's. What the row adds is `lo`/`hi`,
+which a command deliberately has not got: a command parameter is always a byte,
+so a range would have said nothing, while an instrument field is an `int8`, a
+`uint8`, a `uint16` or a flag bit.
+
+**`instrument_param_set` clamps rather than rejects**, and that is the contract:
+no sequence of calls can author an instrument `module_save` refuses. Three rows
+carry a companion derivation, each copied from a rule the loader already applies
+— a one-frame loop becomes a one-shot, a loop start moved forward shortens the
+loop, switching the filter on carries a zero cutoff up to 20 Hz, and changing
+the type to a built-in shape takes the generated geometry with it. The filter
+one is the whole argument in miniature: the cutoff's 20..20000 applies only
+behind its flag, so ticking a checkbox brings a value that was fine under a
+bound that refuses it, and the module then plays all afternoon and will not
+save.
+
+**Three states, not two.** `Absent` means the format has no opinion — a SYNP
+record exists only for a SYNTH instrument, a wave index only means something on
+a built-in shape, a loop start means nothing without a loop — so an editor omits
+the row. `Inert` means the byte is stored, range-checked and round-tripped but
+the voice selected does not read it, so an editor **greys it and never hides
+it**: hiding a hihat's `tune` loses the kick setting the moment someone
+auditions a hihat and does not give it back. `instrument_param_state` answers
+both, which is also what keeps `kSynthVoiceSpecs[ins.synth_voice]` out of
+callers — that table has `kSynthDrumCount` rows and `synth_voice` reaches
+`kBass`.
+
+**`module_load` and `module_save` walk this table and spell no bound of their
+own.** That is the point of it rather than a side effect: the two used to
+duplicate the same six ranges, and the writer's comment admitted it twice. A
+writer and a reader that disagree about a range produce a save nobody can open.
+
 ## Tests
 
 ```sh

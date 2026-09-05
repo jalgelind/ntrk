@@ -5201,6 +5201,287 @@ tune_directory_at(const ntrk::Module &m, const uint8_t *bytes) {
   return at;
 }
 
+// ---- the instrument parameter table -------------------------------------------
+//
+// The table is the only writer of what an instrument may hold, and both ends of
+// the format walk it. That claim is worth exactly as much as the negative
+// control below: without it, step one passes just as well against a table whose
+// bounds are all far too tight to reach.
+
+static void
+test_instrument_param_shape() {
+  printf("every instrument parameter names itself and knows its range\n");
+
+  CHECK(ntrk::instrument_param_count() == (int) ntrk::InsParam::kCount);
+  CHECK(ntrk::instrument_param_at(-1) == NULL);
+  CHECK(ntrk::instrument_param_at(ntrk::instrument_param_count()) == NULL);
+
+  for (int id = 0; id < ntrk::instrument_param_count(); ++id) {
+    const ntrk::InsParamInfo *info = ntrk::instrument_param_at(id);
+    CHECK(info != NULL);
+    if (info == NULL)
+      continue;
+    CHECK(info->name != NULL && info->name[0] != '\0');
+    // Neither of the command table's other two shapes can describe a field: an
+    // instrument byte is a magnitude or one of a list, never two nibbles and
+    // never unread.
+    CHECK(info->shape == ntrk::ParamShape::Continuous ||
+          info->shape == ntrk::ParamShape::Choice);
+    if (info->shape == ntrk::ParamShape::Choice) {
+      CHECK(info->choice_count > 0);
+      CHECK(info->choice != NULL);
+      // A choice whose list is shorter than its range renders a null name for
+      // a value the format accepts.
+      CHECK(info->choice_count == info->hi - info->lo + 1);
+      for (int c = 0; c < info->choice_count; ++c)
+        CHECK(info->choice[c] != NULL && info->choice[c][0] != '\0');
+    }
+  }
+
+  // The four filter modes are one list. `ntrk_mix.cc` had two copies of them
+  // and an editor would have been the third.
+  int modes = 0;
+  const char *const *names = ntrk::filter_mode_names(&modes);
+  CHECK(modes == 4);
+  CHECK(strcmp(names[0], "lowpass") == 0);
+  CHECK(strcmp(names[3], "notch") == 0);
+  const ntrk::InsParamInfo *ft =
+      ntrk::instrument_param_at((int) ntrk::InsParam::kFilterType);
+  CHECK(ft->choice == names);
+
+  // **A bass has no `kSynthVoiceSpecs` row.** The table has kSynthDrumCount
+  // entries and `synth_voice` reaches kBass, so the obvious index is out of
+  // bounds -- which is why the question is answered here and not by a caller.
+  // Asking every state of a bass is what would run that read under a sanitiser.
+  ntrk::Instrument bass;
+  bass.type = (uint8_t) ntrk::InstrumentType::kSynth;
+  bass.synth_voice = (uint8_t) ntrk::SynthVoice::kBass;
+  int live = 0, inert = 0;
+  for (int id = 0; id < ntrk::instrument_param_count(); ++id) {
+    const ntrk::ParamState st = ntrk::instrument_param_state(&bass, id);
+    if (st == ntrk::ParamState::Live)
+      ++live;
+    else if (st == ntrk::ParamState::Inert)
+      ++inert;
+  }
+  // The 303 reads nine of the synth rows and ignores five; a table that
+  // answered "everything is live" would pass every other check in this file.
+  CHECK(inert == 5);
+  CHECK(live > 0);
+
+  // A drum's `tune` is Inert on a hihat and Live on a kick -- stored either
+  // way, which is the whole reason Inert is not Absent.
+  ntrk::Instrument hat = bass;
+  hat.synth_voice = (uint8_t) ntrk::SynthVoice::kHihat;
+  ntrk::Instrument kick = bass;
+  kick.synth_voice = (uint8_t) ntrk::SynthVoice::kKick;
+  const int tune = (int) ntrk::InsParam::kSynthTune;
+  CHECK(ntrk::instrument_param_state(&hat, tune) == ntrk::ParamState::Inert);
+  CHECK(ntrk::instrument_param_state(&kick, tune) == ntrk::ParamState::Live);
+
+  // ...and a synth row on a PCM instrument is Absent, because the file has no
+  // SYNP record to put it in.
+  ntrk::Instrument pcm;
+  CHECK(ntrk::instrument_param_state(&pcm, tune) == ntrk::ParamState::Absent);
+}
+
+static void
+test_instrument_param_clamps() {
+  printf("no value set through the table can author a module that will not save\n");
+
+  const uint8_t types[5] = {
+      (uint8_t) ntrk::InstrumentType::kPcm8,
+      (uint8_t) ntrk::InstrumentType::kPcm16,
+      (uint8_t) ntrk::InstrumentType::kWaveData,
+      (uint8_t) ntrk::InstrumentType::kWaveBuiltin,
+      (uint8_t) ntrk::InstrumentType::kSynth,
+  };
+
+  for (int t = 0; t < 5; ++t) {
+    RtSpec s;
+    s.type = types[t];
+    s.channels = 1;
+    ntrk::Module m;
+    rt_build(&m, s);
+    ntrk::Instrument &ins = m.instruments[0];
+
+    for (int id = 0; id < ntrk::instrument_param_count(); ++id) {
+      if (ntrk::instrument_param_state(&ins, id) == ntrk::ParamState::Absent)
+        continue;
+      // `kType` would move the instrument out from under the sweep.
+      if (id == (int) ntrk::InsParam::kType)
+        continue;
+
+      int lo = 0, hi = 0;
+      ntrk::instrument_param_range(&ins, id, &lo, &hi);
+      const int was = ntrk::instrument_param_get(&ins, id);
+
+      ntrk::instrument_param_set(&ins, id, lo - 1);
+      int v = ntrk::instrument_param_get(&ins, id);
+      CHECK(v >= lo && v <= hi);
+      size_t need = 0;
+      CHECK(ntrk::module_save(&m, NULL, 0, &need));
+
+      ntrk::instrument_param_set(&ins, id, hi + 1);
+      v = ntrk::instrument_param_get(&ins, id);
+      CHECK(v >= lo && v <= hi);
+      CHECK(ntrk::module_save(&m, NULL, 0, &need));
+
+      ntrk::instrument_param_set(&ins, id, was);
+    }
+  }
+
+  // **The trap this table was written for.** A filterless instrument carries a
+  // cutoff of 0, which is fine until the bit goes on and brings a 20..20000
+  // bound with it. Ticking the box has to carry the cutoff into range, or the
+  // module plays all afternoon and refuses to save.
+  RtSpec fs;
+  fs.channels = 1;
+  ntrk::Module f;
+  rt_build(&f, fs);
+  ntrk::Instrument &fi = f.instruments[0];
+  fi.flags = (uint8_t) (fi.flags & ~ntrk::kInstrumentFilter);
+  fi.filter_cutoff_hz = 0u;
+  size_t need = 0;
+  CHECK(ntrk::module_save(&f, NULL, 0, &need));      // fine with the bit clear
+  ntrk::instrument_param_set(&fi, (int) ntrk::InsParam::kFilter, 1);
+  CHECK(fi.filter_cutoff_hz >= 20u);
+  CHECK(ntrk::module_save(&f, NULL, 0, &need));      // and still fine with it set
+
+  // A one-frame loop is what the loader turns into a one-shot, so the setter
+  // does it here rather than letting it come back as something else.
+  ntrk::Module l;
+  rt_build(&l, fs);
+  ntrk::Instrument &li = l.instruments[0];
+  ntrk::instrument_param_set(&li, (int) ntrk::InsParam::kLoopStart, 0);
+  ntrk::instrument_param_set(&li, (int) ntrk::InsParam::kLoopLen, 1);
+  CHECK(li.loop_len == 0u);
+
+  // Changing the type carries the derived width and, for a built-in shape, the
+  // generated geometry -- so what the editor holds is what a reload produces.
+  ntrk::Module y;
+  rt_build(&y, fs);
+  ntrk::Instrument &yi = y.instruments[0];
+  ntrk::instrument_param_set(&yi, (int) ntrk::InsParam::kType,
+                             (int) ntrk::InstrumentType::kPcm16);
+  CHECK(yi.bits == 16u);
+  ntrk::instrument_param_set(&yi, (int) ntrk::InsParam::kType,
+                             (int) ntrk::InstrumentType::kWaveBuiltin);
+  CHECK(yi.bits == 8u);
+  CHECK(yi.length == (uint32_t) ntrk::kBuiltinWaveFrames);
+  CHECK(yi.loop_len == (uint32_t) ntrk::kBuiltinWaveFrames);
+  CHECK(yi.data == ntrk::builtin_wave((int) yi.wave_index));
+  ntrk::instrument_param_set(&yi, (int) ntrk::InsParam::kWave, 2);
+  CHECK(yi.data == ntrk::builtin_wave(2));           // the sample follows the index
+}
+
+static void
+test_instrument_param_enforced() {
+  printf("and a field written past the table by hand is refused at the save\n");
+
+  // **The negative control, and it is the load-bearing half.** Every check
+  // above passes vacuously against a table whose bounds are too tight to reach.
+  // These write the raw field, going around the setter, and require the save to
+  // refuse -- which is what says the walk really is the format's gate.
+  //
+  // Ten rows, and that is all of them: every other row's range is its storage,
+  // so no value it can hold is out of range and there is nothing to refuse.
+  // That is the property, not an omission.
+  RtSpec s;
+  s.channels = 1;
+  size_t need = 0;
+
+#define REFUSED(setup)                                                         \
+  do {                                                                         \
+    ntrk::Module m;                                                            \
+    rt_build(&m, s);                                                           \
+    ntrk::Instrument &ins = m.instruments[0];                                  \
+    CHECK(ntrk::module_save(&m, NULL, 0, &need));  /* sound before the poke */ \
+    setup;                                                                     \
+    CHECK(!ntrk::module_save(&m, NULL, 0, &need));                             \
+    CHECK(!ntrk::instrument_fields_valid(ins));                                \
+  } while (0)
+
+  REFUSED(ins.type = 5u);
+  REFUSED(ins.volume = 65u);
+  REFUSED(ins.finetune = 8);
+  REFUSED(ins.finetune = -9);
+  REFUSED(ins.env_sustain = 65u);
+  REFUSED(ins.flags = (uint8_t) (ins.flags | ntrk::kInstrumentFilter);
+          ins.filter_cutoff_hz = 19u);
+  REFUSED(ins.flags = (uint8_t) (ins.flags | ntrk::kInstrumentFilter);
+          ins.filter_cutoff_hz = 20001u);
+  REFUSED(ins.type = (uint8_t) ntrk::InstrumentType::kWaveBuiltin;
+          ins.wave_index = (uint8_t) ntrk::kBuiltinWaveCount);
+  REFUSED(ins.type = (uint8_t) ntrk::InstrumentType::kSynth;
+          ins.synth_voice = (uint8_t) ntrk::kSynthVoiceCount);
+  REFUSED(ins.type = (uint8_t) ntrk::InstrumentType::kSynth;
+          ins.synth_dist = (uint8_t) ntrk::kSynthDistKinds);
+  REFUSED(ins.type = (uint8_t) ntrk::InstrumentType::kSynth;
+          ins.synth_wave = (uint8_t) ntrk::kSynthWaveCount);
+  REFUSED(ins.loop_len = 4u; ins.loop_start = ins.length);
+  REFUSED(ins.loop_start = 0u; ins.loop_len = ins.length + 1u);
+
+  // The enumerated synth fields are checked whatever the voice -- that is the
+  // difference between Inert and Absent, and a walk that skipped Inert would
+  // let this through.
+  REFUSED(ins.type = (uint8_t) ntrk::InstrumentType::kSynth;
+          ins.synth_voice = (uint8_t) ntrk::SynthVoice::kKick;
+          ins.synth_dist = (uint8_t) ntrk::kSynthDistKinds);
+
+#undef REFUSED
+}
+
+static void
+test_instrument_param_round_trip() {
+  printf("every parameter at its ceiling survives a save and a load\n");
+
+  const uint8_t types[5] = {
+      (uint8_t) ntrk::InstrumentType::kPcm8,
+      (uint8_t) ntrk::InstrumentType::kPcm16,
+      (uint8_t) ntrk::InstrumentType::kWaveData,
+      (uint8_t) ntrk::InstrumentType::kWaveBuiltin,
+      (uint8_t) ntrk::InstrumentType::kSynth,
+  };
+
+  for (int t = 0; t < 5; ++t) {
+    RtSpec s;
+    s.type = types[t];
+    s.channels = 1;
+    ntrk::Module a;
+    rt_build(&a, s);
+    ntrk::Instrument &ins = a.instruments[0];
+
+    for (int id = 0; id < ntrk::instrument_param_count(); ++id) {
+      if (id == (int) ntrk::InsParam::kType)
+        continue;
+      if (ntrk::instrument_param_state(&ins, id) == ntrk::ParamState::Absent)
+        continue;
+      int lo = 0, hi = 0;
+      ntrk::instrument_param_range(&ins, id, &lo, &hi);
+      ntrk::instrument_param_set(&ins, id, hi);
+    }
+
+    int expect[(int) ntrk::InsParam::kCount];
+    for (int id = 0; id < ntrk::instrument_param_count(); ++id)
+      expect[id] = ntrk::instrument_param_get(&ins, id);
+
+    size_t need = 0, wrote = 0;
+    CHECK(ntrk::module_save(&a, NULL, 0, &need));
+    CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &wrote));
+    ntrk::Module b;
+    CHECK(ntrk::module_load(&b, g_saved, wrote));
+
+    for (int id = 0; id < ntrk::instrument_param_count(); ++id) {
+      const int got = ntrk::instrument_param_get(&b.instruments[0], id);
+      if (got != expect[id])
+        printf("  type %d param %s: wrote %d, read %d\n", (int) types[t],
+               ntrk::instrument_param_at(id)->name, expect[id], got);
+      CHECK(got == expect[id]);
+    }
+  }
+}
+
 // ---- NAME -------------------------------------------------------------------
 
 static void
@@ -5657,6 +5938,10 @@ main(void) {
   test_synth_reference_pitch();
   test_render_hashes();
   test_mixr_block();
+  test_instrument_param_shape();
+  test_instrument_param_clamps();
+  test_instrument_param_enforced();
+  test_instrument_param_round_trip();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

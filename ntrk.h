@@ -103,6 +103,473 @@ namespace ntrk {
 // which is what lets `tests/modules/tracker.cc` check any of this at all.
 
 // ----------------------------------------------------------------------------
+// -- Instrument parameters: everything the format has an opinion about
+// ----------------------------------------------------------------------------
+//
+// **One decision, one implementation.** `module_load` and `module_save` each
+// used to spell the same six field bounds, and the writer's comment admitted it
+// twice: "the same field checks the loader makes, so a file this writes is a
+// file that loads". Two copies of a range write a file the reader refuses the
+// day one of them moves -- and one of them already had. `transpose` was
+// narrowed to +/-48 in the loader, that guess turned out to be wrong and was
+// deleted, and three copies of the old number outlived it, one of them under a
+// comment claiming it was the format's. Both ends now walk the table below,
+// which is therefore the only writer of what an instrument may hold.
+//
+// It is also exactly what an editor needs, and for a sharper reason than the
+// command table next door. A drifted mnemonic mislabels a cell. A drifted bound
+// lets someone type a value the format refuses, so the module plays all
+// afternoon and will not save -- the same failure as a note above `note_max`,
+// which is the bug this table exists to make unwritable.
+//
+// It lives here, above the loader, rather than beside `note_fx_table` at the
+// bottom, because the loader and the writer are its first two callers.
+
+// Every value of an instrument the format checks, in the order
+// `instrument_param_table` lists them.
+enum class InsParam {
+  kType = 0, kVolume, kFinetune, kTranspose, kLoopStart, kLoopLen,
+  kEnvelope, kAttackMs, kDecayMs, kSustain, kReleaseMs,
+  kFilter, kCutoffHz, kResonance, kFilterType, kWave,
+  kSynthVoice, kSynthTune, kSynthDecay, kSynthSweep, kSynthTone,
+  kSynthNoise, kSynthNoiseDecay, kSynthDrive, kSynthCutoff, kSynthReso,
+  kSynthEnvMod, kSynthAccent, kSynthDist, kSynthDistMix, kSynthWave,
+  kCount
+};
+
+// Whether a value is in this instrument at all, and whether anything reads it.
+//
+// **`Absent` and `Inert` are different facts, and only one of them is the
+// format's.** Absent means the format has no opinion: either the byte is not
+// written -- a SYNP record exists only for a SYNTH instrument -- or it is
+// written and nothing derives from it, which is what a loop start is on a
+// one-shot. Inert means the byte IS stored, range-checked and round-tripped,
+// but the voice currently selected does not read it: a hihat's `tune` is still
+// there and becomes live again the moment the voice becomes a kick.
+//
+// So an editor **omits** an Absent row and **greys** an Inert one. Hiding a
+// hihat's `tune` loses the kick setting the moment someone auditions a hihat,
+// and does not give it back.
+enum class ParamState { Absent, Inert, Live };
+
+// One row. `ParamShape` is reused unchanged -- Continuous and Choice are the
+// only two an instrument field is -- so an editor draws a synth-voice dropdown
+// and an FXPL choice dropdown through one code path.
+//
+// `lo`/`hi` are what the command table deliberately has NOT got: a command
+// parameter is always a byte, so a range there would have said nothing, while
+// an instrument field is an int8, a u8, a u16 or a flag bit and the range is
+// the fact `module_save` enforces. Two rows carry a range that is the sample's
+// rather than the format's; `instrument_param_range` is the only honest reader
+// of those, and it says so.
+struct InsParamInfo {
+  const char       *name;
+  ParamShape        shape;        // Continuous or Choice; never SplitNibble
+  int               lo, hi;
+  int               choice_count; // 0 unless shape == Choice
+  const char *const *choice;      // choice_count strings, else null
+};
+
+// The four filter modes, in the order `voice_filter_sample` switches on them.
+// One list: the strings were written twice inside `ntrk_mix.cc` before this,
+// and an editor's own copy would have been the third.
+inline const char *const *
+filter_mode_names(int *count) {
+  static const char *const kNames[4] = {"lowpass", "highpass", "bandpass",
+                                        "notch"};
+  if (count != nullptr)
+    *count = 4;
+  return kNames;
+}
+
+inline const InsParamInfo *
+instrument_param_table(int *count) {
+  static const char *const kTypes[5] = {"pcm8", "pcm16", "wave data",
+                                        "wave builtin", "synth"};
+  static const char *const kOffOn[2] = {"off", "on"};
+  static const char *const kVoices[kSynthVoiceCount] = {"kick", "snare",
+                                                        "hihat", "clap",
+                                                        "bass"};
+  static const char *const kDistKinds[kSynthDistKinds] = {"warm", "crunch",
+                                                          "tape", "fold"};
+  // **Order trap:** 0 is saw. `synth303_sample` reads `synth_wave == 0` as the
+  // saw and reaches for built-in shape 1, so this list is not the wave table's
+  // order and must not be sorted into it.
+  static const char *const kSynthWaves[kSynthWaveCount] = {"saw", "square"};
+  // In `BuiltinWaves`' own order: square, saw, triangle, then the two pulses at
+  // a quarter and an eighth of the cycle.
+  static const char *const kWaves[kBuiltinWaveCount] = {
+      "square", "saw", "triangle", "pulse 25%", "pulse 12%"};
+
+  static const InsParamInfo kTable[(int) InsParam::kCount] = {
+      {"type", ParamShape::Choice, 0, 4, 5, kTypes},
+      {"volume", ParamShape::Continuous, 0, 64, 0, nullptr},
+      {"finetune", ParamShape::Continuous, -8, 7, 0, nullptr},
+      // A whole signed byte on purpose: the playable range is
+      // kMinNote..note_max and an XM's `relative_note` lands here, so four
+      // octaves is not enough to express what a file can ask for.
+      // `note_transposed` clamps the RESULT, which is what makes any value safe.
+      {"transpose", ParamShape::Continuous, -128, 127, 0, nullptr},
+      // The two whose ceiling is the sample's. `instrument_param_range`
+      // overrides both; the zeroes here are what a caller gets with no
+      // instrument to measure, and reading `hi` off the row is a bug.
+      {"loop start", ParamShape::Continuous, 0, 0, 0, nullptr},
+      {"loop len", ParamShape::Continuous, 0, 0, 0, nullptr},
+      {"envelope", ParamShape::Choice, 0, 1, 2, kOffOn},
+      {"attack ms", ParamShape::Continuous, 0, 65535, 0, nullptr},
+      {"decay ms", ParamShape::Continuous, 0, 65535, 0, nullptr},
+      {"sustain", ParamShape::Continuous, 0, 64, 0, nullptr},
+      {"release ms", ParamShape::Continuous, 0, 65535, 0, nullptr},
+      {"filter", ParamShape::Choice, 0, 1, 2, kOffOn},
+      {"cutoff hz", ParamShape::Continuous, 20, 20000, 0, nullptr},
+      {"resonance", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"filter type", ParamShape::Choice, 0, 3, 4, filter_mode_names(nullptr)},
+      {"wave", ParamShape::Choice, 0, kBuiltinWaveCount - 1, kBuiltinWaveCount,
+       kWaves},
+      {"synth voice", ParamShape::Choice, 0, kSynthVoiceCount - 1,
+       kSynthVoiceCount, kVoices},
+      {"synth tune", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth decay", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth sweep", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth tone", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth noise", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth noise decay", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth drive", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth cutoff", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth reso", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth env mod", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth accent", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth dist", ParamShape::Choice, 0, kSynthDistKinds - 1,
+       kSynthDistKinds, kDistKinds},
+      {"synth dist mix", ParamShape::Continuous, 0, 255, 0, nullptr},
+      {"synth wave", ParamShape::Choice, 0, kSynthWaveCount - 1,
+       kSynthWaveCount, kSynthWaves},
+  };
+  static_assert(sizeof(kTable) / sizeof(*kTable) == (size_t) InsParam::kCount,
+                "the table and InsParam are one list");
+  if (count != nullptr)
+    *count = (int) InsParam::kCount;
+  return kTable;
+}
+
+inline int
+instrument_param_count() {
+  return (int) InsParam::kCount;
+}
+
+inline const InsParamInfo *
+instrument_param_at(int id) {
+  if (id < 0 || id >= (int) InsParam::kCount)
+    return nullptr;
+  return instrument_param_table(nullptr) + id;
+}
+
+// Which synth rows the selected voice actually reads.
+//
+// **This is here rather than in a caller because the obvious way to ask it is
+// out of bounds:** `kSynthVoiceSpecs` has `kSynthDrumCount` rows and
+// `synth_voice` reaches `kBass`, so `kSynthVoiceSpecs[ins->synth_voice]` reads
+// past the end for a bass. Answering it once is what stops that index being
+// written somewhere else.
+inline bool
+synth_param_read_by_voice(const Instrument *ins, InsParam p) {
+  if (p == InsParam::kSynthVoice)
+    return true;
+  if (ins->synth_voice == (uint8_t) SynthVoice::kBass) {
+    // `synth303_sample` reads exactly these and nothing else.
+    switch (p) {
+      case InsParam::kSynthWave:
+      case InsParam::kSynthCutoff:
+      case InsParam::kSynthReso:
+      case InsParam::kSynthEnvMod:
+      case InsParam::kSynthAccent:
+      case InsParam::kSynthDecay:
+      case InsParam::kSynthDrive:
+      case InsParam::kSynthDist:
+      case InsParam::kSynthDistMix:
+        return true;
+      default:
+        return false;
+    }
+  }
+  // A drum reads none of the 303's.
+  switch (p) {
+    case InsParam::kSynthCutoff:
+    case InsParam::kSynthReso:
+    case InsParam::kSynthEnvMod:
+    case InsParam::kSynthAccent:
+    case InsParam::kSynthDist:
+    case InsParam::kSynthDistMix:
+    case InsParam::kSynthWave:
+      return false;
+    default:
+      break;
+  }
+  // ...and a drum with no resonator reads nothing about a body: `body_hz` is 0
+  // for the hihat and the clap, which switches the body block off entirely and
+  // pins the noise/body mix at all-noise.
+  const int voice = (int) ins->synth_voice;
+  if (voice >= 0 && voice < kSynthDrumCount &&
+      kSynthVoiceSpecs[voice].body_hz <= 0.f) {
+    switch (p) {
+      case InsParam::kSynthTune:
+      case InsParam::kSynthSweep:
+      case InsParam::kSynthNoise:
+      case InsParam::kSynthDecay:
+        return false;
+      default:
+        break;
+    }
+  }
+  return true;
+}
+
+inline ParamState
+instrument_param_state(const Instrument *ins, int id) {
+  if (ins == nullptr || id < 0 || id >= (int) InsParam::kCount)
+    return ParamState::Absent;
+  const InsParam p = (InsParam) id;
+  const uint8_t type = ins->type;
+
+  // A built-in shape names one of the generated cycles; every other type does
+  // not carry the field at all.
+  if (p == InsParam::kWave)
+    return type == (uint8_t) InstrumentType::kWaveBuiltin ? ParamState::Live
+                                                          : ParamState::Absent;
+  // The cutoff is bounded only when the bit is set. With it clear the field is
+  // unread and unchecked -- which is the trap `instrument_param_set` closes,
+  // because switching the bit on brings a 0 that was fine under a bound that
+  // refuses it.
+  if (p == InsParam::kCutoffHz)
+    return (ins->flags & kInstrumentFilter) != 0u ? ParamState::Live
+                                                  : ParamState::Absent;
+  if (p == InsParam::kLoopStart || p == InsParam::kLoopLen) {
+    // A built-in shape's geometry is generated at load and whatever the entry
+    // stored is discarded, so neither is a round-trip field.
+    if (type == (uint8_t) InstrumentType::kWaveBuiltin)
+      return ParamState::Absent;
+    // Without a loop there is nothing for a start to be inside of, and the
+    // format checks it only when there is one. The length is the field to set
+    // first, which is also how a sample editor's loop drag works.
+    if (p == InsParam::kLoopStart && ins->loop_len == 0u)
+      return ParamState::Absent;
+    return ParamState::Live;
+  }
+  if (p >= InsParam::kSynthVoice) {
+    if (type != (uint8_t) InstrumentType::kSynth)
+      return ParamState::Absent;
+    return synth_param_read_by_voice(ins, p) ? ParamState::Live
+                                             : ParamState::Inert;
+  }
+  return ParamState::Live;
+}
+
+inline void
+instrument_param_range(const Instrument *ins, int id, int *lo, int *hi) {
+  const InsParamInfo *info = instrument_param_at(id);
+  int l = 0, h = 0;
+  if (info != nullptr) {
+    l = info->lo;
+    h = info->hi;
+    // The two rows the sample sizes. Computed in a width that cannot wrap: a
+    // loop start at or past the end would underflow the subtraction, and that
+    // wrap is exactly how a loop running off the blob gets past a check.
+    if (ins != nullptr) {
+      const long long len = (long long) ins->length;
+      if ((InsParam) id == InsParam::kLoopStart)
+        h = len > 0 ? (int) (len - 1) : 0;
+      else if ((InsParam) id == InsParam::kLoopLen)
+        h = len > (long long) ins->loop_start
+                ? (int) (len - (long long) ins->loop_start)
+                : 0;
+    }
+  }
+  if (lo != nullptr)
+    *lo = l;
+  if (hi != nullptr)
+    *hi = h;
+}
+
+inline int
+instrument_param_get(const Instrument *ins, int id) {
+  if (ins == nullptr)
+    return 0;
+  switch ((InsParam) id) {
+    case InsParam::kType:       return (int) ins->type;
+    case InsParam::kVolume:     return (int) ins->volume;
+    case InsParam::kFinetune:   return (int) ins->finetune;
+    case InsParam::kTranspose:  return (int) ins->transpose;
+    case InsParam::kLoopStart:  return (int) ins->loop_start;
+    case InsParam::kLoopLen:    return (int) ins->loop_len;
+    case InsParam::kEnvelope:
+      return (ins->flags & kInstrumentEnvelope) != 0u ? 1 : 0;
+    case InsParam::kAttackMs:   return (int) ins->env_attack_ms;
+    case InsParam::kDecayMs:    return (int) ins->env_decay_ms;
+    case InsParam::kSustain:    return (int) ins->env_sustain;
+    case InsParam::kReleaseMs:  return (int) ins->env_release_ms;
+    case InsParam::kFilter:
+      return (ins->flags & kInstrumentFilter) != 0u ? 1 : 0;
+    case InsParam::kCutoffHz:   return (int) ins->filter_cutoff_hz;
+    case InsParam::kResonance:  return (int) ins->filter_res;
+    case InsParam::kFilterType:
+      return (int) ((ins->flags & kInstrumentFilterType) >> 2);
+    case InsParam::kWave:       return (int) ins->wave_index;
+    case InsParam::kSynthVoice: return (int) ins->synth_voice;
+    case InsParam::kSynthTune:  return (int) ins->synth_tune;
+    case InsParam::kSynthDecay: return (int) ins->synth_decay;
+    case InsParam::kSynthSweep: return (int) ins->synth_sweep;
+    case InsParam::kSynthTone:  return (int) ins->synth_tone;
+    case InsParam::kSynthNoise: return (int) ins->synth_noise;
+    case InsParam::kSynthNoiseDecay: return (int) ins->synth_noise_decay;
+    case InsParam::kSynthDrive: return (int) ins->synth_drive;
+    case InsParam::kSynthCutoff: return (int) ins->synth_cutoff;
+    case InsParam::kSynthReso:  return (int) ins->synth_reso;
+    case InsParam::kSynthEnvMod: return (int) ins->synth_env_mod;
+    case InsParam::kSynthAccent: return (int) ins->synth_accent;
+    case InsParam::kSynthDist:  return (int) ins->synth_dist;
+    case InsParam::kSynthDistMix: return (int) ins->synth_dist_mix;
+    case InsParam::kSynthWave:  return (int) ins->synth_wave;
+    case InsParam::kCount:      break;
+  }
+  return 0;
+}
+
+// **Clamps rather than rejects, and that is the contract.** No sequence of
+// calls to this can author an instrument `module_save` refuses; a bool return
+// would hand that decision back to every caller and one of them would drop it.
+// Three rows carry a companion derivation, and each is a copy of a rule the
+// loader already applies -- which is the point: the loader is where they came
+// from, so what this writes is what a reload produces.
+inline void
+instrument_param_set(Instrument *ins, int id, int value) {
+  if (ins == nullptr || instrument_param_at(id) == nullptr)
+    return;
+  int lo = 0, hi = 0;
+  instrument_param_range(ins, id, &lo, &hi);
+  const int v = value < lo ? lo : (value > hi ? hi : value);
+
+  switch ((InsParam) id) {
+    case InsParam::kType:
+      ins->type = (uint8_t) v;
+      ins->bits = instrument_bits_for(ins->type);
+      // The geometry the loader gives a built-in shape, applied here so the
+      // instrument in hand is the one a reload produces rather than one that
+      // silently changes shape on the way back in.
+      if (ins->type == (uint8_t) InstrumentType::kWaveBuiltin) {
+        if (ins->wave_index >= (uint8_t) kBuiltinWaveCount)
+          ins->wave_index = 0;
+        ins->data = builtin_wave((int) ins->wave_index);
+        ins->length = (uint32_t) kBuiltinWaveFrames;
+        ins->loop_start = 0;
+        ins->loop_len = (uint32_t) kBuiltinWaveFrames;
+      }
+      break;
+    case InsParam::kVolume:    ins->volume = (uint8_t) v; break;
+    case InsParam::kFinetune:  ins->finetune = (int8_t) v; break;
+    case InsParam::kTranspose: ins->transpose = (int8_t) v; break;
+    case InsParam::kLoopStart:
+      ins->loop_start = (uint32_t) v;
+      // A start moved forward shortens the loop. Its own range keeps it inside
+      // the sample, but the format's rule is about the PAIR -- `loop_start +
+      // loop_len <= length` -- and moving one end without the other is how a
+      // setter that clamps every field authors a module that will not save.
+      if ((long long) ins->loop_start + (long long) ins->loop_len >
+          (long long) ins->length)
+        ins->loop_len = ins->length - ins->loop_start;
+      if (ins->loop_len == 1u)
+        ins->loop_len = 0u;
+      break;
+    case InsParam::kLoopLen:
+      // A loop of one frame is what the loader turns into a one-shot, so
+      // authoring one would come back as something else.
+      ins->loop_len = (uint32_t) (v == 1 ? 0 : v);
+      break;
+    case InsParam::kEnvelope:
+      ins->flags = (uint8_t) (v != 0 ? (ins->flags | kInstrumentEnvelope)
+                                     : (ins->flags & ~kInstrumentEnvelope));
+      break;
+    case InsParam::kAttackMs:  ins->env_attack_ms = (uint16_t) v; break;
+    case InsParam::kDecayMs:   ins->env_decay_ms = (uint16_t) v; break;
+    case InsParam::kSustain:   ins->env_sustain = (uint8_t) v; break;
+    case InsParam::kReleaseMs: ins->env_release_ms = (uint16_t) v; break;
+    case InsParam::kFilter:
+      if (v != 0) {
+        ins->flags = (uint8_t) (ins->flags | kInstrumentFilter);
+        // Switching the filter on brings the cutoff under a bound that did not
+        // apply a moment ago, and the value sitting there is 0 on every
+        // instrument that never had one. Without this, ticking the box authors
+        // a module that plays and will not save.
+        if (ins->filter_cutoff_hz < 20u)
+          ins->filter_cutoff_hz = 20u;
+        else if (ins->filter_cutoff_hz > 20000u)
+          ins->filter_cutoff_hz = 20000u;
+      } else {
+        ins->flags = (uint8_t) (ins->flags & ~kInstrumentFilter);
+      }
+      break;
+    case InsParam::kCutoffHz:  ins->filter_cutoff_hz = (uint16_t) v; break;
+    case InsParam::kResonance: ins->filter_res = (uint8_t) v; break;
+    case InsParam::kFilterType:
+      ins->flags = (uint8_t) ((ins->flags & ~kInstrumentFilterType) |
+                              (uint8_t) ((v << 2) & kInstrumentFilterType));
+      break;
+    case InsParam::kWave:
+      ins->wave_index = (uint8_t) v;
+      // A built-in instrument's data IS its wave index; the two cannot be set
+      // apart without the sample going stale.
+      if (ins->type == (uint8_t) InstrumentType::kWaveBuiltin)
+        ins->data = builtin_wave(v);
+      break;
+    case InsParam::kSynthVoice: ins->synth_voice = (uint8_t) v; break;
+    case InsParam::kSynthTune:  ins->synth_tune = (uint8_t) v; break;
+    case InsParam::kSynthDecay: ins->synth_decay = (uint8_t) v; break;
+    case InsParam::kSynthSweep: ins->synth_sweep = (uint8_t) v; break;
+    case InsParam::kSynthTone:  ins->synth_tone = (uint8_t) v; break;
+    case InsParam::kSynthNoise: ins->synth_noise = (uint8_t) v; break;
+    case InsParam::kSynthNoiseDecay: ins->synth_noise_decay = (uint8_t) v; break;
+    case InsParam::kSynthDrive: ins->synth_drive = (uint8_t) v; break;
+    case InsParam::kSynthCutoff: ins->synth_cutoff = (uint8_t) v; break;
+    case InsParam::kSynthReso:  ins->synth_reso = (uint8_t) v; break;
+    case InsParam::kSynthEnvMod: ins->synth_env_mod = (uint8_t) v; break;
+    case InsParam::kSynthAccent: ins->synth_accent = (uint8_t) v; break;
+    case InsParam::kSynthDist:  ins->synth_dist = (uint8_t) v; break;
+    case InsParam::kSynthDistMix: ins->synth_dist_mix = (uint8_t) v; break;
+    case InsParam::kSynthWave:  ins->synth_wave = (uint8_t) v; break;
+    case InsParam::kCount:      break;
+  }
+}
+
+// Every per-field bound the format has, in one walk. `module_load` and
+// `module_save` both call this and neither spells a range of its own, which is
+// what makes a file this writes a file that loads.
+//
+// The structural checks are NOT here and stay at their ends: a blob offset, a
+// null `data` behind a non-zero length and the one-frame-loop coercion are not
+// per-field ranges, and only one end has the context for each.
+inline bool
+instrument_fields_valid(const Instrument &ins) {
+  // The loop rows are the sample's own indices and the table reports them as
+  // `int`. Nothing addressable by this walk is longer, and no .ntrk holds such
+  // a sample -- the blob is a buffer in memory that was read in one piece.
+  if (ins.length > (uint32_t) 0x7fffffff)
+    return false;
+  for (int id = 0; id < (int) InsParam::kCount; ++id) {
+    // **`Absent` is the only state that skips.** `Inert` still checks: the
+    // loader validates a kick's `synth_dist` whatever the voice, because a
+    // value outside the enum is a file that has gone wrong rather than a
+    // setting this voice happens not to be reading today.
+    if (instrument_param_state(&ins, id) == ParamState::Absent)
+      continue;
+    int lo = 0, hi = 0;
+    instrument_param_range(&ins, id, &lo, &hi);
+    const int v = instrument_param_get(&ins, id);
+    if (v < lo || v > hi)
+      return false;
+  }
+  return true;
+}
+
+// ----------------------------------------------------------------------------
 // -- Loading
 // ----------------------------------------------------------------------------
 //
@@ -560,36 +1027,15 @@ module_load(Module *module, const uint8_t *data, size_t size) {
     ins.filter_res = e[30];
     ins.wave_index = e[31];
 
-    if (ins.volume > 64)
-      return false;
-    if (ins.finetune < -8 || ins.finetune > 7)
-      return false;
-    if (ins.type > (uint8_t) InstrumentType::kSynth)
-      return false;
     if ((ins.flags & 0xf0u) != 0u)      // reserved, so they stay free to mean
       return false;                     // something in a later version
-    if (ins.env_sustain > 64)
-      return false;
-    // `transpose` is a whole signed byte, and the check that used to narrow it
-    // to +/-48 was a guess that became wrong. The playable range is now
-    // kMinNote..note_max -- 143 semitones -- and an XM's `relative_note` lands
-    // here, so four octaves is not enough to express what a file can ask for.
-    // `note_transposed` clamps the *result* into range, which is what makes any
-    // value here safe.
-
-    // Only when the filter bit is set. An instrument with no filter carries a
-    // zero cutoff, and a range check on a field nothing reads would refuse
-    // every file that does not use one.
-    if ((ins.flags & kInstrumentFilter) != 0u &&
-        (ins.filter_cutoff_hz < 20u || ins.filter_cutoff_hz > 20000u))
-      return false;
-    if (ins.type == (uint8_t) InstrumentType::kWaveBuiltin &&
-        ins.wave_index >= (uint8_t) kBuiltinWaveCount)
+    // Every per-field bound, from the table `module_save` also walks. The
+    // conditional ones come with it: a cutoff is checked only behind its bit, a
+    // wave index only on a built-in shape, a loop only when there is one.
+    if (!instrument_fields_valid(ins))
       return false;
 
-    // Derived, never trusted: one width field that could disagree with `type`
-    // is one way for a file to talk a reader into a stride it did not check.
-    ins.bits = (ins.type == (uint8_t) InstrumentType::kPcm16) ? 16u : 8u;
+    ins.bits = instrument_bits_for(ins.type);
     const size_t bps = (size_t) (ins.bits / 8u);
 
     // `length * bps` is a multiply that can wrap on a 32-bit size_t; the
@@ -598,19 +1044,15 @@ module_load(Module *module, const uint8_t *data, size_t size) {
         (size_t) ins.length > (blob_bytes - (size_t) offset) / bps)
       return false;
 
-    // A loop must lie inside the sample. A module with a loop running off the
-    // end is the shape that reads past the blob on every repeat, for as long
-    // as the tune plays, which is why this is checked rather than clamped.
-    if (ins.loop_len > 0) {
-      if ((size_t) ins.loop_start >= (size_t) ins.length)
-        return false;
-      if ((size_t) ins.loop_len > (size_t) ins.length - (size_t) ins.loop_start)
-        return false;
-      // A loop of one frame is a denormal-rate buzz and, more to the point, a
-      // trivial infinite loop in the mixer's advance. Treat it as one-shot.
-      if (ins.loop_len < 2)
-        ins.loop_len = 0;
-    }
+    // A loop of one frame is a denormal-rate buzz and, more to the point, a
+    // trivial infinite loop in the mixer's advance. Treat it as one-shot.
+    //
+    // A coercion, not a bound, which is why it is here and not in the table:
+    // the containment check -- a loop running off the end reads past the blob
+    // on every repeat, for as long as the tune plays -- is `InsParam::kLoopLen`
+    // and has already run above.
+    if (ins.loop_len > 0 && ins.loop_len < 2)
+      ins.loop_len = 0;
     ins.data = (const int8_t *) (const void *) (blob + offset);
 
     // A built-in shape carries nothing in the blob: whatever the entry claimed
@@ -699,16 +1141,13 @@ module_load(Module *module, const uint8_t *data, size_t size) {
     ins.synth_dist = r[12];
     ins.synth_dist_mix = r[13];
     ins.synth_wave = r[14];
-    // A voice this reader does not have is a drum it would play as another one,
-    // which is the quiet kind of wrong. Refused, like every other range here.
-    if (ins.synth_voice >= (uint8_t) kSynthVoiceCount)
-      return false;
-    // Checked whatever the voice: the two enumerated fields are properties of
-    // the record, and a value outside them is a file that has gone wrong rather
-    // than a setting the bass happens not to be reading today.
-    if (ins.synth_dist >= (uint8_t) kSynthDistKinds)
-      return false;
-    if (ins.synth_wave >= (uint8_t) kSynthWaveCount)
+    // The same walk again, now that the record is in: a voice this reader does
+    // not have is a drum it would play as another one, which is the quiet kind
+    // of wrong. The enumerated fields are checked whatever the voice, because a
+    // value outside them is a file that has gone wrong rather than a setting
+    // the bass happens not to be reading today -- which is why they are `Inert`
+    // and not `Absent`, and why this walk still tests them.
+    if (!instrument_fields_valid(ins))
       return false;
     for (int k = 15; k < kSynthParamBytes; ++k)  // reserved, so it stays free
       if (r[k] != 0u)                            // to mean something later
@@ -828,49 +1267,27 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   int synth_count = 0;
   for (int i = 0; i < module->instrument_count; ++i) {
     const Instrument &ins = module->instruments[i];
-    if (ins.volume > 64)
-      return false;
-    if (ins.finetune < -8 || ins.finetune > 7)
-      return false;
+    // Structural, and only this end has the context for it: a length with
+    // nothing behind it is a writer bug, not a file that has gone wrong.
     if (ins.length > 0 && ins.data == nullptr)
       return false;
-    if (ins.loop_len > 0) {
-      if (ins.loop_start >= ins.length)
-        return false;
-      if (ins.loop_len > ins.length - ins.loop_start)
-        return false;
-    }
-    // The same field checks the loader makes, so a file this writes is a file
-    // that loads. A writer and a reader that disagree about a range produce a
-    // save nobody can open.
-    if (ins.type > (uint8_t) InstrumentType::kSynth)
+    if ((ins.flags & 0xf0u) != 0u)   // reserved, exactly as the loader has it
       return false;
-    if ((ins.flags & 0xf0u) != 0u)
-      return false;
-    if (ins.env_sustain > 64)
+    // **The same table the loader walks, so a file this writes is a file that
+    // loads.** These were the loader's checks written out a second time, and a
+    // writer and a reader that disagree about a range produce a save nobody can
+    // open -- which is what happened to `transpose`.
+    if (!instrument_fields_valid(ins))
       return false;
 
-    if ((ins.flags & kInstrumentFilter) != 0u &&
-        (ins.filter_cutoff_hz < 20u || ins.filter_cutoff_hz > 20000u))
-      return false;
     if (ins.type == (uint8_t) InstrumentType::kSynth) {
-      // The same check the loader makes, so a file this writes is a file that
-      // loads. A synth's sample fields are written and read back like anything
-      // else -- a SYNTH instrument names no blob in practice, but nothing here
-      // forces `length` to zero, and carrying what is there costs one entry.
-      if (ins.synth_voice >= (uint8_t) kSynthVoiceCount)
-        return false;
-      if (ins.synth_dist >= (uint8_t) kSynthDistKinds)
-        return false;
-      if (ins.synth_wave >= (uint8_t) kSynthWaveCount)
-        return false;
+      // A synth's sample fields are written and read back like anything else --
+      // a SYNTH instrument names no blob in practice, but nothing here forces
+      // `length` to zero, and carrying what is there costs one entry.
       ++synth_count;
     }
-    if (ins.type == (uint8_t) InstrumentType::kWaveBuiltin) {
-      if (ins.wave_index >= (uint8_t) kBuiltinWaveCount)
-        return false;
+    if (ins.type == (uint8_t) InstrumentType::kWaveBuiltin)
       continue;         // generated at load, so it stores nothing at all
-    }
     const bool wide = ins.type == (uint8_t) InstrumentType::kPcm16;
     blob_bytes += (size_t) ins.length * (size_t) (wide ? 2u : 1u);
   }
@@ -3017,14 +3434,6 @@ note_fx_describe_extended(TextOut *t, uint8_t param) {
 // two independent nibbles. `ParamShape` says which of those a command is and
 // `mix::command_value_text` renders the byte accordingly, which is the honest
 // version of the same information.
-
-// What a command does with its parameter byte.
-enum class ParamShape {
-  Continuous,   // a magnitude: a level, a speed, a number of ticks
-  Choice,       // one of `choice_count` named alternatives
-  SplitNibble,  // two independent numbers packed into the one byte
-  Unused        // read by nothing; the command is the whole cell
-};
 
 // One row of a command table: everything static about a command number.
 // `mix::CommandInfo` is this resolved for a lane and a mixer.

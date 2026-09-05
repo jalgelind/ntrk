@@ -265,6 +265,18 @@ const int kTuneBytes = 8;
 const int kSwingUnit = 4096;
 const int kSwingMax = 2047;
 
+// What a command does with its parameter byte, and what an instrument field is.
+//
+// **Shared by both tables on purpose.** An FXPL filter-type dropdown and an
+// instrument filter-type dropdown are the same control over the same four
+// names; giving them two shapes would be two code paths drawing one thing.
+enum class ParamShape {
+  Continuous,   // a magnitude: a level, a speed, a number of ticks
+  Choice,       // one of `choice_count` named alternatives
+  SplitNibble,  // two independent numbers packed into the one byte
+  Unused        // read by nothing; the command is the whole cell
+};
+
 struct Instrument {
   const int8_t *data = nullptr;   // frames, into the file buffer or a built-in
   uint32_t length = 0;            // frames
@@ -280,7 +292,7 @@ struct Instrument {
   uint8_t type = (uint8_t) InstrumentType::kPcm8;
   uint8_t bits = 8;               // derived from `type`, never read from a file
   uint8_t flags = 0;
-  int8_t transpose = 0;           // -48..48 semitones
+  int8_t transpose = 0;           // a whole signed byte; see InsParam::kTranspose
   uint16_t env_attack_ms = 0;
   uint16_t env_decay_ms = 0;
   uint16_t env_release_ms = 0;
@@ -324,6 +336,15 @@ struct Instrument {
   // business having an opinion on an encoding.
   char name[kNameBytes + 1] = {};
 };
+
+// The sample width `type` implies. **Derived, never read from a file and never
+// spelled twice:** one width field that could disagree with `type` is one way
+// for a file to talk a reader into a stride it did not check, and one copy of
+// this expression that drifts is the same bug with an editor holding the pen.
+inline uint8_t
+instrument_bits_for(uint8_t type) {
+  return type == (uint8_t) InstrumentType::kPcm16 ? (uint8_t) 16u : (uint8_t) 8u;
+}
 
 // One cell. Four bytes, because that is what a pattern is mostly made of and a
 // tune is thousands of them: 64 rows by 4 channels by 4 bytes is a 1K pattern.
