@@ -2533,6 +2533,104 @@ player_run_end(Player *player, int run) {
     player->until_tick -= (double) run;
 }
 
+// ---- Advancing without rendering (T52) -------------------------------------
+//
+// **The same loop `render_add` runs, with the audio half not written.** It calls
+// `player_run_begin`/`player_run_end` for the tick logic and `channel_sample`
+// for the voice walk -- the same two functions, so there is no second sequencer
+// to drift and no second copy of what a frame does to a voice.
+//
+// **The voices are still walked, and that is the point rather than an
+// oversight.** Everything a frame moves -- `pos`, `playing`, and the envelope --
+// is a function of `step` and the frame count and never of a sample's value, so
+// walking them reproduces the state exactly; skipping them would not merely
+// lose amplitude, it would play DIFFERENT NOTES. `player_row`'s tie test reads
+// `ch->playing` and `ch->env_stage`, both written by the walk, so a tie that
+// should have struck (because a long sample ran out on the way) strikes only if
+// the walk happened. That read is the only coupling of its kind in the
+// sequencer, which is what makes it both real and cheap to honour.
+//
+// What is skipped is everything outside the voice: the pan gains, the summing,
+// the clip, the buffer, and -- for a caller using the mixer -- the whole effect
+// chain.
+//
+// **A caller using `ntrk_mix` must `mixer_reset` before skipping.** `fxpl_run`
+// catches up by tick delta, so a skip of thousands of ticks leaves it thousands
+// of slide steps behind, and the next block would run every one of them and
+// slam each pan, gain and cutoff to its rail.
+inline void
+player_skip(Player *player, double rate, int frames) {
+  if (player == nullptr || player->module == nullptr || !player->playing)
+    return;
+  if (frames <= 0)
+    return;
+
+  const Module *m = player->module;
+  int frame = 0;
+  while (frame < frames) {
+    const int run = player_run_begin(player, rate, frames - frame);
+    if (run == 0)
+      return;
+    for (int i = 0; i < run; ++i) {
+      for (int c = 0; c < m->channels; ++c) {
+        Channel *ch = &player->channels[c];
+        if (ch->instrument <= 0)
+          continue;
+        // The value is discarded; the state it advances is the whole reason
+        // this is here. Muted channels are walked too, exactly as they are in
+        // `render_add` -- a channel that stopped being read would freeze.
+        (void) channel_sample(ch, m->instruments[ch->instrument - 1]);
+      }
+    }
+    frame += run;
+    player_run_end(player, run);
+  }
+}
+
+// Advance to the first tick of `(order, row)`, or give up.
+//
+// **Bounded, and the bound is the answer to a real question**: a row can be one
+// a tune never reaches, because a `Bxx` jumps over it or a loop never leaves the
+// section it is in. Without a cap that is a hang; with one it is a `false` the
+// caller can report. The cap counts TICKS rather than iterations, so it means
+// the same thing at every tempo.
+//
+// Returns false and leaves the player where it got to, which is a position the
+// caller may still render from -- there is nothing invalid about it.
+inline bool
+player_skip_to(Player *player, double rate, int order, int row,
+               uint64_t max_ticks) {
+  if (player == nullptr || player->module == nullptr || !player->playing)
+    return false;
+  const Module *m = player->module;
+  if (order < 0 || order >= m->order_count || row < 0 || row >= m->rows)
+    return false;
+
+  const uint64_t start = player->ticks_elapsed;
+  while (player->playing) {
+    if (player->order == order && player->row == row)
+      return true;
+    if (player->ticks_elapsed - start > max_ticks)
+      return false;
+    // One run, which `player_run_begin` bounds by the next tick -- so the
+    // position is re-examined at every tick boundary and never overshot by
+    // more than the frames inside one.
+    const int run = player_run_begin(player, rate, kMaxBlock);
+    if (run == 0)
+      return false;
+    for (int i = 0; i < run; ++i) {
+      for (int c = 0; c < m->channels; ++c) {
+        Channel *ch = &player->channels[c];
+        if (ch->instrument <= 0)
+          continue;
+        (void) channel_sample(ch, m->instruments[ch->instrument - 1]);
+      }
+    }
+    player_run_end(player, run);
+  }
+  return false;
+}
+
 inline void
 render_add(Player *player, double *buffer, int frames, int channels,
            float sample_rate) {

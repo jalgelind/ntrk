@@ -5299,6 +5299,114 @@ test_names() {
   CHECK(saw);
 }
 
+// ---- T52, advancing without rendering -----------------------------------------
+
+static void
+test_skip() {
+  printf("skipping frames leaves the player where rendering them would\n");
+
+  Spec s;
+  s.channels = 2;
+  s.rows = 8;
+  s.orders = 4;
+  s.patterns = 4;
+  s.sample_len = 64;
+  s.loop_len = 0;          // ONE-SHOT: a sample that runs out is the whole point
+  build(s);
+  for (int p = 0; p < 4; ++p) {
+    g_bytes[32u + (size_t) p] = (uint8_t) p;
+    const size_t at = patterns_at(s) +
+                      (size_t) p * (size_t) s.rows * (size_t) s.channels * 4u;
+    g_bytes[at + 0] = (uint8_t) (13 + p * 3);      // a note on row 0 of each
+    g_bytes[at + 1] = 1u;
+  }
+  // Row 4 of pattern 2 carries a note with NO instrument column -- the tie case.
+  // Whether it ties or strikes depends on `ch->playing`, which only the voice
+  // walk moves, so this is the row the negative control is about.
+  {
+    const size_t at = patterns_at(s) +
+                      2u * (size_t) s.rows * (size_t) s.channels * 4u +
+                      4u * (size_t) s.channels * 4u;
+    g_bytes[at + 0] = 25u;
+    g_bytes[at + 1] = 0u;                          // no instrument: inherits
+  }
+
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+
+  ntrk::Player probe;
+  ntrk::player_start(&probe, &m);
+  const double per_row =
+      ntrk::frames_per_tick(&probe, 48000.0) * (double) m.speed;
+  const int pre = (int) (per_row * (double) (s.rows * 2));   // two whole orders
+  const int n = (int) (per_row * (double) s.rows);           // one more order
+
+  static double a[400000];
+  static double b[400000];
+  static double scratch[400000];
+  CHECK((size_t) n * 2u <= sizeof a / sizeof a[0]);
+  CHECK((size_t) pre * 2u <= sizeof scratch / sizeof scratch[0]);
+
+  // THE GATE. Skipping `pre` frames must leave the player in the state that
+  // rendering and discarding them does -- so the audio that follows is equal
+  // sample for sample.
+  ntrk::Player pa;
+  ntrk::player_start(&pa, &m);
+  ntrk::player_skip(&pa, 48000.0, pre);
+  for (int i = 0; i < n * 2; ++i) a[i] = 0.0;
+  ntrk::render_add(&pa, a, n, 2, 48000.f);
+
+  ntrk::Player pb;
+  ntrk::player_start(&pb, &m);
+  for (int i = 0; i < pre * 2; ++i) scratch[i] = 0.0;
+  ntrk::render_add(&pb, scratch, pre, 2, 48000.f);
+  for (int i = 0; i < n * 2; ++i) b[i] = 0.0;
+  ntrk::render_add(&pb, b, n, 2, 48000.f);
+
+  CHECK(memcmp(a, b, (size_t) n * 2u * sizeof(double)) == 0);
+  CHECK(pa.order == pb.order);
+  CHECK(pa.row == pb.row);
+  CHECK(pa.ticks_elapsed == pb.ticks_elapsed);
+
+  // **The negative control, and it is what makes the gate bite.** The sample is
+  // one-shot and shorter than the rows it is held over, so by the time the tie
+  // row arrives the voice has run out and `playing` is false -- which is what
+  // makes that row STRIKE rather than tie. Only the voice walk sets it, so a
+  // skip that advanced the sequencer and left the voices alone would arrive
+  // with `playing` still true and play a different note. Asserting the flag
+  // asserts the mechanism rather than its symptom.
+  // Against a player rendered EXACTLY `pre` frames -- `pb` above has since
+  // rendered `n` more, and comparing a skipped player to it would be comparing
+  // two different positions and passing only by luck.
+  ntrk::Player pc;
+  ntrk::player_start(&pc, &m);
+  ntrk::player_skip(&pc, 48000.0, pre);
+  ntrk::Player pr;
+  ntrk::player_start(&pr, &m);
+  for (int i = 0; i < pre * 2; ++i) scratch[i] = 0.0;
+  ntrk::render_add(&pr, scratch, pre, 2, 48000.f);
+
+  CHECK(pc.channels[0].playing == pr.channels[0].playing);
+  CHECK(!pc.channels[0].playing);      // it really did run out; the walk happened
+  CHECK(pc.channels[0].pos == pr.channels[0].pos);
+  CHECK(pc.channels[0].env_stage == pr.channels[0].env_stage);
+  CHECK(pc.channels[0].env_level == pr.channels[0].env_level);
+
+  // player_skip_to lands on the row it names.
+  ntrk::Player pd;
+  ntrk::player_start(&pd, &m);
+  CHECK(ntrk::player_skip_to(&pd, 48000.0, 2, 4, 100000u));
+  CHECK(pd.order == 2);
+  CHECK(pd.row == 4);
+
+  // ...and gives up rather than hanging on a row the tune never reaches.
+  ntrk::Player pe;
+  ntrk::player_start(&pe, &m);
+  CHECK(ntrk::player_loop_range(&pe, 0, 0));      // never leaves order 0
+  CHECK(!ntrk::player_skip_to(&pe, 48000.0, 3, 0, 500u));
+  CHECK(pe.order == 0);                            // and is still somewhere valid
+}
+
 // ---- T51, the host's loop over an order range ---------------------------------
 
 static void
@@ -5497,6 +5605,7 @@ main(void) {
   test_names();
   test_tune();
   test_loop_range();
+  test_skip();
   test_mute();
   test_seek();
   test_geometry_shrinks_under_player();
