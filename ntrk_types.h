@@ -49,6 +49,12 @@ const int kMaxRows = 256;
 const int kMaxBlock = 64;
 const int kMaxInstruments = 64;
 
+// Slices per instrument. **Forced by `Note::param` being one byte**: an index
+// past 255 is data no cell could name, so a larger ceiling would be storage for
+// boundaries nothing can reach. `slice_count` is a `u16` in the file precisely
+// so that 256 is representable.
+const int kMaxSlices = 256;
+
 // The highest note a file may name. **The new octaves go upward and that is
 // forced rather than chosen**: notes 1..36 must keep their exact meaning,
 // because a pattern block is a view over the caller's bytes and can never be
@@ -282,6 +288,17 @@ struct Instrument {
   uint32_t length = 0;            // frames
   uint32_t loop_start = 0;
   uint32_t loop_len = 0;          // 0 means one-shot
+
+  // The SLIC table's boundaries for this instrument: `slice_count` frame
+  // offsets, little-endian, **pointed at rather than copied**. 64 × 256 × 4 is
+  // 65 KB, ten times the whole `Module`, which is the same argument that makes
+  // `data` a view.
+  //
+  // **Raw bytes rather than `const uint32_t *`**, because a block's offset in
+  // the file is arbitrary: a cast would be unaligned and host-endian. One
+  // accessor, `slice_offset`, is the single reader of a boundary.
+  const uint8_t *slices = nullptr;
+  uint16_t slice_count = 0;
   uint8_t volume = 64;            // 0..64
   int8_t finetune = 0;            // -8..7
 

@@ -815,7 +815,35 @@ const uint16_t kBlockName = 0x0002;
 const uint16_t kBlockTune = 0x0006;
 const uint16_t kBlockMacr = 0x0004;
 const uint16_t kBlockMixr = 0x0005;
+const uint16_t kBlockSlic = 0x000A;
 const uint16_t kBlockCritical = 0x0001;   // a directory entry's flags, bit 0
+
+// SLIC: `u16 table_count`, `u16` reserved, then one four-byte record per
+// instrument that has slices -- `u8 instrument` (1-based), `u8` reserved,
+// `u16 slice_count` -- and then, in the same order, every table's `u32 LE`
+// frame offsets end to end.
+//
+// **Deliberately NOT MACR's fixed-max record.** MACR's is 52 bytes because
+// `kMaxMacroTargets` is 8; a fixed slice record would be `4 + kMaxSlices * 4`
+// and would bake the ceiling into the wire format, where it could never be
+// raised without a version bump. Two loops buy that.
+//
+// The exact length is `4 + table_count*4 + total*4`, so the whole size is known
+// before any offset is dereferenced -- the loader's own discipline.
+const int kSlicHeaderBytes = 4;
+const int kSlicRecordBytes = 4;
+const int kSlicOffsetBytes = 4;
+
+// `SLC` — start the note at a slice from the instrument's `SLIC` table.
+//
+// **Past the nibble on purpose.** ProTracker's effect column is a nibble and
+// every one of its sixteen values is spent; this format's `Note::effect` is a
+// whole byte, so a new command starts at 0x10 rather than stealing `Exx`'s
+// sub-nibble space. The consequence is that **three display functions which
+// mask `effect & 15` have to know about it** -- `note_fx_index`,
+// `note_fx_describe` and `note_fx_repr` -- or `SLC 05` prints as `ARP`,
+// describes as *Arpeggio*, and renders as `005`, colliding with arpeggio.
+const uint8_t kFxSlice = 0x10;
 
 // The FXPL payload's geometry prefix: `u16 fx_columns`, `u16 meta_columns`,
 // then the cells. In the payload rather than in the header because the header
@@ -954,6 +982,8 @@ module_load(Module *module, const uint8_t *data, size_t size) {
   size_t tune_bytes = 0;
   const uint8_t *macr = nullptr;
   size_t macr_bytes = 0;
+  const uint8_t *slic = nullptr;
+  size_t slic_bytes = 0;
   for (int i = 0; i < block_count; ++i) {
     const uint8_t *e = directory + (size_t) i * (size_t) kDirectoryEntryBytes;
     const uint16_t id = read_u16(e + 0);
@@ -1031,6 +1061,12 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // than a second copy of the parse made here.
       synp = data + offset;
       synp_bytes = (size_t) bytes;
+    } else if (id == kBlockSlic) {
+      // Judged against the instrument table -- both the count and every
+      // instrument's `length` -- which is parsed below, so the check is made
+      // there for the same reason SYNP's and NAME's are.
+      slic = data + offset;
+      slic_bytes = (size_t) bytes;
     } else if (id == kBlockMixr) {
       // **Optional, and it has to be**: the mixer's configuration is what a
       // replayer has no concept of, so a reader that skips it plays the tune
@@ -1284,7 +1320,105 @@ module_load(Module *module, const uint8_t *data, size_t size) {
         return false;
   }
 
+  // SLIC, once the instrument table has said how many instruments there are and
+  // how long each sample is. Here rather than in the directory loop for the
+  // same reason SYNP and NAME are: the offsets are judged against `length`, and
+  // a directory may name the blocks in either order.
+  //
+  // Two refusals fall out of the general rules with no case of their own. A
+  // SYNTH instrument has `length == 0`, so `offset >= length` refuses every
+  // slice on it -- no type test needed. And **offset 0 need not be the first
+  // boundary**, because a break may have a lead-in, so the first offset is
+  // checked against `length` like every other and not against zero.
+  if (slic != nullptr) {
+    if (slic_bytes < (size_t) kSlicHeaderBytes)
+      return false;
+    const int table_count = (int) read_u16(slic + 0);
+    if (table_count < 1 || table_count > kMaxInstruments)
+      return false;
+    if (read_u16(slic + 2) != 0u)     // reserved, so it stays free to mean
+      return false;                   // something later
+
+    // The records first, and the total they claim, so the block's exact length
+    // is settled before a single offset is read.
+    size_t total = 0;
+    int previous = 0;                 // 1-based; 0 is "no record yet"
+    for (int i = 0; i < table_count; ++i) {
+      const size_t rec = (size_t) kSlicHeaderBytes +
+                         (size_t) i * (size_t) kSlicRecordBytes;
+      // The header plus the records has to be inside the block before the
+      // records are read -- the length formula below cannot be trusted until
+      // the numbers it is built from have themselves been read safely.
+      if (slic_bytes < rec + (size_t) kSlicRecordBytes)
+        return false;
+      const int instrument = (int) slic[rec + 0];
+      if (slic[rec + 1] != 0u)
+        return false;
+      const int count = (int) read_u16(slic + rec + 2);
+      // **Strictly increasing**, which makes one-table-per-instrument free: a
+      // repeat is a file that disagrees with itself about which table an
+      // instrument has, and which one wins would be a reader's private
+      // business rather than the format's.
+      if (instrument <= previous || instrument > module->instrument_count)
+        return false;
+      previous = instrument;
+      if (count < 1 || count > kMaxSlices)
+        return false;
+      total += (size_t) count;
+    }
+
+    if (slic_bytes != (size_t) kSlicHeaderBytes +
+                          (size_t) table_count * (size_t) kSlicRecordBytes +
+                          total * (size_t) kSlicOffsetBytes)
+      return false;
+
+    // Now the offsets, which start where the records end.
+    size_t at_offset = (size_t) kSlicHeaderBytes +
+                       (size_t) table_count * (size_t) kSlicRecordBytes;
+    for (int i = 0; i < table_count; ++i) {
+      const size_t rec = (size_t) kSlicHeaderBytes +
+                         (size_t) i * (size_t) kSlicRecordBytes;
+      const int instrument = (int) slic[rec + 0];
+      const int count = (int) read_u16(slic + rec + 2);
+      Instrument &ins = module->instruments[instrument - 1];
+
+      uint32_t last = 0;
+      bool first = true;
+      for (int k = 0; k < count; ++k) {
+        const uint32_t off = read_u32(slic + at_offset +
+                                      (size_t) k * (size_t) kSlicOffsetBytes);
+        // Inside the sample, which is what makes `slice_offset` safe to hand
+        // straight to the mixer as a position.
+        if (off >= ins.length)
+          return false;
+        // Strictly increasing, so a table is an ordered chop rather than a bag
+        // of positions -- and so an editor cannot write two boundaries at one
+        // frame, which would be two slices one of which is empty.
+        if (!first && off <= last)
+          return false;
+        last = off;
+        first = false;
+      }
+      ins.slices = slic + at_offset;
+      ins.slice_count = (uint16_t) count;
+      at_offset += (size_t) count * (size_t) kSlicOffsetBytes;
+    }
+  }
+
   return true;
+}
+
+/// The frame a slice starts at. **The one reader of a boundary**, because the
+/// bytes are unaligned and little-endian wherever the block happened to land.
+///
+/// Out of range is 0 rather than an error: every caller is asking "where does
+/// this slice start", and the answer for a slice that does not exist is the top
+/// of the sample -- which is what `SLC` with a bad index does, audibly.
+inline uint32_t
+slice_offset(const Instrument &ins, int index) {
+  if (ins.slices == nullptr || index < 0 || index >= (int) ins.slice_count)
+    return 0u;
+  return read_u32(ins.slices + (size_t) index * (size_t) kSlicOffsetBytes);
 }
 
 // The mirror of module_load: the same blocks, in the same order, refusing
@@ -1419,6 +1553,41 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const bool want_macr = module->macro_count > 0;
   const bool want_mixr = module->has_mix;
 
+  // SLIC. **Every load-side invariant again**, plus one the loader gets for
+  // free: a `slice_count` with no `slices` pointer is a module that cannot be
+  // written, because there is nothing to write.
+  //
+  // Not checked, deliberately: whether any cell actually uses `SLC`. Which
+  // instrument an `SLC` applies to depends on the channel's RUNNING instrument
+  // -- a note with an empty instrument column inherits the last one -- so the
+  // writer would have to replay the order list to know. A rule the writer
+  // cannot evaluate is not a rule. A table with no cells using it is an
+  // editor's normal working state, exactly as a macro table with no meta lanes
+  // is.
+  int slic_tables = 0;
+  size_t slic_offsets = 0;
+  for (int i = 0; i < module->instrument_count; ++i) {
+    const Instrument &ins = module->instruments[i];
+    if (ins.slice_count == 0)
+      continue;
+    if (ins.slices == nullptr)
+      return false;
+    if ((int) ins.slice_count > kMaxSlices)
+      return false;
+    uint32_t last = 0;
+    for (int k = 0; k < (int) ins.slice_count; ++k) {
+      const uint32_t off = slice_offset(ins, k);
+      if (off >= ins.length)
+        return false;
+      if (k > 0 && off <= last)
+        return false;
+      last = off;
+    }
+    ++slic_tables;
+    slic_offsets += (size_t) ins.slice_count;
+  }
+  const bool want_slic = slic_tables > 0;
+
   // A NAME block is written only where a name is actually set. All-empty names
   // are what a module without one already has, so writing 22 zero bytes per
   // instrument would grow every file to say nothing.
@@ -1433,7 +1602,8 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
 
   const int block_count = (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
                           (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
-                          (want_macr ? 1 : 0) + (want_mixr ? 1 : 0);
+                          (want_macr ? 1 : 0) + (want_mixr ? 1 : 0) +
+                          (want_slic ? 1 : 0);
   const size_t directory_bytes =
       (size_t) block_count * (size_t) kDirectoryEntryBytes;
   // Lanes rather than channels, and the four-byte prefix that says how many.
@@ -1452,10 +1622,15 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
                       (size_t) module->macro_count * (size_t) kMacroRecordBytes
                 : 0u;
   const size_t mixr_bytes = want_mixr ? (size_t) kMixrBytes : 0u;
+  const size_t slic_bytes =
+      want_slic ? (size_t) kSlicHeaderBytes +
+                      (size_t) slic_tables * (size_t) kSlicRecordBytes +
+                      slic_offsets * (size_t) kSlicOffsetBytes
+                : 0u;
   const size_t total = (size_t) kHeaderBytes + order_bytes + instrument_bytes +
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
                        tune_bytes + name_bytes + synp_bytes + macr_bytes +
-                       mixr_bytes;
+                       mixr_bytes + slic_bytes;
 
   *written = total;
   if (out == nullptr)
@@ -1653,6 +1828,42 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
         out[at + (size_t) k] = 0u;                   // rather than left over
       at += (size_t) kSynthParamBytes;
     }
+  }
+
+  // SLIC, written **critical**. A reader that predates `SLC` falls through its
+  // switch and plays every slice from the top: a chop that sounds wrong with
+  // nothing to point at. The block's own contents are what decide where a note
+  // starts, so skipping it changes what is heard -- which is this format's one
+  // test for the flag.
+  if (want_slic) {
+    write_u16(out + entry + 0, kBlockSlic);
+    write_u16(out + entry + 2, kBlockCritical);
+    write_u32(out + entry + 4, (uint32_t) at);
+    write_u32(out + entry + 8, (uint32_t) slic_bytes);
+    entry += (size_t) kDirectoryEntryBytes;
+
+    write_u16(out + at + 0, (uint16_t) slic_tables);
+    write_u16(out + at + 2, 0u);                 // reserved, and zeroed
+    size_t rec = at + (size_t) kSlicHeaderBytes;
+    size_t off = rec + (size_t) slic_tables * (size_t) kSlicRecordBytes;
+
+    // **One walk of the instrument table, in order**, which is what makes the
+    // ids strictly increasing without sorting anything -- and is the same
+    // argument that binds a SYNP record or a NAME to its instrument.
+    for (int i = 0; i < module->instrument_count; ++i) {
+      const Instrument &ins = module->instruments[i];
+      if (ins.slice_count == 0)
+        continue;
+      out[rec + 0] = (uint8_t) (i + 1);          // 1-based, like a Note's
+      out[rec + 1] = 0u;                         // reserved, and zeroed
+      write_u16(out + rec + 2, ins.slice_count);
+      rec += (size_t) kSlicRecordBytes;
+      for (int k = 0; k < (int) ins.slice_count; ++k) {
+        write_u32(out + off, slice_offset(ins, k));
+        off += (size_t) kSlicOffsetBytes;
+      }
+    }
+    at += slic_bytes;
   }
 
   // MACR, written **critical**: a meta cell whose macro table a reader skipped
@@ -2227,13 +2438,17 @@ note_transposed(const Module *m, const Channel *ch, int note) {
 // ticks later, and a delayed note that took a different path to sounding would
 // be a second implementation to keep in step with this one.
 inline void
-channel_trigger(const Module *m, Channel *ch, int note, uint8_t param,
-                bool with_offset, double sample_rate) {
+channel_trigger(const Module *m, Channel *ch, int note, double start_frame,
+                double sample_rate) {
   const double period =
       period_for(note_transposed(m, ch, note), ch->finetune);
   ch->base_period = period;
   ch->period = period;
-  ch->pos = with_offset ? (double) ((int) param * 256) : 0.0;
+  // **One frame count, not an effect's parameter.** This is the only writer of
+  // the starting position and the `pos >= length` check sits right under it;
+  // taking a frame keeps both facts here, where taking a slice INDEX would need
+  // a second position computation and a second copy of that check.
+  ch->pos = start_frame;
 
   // Bit 2 of the waveform selector means the wave keeps running across a new
   // note instead of restarting, which is the difference between a vibrato that
@@ -2315,7 +2530,7 @@ player_preview(Player *player, int channel, int note, int instrument,
   ch->accent = 0.f;
   ch->slide_ticks = 0;
 
-  channel_trigger(m, ch, note, 0, false, sample_rate);
+  channel_trigger(m, ch, note, 0.0, sample_rate);
   return true;
 }
 
@@ -2504,18 +2719,39 @@ player_row(Player *player, double sample_rate) {
         ch->delay_note = n.note;
         ch->playing = false;
       } else {
-        // 9xx remembers its parameter like every other effect here: `900`
-        // repeats the last offset rather than restarting at zero, which is the
-        // idiom a sample chopped into slices by offset depends on. The memory
-        // has to be read here rather than in the switch below, because the
-        // switch runs after the note has already started.
-        uint8_t start = param;
+        // Where the note starts, in frames. Three sources and they cannot
+        // collide: a `Note` carries ONE effect byte and this reads one cell per
+        // channel, so `9xx` and `SLC` on the same row of the same channel is
+        // not a case -- there is no precedence rule here because there is
+        // nothing to order.
+        double start = 0.0;
         if (effect == 0x9) {
+          // 9xx remembers its parameter like every other effect here: `900`
+          // repeats the last offset rather than restarting at zero, which is
+          // the idiom a sample chopped by offset depends on. The memory has to
+          // be read here rather than in the switch below, because the switch
+          // runs after the note has already started.
           if (param != 0)
             ch->offset = param;
-          start = ch->offset;
+          start = (double) ((int) ch->offset * 256);
+        } else if (effect == kFxSlice && ch->instrument > 0) {
+          // **No memory, so `SLC 00` is slice 0.** Every memory effect here
+          // uses `param != 0` as its sentinel, which costs the command the
+          // value zero -- and slice 0 is the downbeat, the most-used index in a
+          // chopped break. `9xx` needs memory because its parameter means
+          // nothing on its own; `SLC` indexes a table the file carries, so the
+          // TABLE is the memory. `ch->offset` is deliberately untouched, so a
+          // later `900` still repeats the last `9xx` offset.
+          //
+          // An index past the count -- or no table at all, which is the same
+          // thing with `slice_count == 0` -- yields 0 and the note plays from
+          // the top. Not `9xx`'s silence: that is a memory-safety rule about a
+          // position past the buffer, and a bad index never produces a position
+          // at all. This fails audibly rather than inaudibly.
+          start = (double) slice_offset(m->instruments[ch->instrument - 1],
+                                        (int) param);
         }
-        channel_trigger(m, ch, n.note, start, effect == 0x9, sample_rate);
+        channel_trigger(m, ch, n.note, start, sample_rate);
       }
     }
 
@@ -2708,7 +2944,7 @@ player_effects(Player *player, double sample_rate) {
     // what the row's main effect is.
     if (ch->delay_pending && player->tick >= (int) ch->delay_tick) {
       ch->delay_pending = false;
-      channel_trigger(m, ch, (int) ch->delay_note, 0u, false, sample_rate);
+      channel_trigger(m, ch, (int) ch->delay_note, 0.0, sample_rate);
     }
     if (ch->cut_pending && player->tick >= (int) ch->cut_tick) {
       ch->cut_pending = false;
@@ -3393,11 +3629,19 @@ text_step(TextOut *t, uint8_t v) {
 
 // "C40" — ProTracker's own notation, one nibble of effect and a byte of
 // parameter.
+//
+// **A LETTER for the command past the nibble**, which is what XM does with the
+// same problem: `SLC 05` as `005` would be indistinguishable from `ARP 05`, and
+// two commands rendering identically in a pattern grid is worse than an unusual
+// character.
 inline size_t
 note_fx_repr(uint8_t effect, uint8_t param, char *out, size_t cap) {
   TextOut t;
   text_init(&t, out, cap);
-  text_hex(&t, effect & 15u, 1);
+  if (effect == kFxSlice)
+    text_char(&t, 'G');
+  else
+    text_hex(&t, effect & 15u, 1);
   text_hex(&t, param, 2);
   return t.len;
 }
@@ -3577,7 +3821,7 @@ note_fx_table(int *count) {
       "sine", "ramp", "square", "random",
       "sine, no retrigger", "ramp, no retrigger",
       "square, no retrigger", "random, no retrigger"};
-  static const CmdInfo kTable[32] = {
+  static const CmdInfo kTable[33] = {
       {0x00, "ARP", "Arpeggio", ParamShape::SplitNibble, 0, nullptr},
       {0x01, "PTU", "Portamento up", ParamShape::Continuous, 0, nullptr},
       {0x02, "PTD", "Portamento down", ParamShape::Continuous, 0, nullptr},
@@ -3613,16 +3857,31 @@ note_fx_table(int *count) {
       {0xED, "DLY", "Note delay", ParamShape::Continuous, 0, nullptr},
       {0xEE, "PDL", "Pattern delay", ParamShape::Continuous, 0, nullptr},
       {0xEF, "IVL", "Invert loop (no-op)", ParamShape::Unused, 0, nullptr},
+      // Past the nibble. See `kFxSlice`.
+      {0x10, "SLC", "Play slice", ParamShape::Continuous, 0, nullptr},
   };
   if (count != nullptr)
-    *count = 32;
+    *count = 33;
   return kTable;
 }
 
 // Where a cell's `(effect, param)` sits in that table. Always in range: the
-// effect is masked to a nibble and the sub-nibble likewise.
+// byte is either one of the seventeen commands or it is masked to a nibble, and
+// the sub-nibble likewise.
+//
+// **The `SLC` test comes first**, because everything after it masks. A version
+// of this that masked and then asked would report `SLC` as `ARP` and take the
+// other two functions with it -- precisely the bug `kFxSlice` names.
+//
+// **Equality, not `>=`.** One command lives past the nibble; a byte above it is
+// not "the next one", it is a byte this format has not defined, and it masks
+// exactly as it always did. Making the test a range would have handed 0xFF an
+// index of 271 into a table of 33 -- which is how the in-range guarantee above
+// got broken and then caught.
 inline int
 note_fx_index(uint8_t effect, uint8_t param) {
+  if (effect == kFxSlice)
+    return 32;
   return (effect & 15u) == 0xEu ? 16 + (int) ((param >> 4) & 15u)
                                 : (int) (effect & 15u);
 }
@@ -3663,6 +3922,15 @@ note_fx_describe(uint8_t effect, uint8_t param, char *out, size_t cap) {
   text_init(&t, out, cap);
   const long hi = (long) ((param >> 4) & 15);
   const long lo = (long) (param & 15);
+
+  // **Before the mask**, for the reason `note_fx_index` tests it first: this
+  // switch is over a nibble, and `SLC 05` reaching it would be described as an
+  // arpeggio.
+  if (effect == kFxSlice) {
+    text_add(&t, "Play slice ");
+    text_int(&t, (long) param);
+    return t.len;
+  }
 
   switch (effect & 15u) {
     case 0x0:

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -1435,6 +1436,538 @@ test_v2_refusals() {
 // The format's half of MIXR. What the bytes *mean* is the mixer's, and is
 // checked in test_ntrk_mix.cc; what has to hold here is that a block goes out
 // and comes back unchanged, and that a malformed one is refused at both ends.
+// ---- SLIC and SLC ------------------------------------------------------------
+//
+// A slice table on an instrument, and the command that plays one. The two are
+// separable on purpose -- a table with no cells using it is an editor's normal
+// state, and a cell with no table is a note with an ignored effect -- so they
+// are tested apart before they are tested together.
+
+// Point an instrument at `count` boundaries held in a static array, the way an
+// editor does while it works: `Instrument::slices` is a view, so the bytes have
+// to outlive the save.
+static uint8_t g_slice_bytes[4 * ntrk::kMaxSlices];
+
+static void
+set_slices(ntrk::Instrument *ins, const uint32_t *frames, int count) {
+  for (int i = 0; i < count; ++i)
+    ntrk::write_u32(g_slice_bytes + (size_t) i * 4u, frames[i]);
+  ins->slices = g_slice_bytes;
+  ins->slice_count = (uint16_t) count;
+}
+
+static void
+test_slic_block() {
+  printf("a slice table round-trips, and a module without one is unchanged\n");
+
+  Spec s;
+  s.sample_len = 256;
+  build(s);
+  ntrk::Module a;
+  CHECK(ntrk::module_load(&a, g_bytes, g_size));
+  // The default, and the thing every existing file gets: no table at all.
+  CHECK(a.instruments[0].slices == NULL);
+  CHECK(a.instruments[0].slice_count == 0);
+  CHECK(ntrk::slice_offset(a.instruments[0], 0) == 0u);
+
+  // **A module with no SLIC is byte-identical to what it was**, which is the
+  // gate that lets this block exist at all: every shipped tune's bytes are
+  // unmoved.
+  size_t plain = 0;
+  CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &plain));
+  CHECK(plain == g_size);
+  CHECK(memcmp(g_saved, g_bytes, plain) == 0);
+
+  // **Offset 0 need not be the first boundary** -- a break may have a lead-in --
+  // so the table below starts late on purpose.
+  const uint32_t frames[4] = {7u, 64u, 128u, 200u};
+  set_slices(&a.instruments[0], frames, 4);
+
+  size_t need = 0;
+  CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
+  // Exactly the formula: a directory entry, the header, one record, four
+  // offsets. Spelled out rather than derived from the same expression the
+  // writer uses, so a change to either has to be made twice deliberately.
+  CHECK(need == g_size + (size_t) ntrk::kDirectoryEntryBytes + 4u + 4u + 16u);
+
+  ntrk::Module b;
+  CHECK(ntrk::module_load(&b, g_saved, need));
+  CHECK(b.instruments[0].slice_count == 4);
+  for (int i = 0; i < 4; ++i)
+    CHECK(ntrk::slice_offset(b.instruments[0], i) == frames[i]);
+  // Past the end is 0 rather than rubbish -- the answer to "where does a slice
+  // that does not exist start" is the top of the sample, which is what `SLC`
+  // with a bad index does audibly.
+  CHECK(ntrk::slice_offset(b.instruments[0], 4) == 0u);
+  CHECK(ntrk::slice_offset(b.instruments[0], -1) == 0u);
+
+  // And it round-trips again from the loaded module, whose `slices` now points
+  // into the saved buffer rather than at the editor's array.
+  static uint8_t twice[1 << 16];
+  size_t need2 = 0;
+  CHECK(ntrk::module_save(&b, twice, sizeof twice, &need2));
+  CHECK(need2 == need);
+  CHECK(memcmp(twice, g_saved, need) == 0);
+
+  // **Written critical.** A reader that does not know 0x000A must refuse the
+  // file rather than play every slice from the top -- a chop that sounds wrong
+  // with nothing to point at. The directory entry is walked here rather than
+  // assumed, because "which block is last" is the writer's business.
+  {
+    const int blocks = (int) ntrk::read_u16(g_saved + 26);
+    CHECK(blocks == 1);
+    const size_t dir = need - (size_t) ntrk::kDirectoryEntryBytes - 4u - 4u - 16u;
+    CHECK(ntrk::read_u16(g_saved + dir + 0) == ntrk::kBlockSlic);
+    CHECK((ntrk::read_u16(g_saved + dir + 2) & ntrk::kBlockCritical) != 0u);
+
+    // **The negative control for the flag.** Clear the critical bit and this
+    // build still reads it -- it knows the id. What the bit buys is a reader
+    // that does NOT, and that reader's behaviour is exactly the `else if
+    // ((flags & kBlockCritical) != 0u)` branch: so give the block an id nothing
+    // knows and watch the two flag values part company.
+    ntrk::Module c;
+    ntrk::write_u16(g_saved + dir + 0, 0x7FFFu);          // an id from the future
+    ntrk::write_u16(g_saved + dir + 2, 0u);               // ...marked optional
+    CHECK(ntrk::module_load(&c, g_saved, need));          // skipped, and mis-played
+    CHECK(c.instruments[0].slice_count == 0);             // ...which is the harm
+    ntrk::write_u16(g_saved + dir + 2, ntrk::kBlockCritical);
+    CHECK(!ntrk::module_load(&c, g_saved, need));         // refused, which is the point
+    ntrk::write_u16(g_saved + dir + 0, ntrk::kBlockSlic);
+    CHECK(ntrk::module_load(&c, g_saved, need));
+  }
+
+  // A table on the SECOND of two instruments, so the record's 1-based id is
+  // doing work rather than being 1 by coincidence -- and so the offsets that
+  // follow the records are found by the walk rather than by luck.
+  {
+    Spec t;
+    t.instruments = 2;
+    t.sample_len = 128;
+    build(t);
+    ntrk::Module d;
+    CHECK(ntrk::module_load(&d, g_bytes, g_size));
+    const uint32_t two[2] = {16u, 96u};
+    set_slices(&d.instruments[1], two, 2);
+    size_t n2 = 0;
+    CHECK(ntrk::module_save(&d, g_saved, sizeof g_saved, &n2));
+    ntrk::Module e;
+    CHECK(ntrk::module_load(&e, g_saved, n2));
+    CHECK(e.instruments[0].slice_count == 0);
+    CHECK(e.instruments[1].slice_count == 2);
+    CHECK(ntrk::slice_offset(e.instruments[1], 0) == 16u);
+    CHECK(ntrk::slice_offset(e.instruments[1], 1) == 96u);
+  }
+}
+
+static void
+test_slic_refusals() {
+  printf("every SLIC refusal is reachable, and refuses\n");
+
+  // One good file, saved once, then broken one field at a time and repaired --
+  // so each case differs from a file that loads by exactly the thing it is
+  // about.
+  Spec s;
+  s.sample_len = 256;
+  build(s);
+  ntrk::Module a;
+  CHECK(ntrk::module_load(&a, g_bytes, g_size));
+  const uint32_t frames[3] = {0u, 64u, 128u};
+  set_slices(&a.instruments[0], frames, 3);
+  size_t need = 0;
+  CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
+
+  const size_t dir = need - (size_t) ntrk::kDirectoryEntryBytes - 4u - 4u - 12u;
+  const size_t blk = dir + (size_t) ntrk::kDirectoryEntryBytes;
+  const size_t rec = blk + 4u;
+  const size_t off = rec + 4u;
+
+  ntrk::Module b;
+  CHECK(ntrk::module_load(&b, g_saved, need));      // the control: it loads
+
+  // The block header's two fields.
+  ntrk::write_u16(g_saved + blk + 0, 0u);           // table_count 0
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  ntrk::write_u16(g_saved + blk + 0,
+                  (uint16_t) (ntrk::kMaxInstruments + 1));
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  ntrk::write_u16(g_saved + blk + 0, 1u);
+  ntrk::write_u16(g_saved + blk + 2, 1u);           // reserved, and not zero
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  ntrk::write_u16(g_saved + blk + 2, 0u);
+  CHECK(ntrk::module_load(&b, g_saved, need));
+
+  // The record's four bytes.
+  g_saved[rec + 0] = 0u;                            // instrument 0 is not 1-based
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  g_saved[rec + 0] = 2u;                            // ...and there is only one
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  g_saved[rec + 0] = 1u;
+  g_saved[rec + 1] = 1u;                            // reserved, and not zero
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  g_saved[rec + 1] = 0u;
+  ntrk::write_u16(g_saved + rec + 2, 0u);           // slice_count 0
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  ntrk::write_u16(g_saved + rec + 2, (uint16_t) (ntrk::kMaxSlices + 1));
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  // A count that does not match the block's length -- the exact-length rule,
+  // the same one FXPL and MACR are held to.
+  ntrk::write_u16(g_saved + rec + 2, 2u);
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  ntrk::write_u16(g_saved + rec + 2, 3u);
+  CHECK(ntrk::module_load(&b, g_saved, need));
+
+  // The offsets.
+  ntrk::write_u32(g_saved + off + 4u, 0u);          // not strictly increasing
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  ntrk::write_u32(g_saved + off + 4u, 128u);        // ...equal is not increasing
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  ntrk::write_u32(g_saved + off + 4u, 300u);        // past the sample
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  ntrk::write_u32(g_saved + off + 4u, 256u);        // one past the last frame
+  CHECK(!ntrk::module_load(&b, g_saved, need));
+  ntrk::write_u32(g_saved + off + 4u, 64u);
+  CHECK(ntrk::module_load(&b, g_saved, need));
+
+  // **Two tables for one instrument, which strictly-increasing ids make
+  // impossible.** Built by hand rather than saved, because the writer cannot
+  // produce it -- which is the point: the loader refuses files no writer here
+  // would make.
+  {
+    Spec t;
+    t.instruments = 2;
+    t.sample_len = 128;
+    build(t);
+    ntrk::Module d;
+    CHECK(ntrk::module_load(&d, g_bytes, g_size));
+    const uint32_t two[1] = {8u};
+    set_slices(&d.instruments[0], two, 1);
+    set_slices(&d.instruments[1], two, 1);
+    size_t n2 = 0;
+    CHECK(ntrk::module_save(&d, g_saved, sizeof g_saved, &n2));
+    ntrk::Module e;
+    CHECK(ntrk::module_load(&e, g_saved, n2));
+    // Both records name instrument 1: a repeat rather than an increase.
+    const size_t r0 = n2 - 8u - 8u;   // past the header, at the first record
+    CHECK(g_saved[r0 + 0] == 1u);
+    CHECK(g_saved[r0 + 4] == 2u);
+    g_saved[r0 + 4] = 1u;
+    CHECK(!ntrk::module_load(&e, g_saved, n2));
+    // ...and decreasing is refused by the same test.
+    g_saved[r0 + 0] = 2u;
+    g_saved[r0 + 4] = 1u;
+    CHECK(!ntrk::module_load(&e, g_saved, n2));
+  }
+
+  // **A SYNTH instrument has length 0, so every slice on it is past the end.**
+  // No type check anywhere -- it falls out of `offset >= length`.
+  {
+    ntrk::Module f;
+    CHECK(ntrk::module_load(&f, g_bytes, g_size));
+    f.instruments[0].length = 0u;
+    f.instruments[0].data = NULL;
+    const uint32_t one[1] = {0u};
+    set_slices(&f.instruments[0], one, 1);
+    size_t n3 = 0;
+    CHECK(!ntrk::module_save(&f, g_saved, sizeof g_saved, &n3));
+  }
+
+  // **The writer refuses what the loader refuses**, so a save cannot produce a
+  // file the next load turns away.
+  {
+    ntrk::Module g;
+    CHECK(ntrk::module_load(&g, g_bytes, g_size));
+    size_t n4 = 0;
+    // A count with no bytes behind it.
+    g.instruments[0].slices = NULL;
+    g.instruments[0].slice_count = 2;
+    CHECK(!ntrk::module_save(&g, g_saved, sizeof g_saved, &n4));
+    // Out of order.
+    const uint32_t backwards[2] = {64u, 8u};
+    set_slices(&g.instruments[0], backwards, 2);
+    CHECK(!ntrk::module_save(&g, g_saved, sizeof g_saved, &n4));
+    // Past the sample.
+    const uint32_t over[1] = {9999u};
+    set_slices(&g.instruments[0], over, 1);
+    CHECK(!ntrk::module_save(&g, g_saved, sizeof g_saved, &n4));
+    // ...and the good one still saves, so the three above are about the fields
+    // and not about a module that had stopped being writable.
+    const uint32_t good[2] = {8u, 64u};
+    set_slices(&g.instruments[0], good, 2);
+    CHECK(ntrk::module_save(&g, g_saved, sizeof g_saved, &n4));
+  }
+}
+
+// The frame the voice is standing on after one row of playback, read off the
+// player rather than inferred from the audio: `SLC` is about a POSITION, and
+// asserting on samples would be asserting on the sample's contents instead.
+static double
+first_channel_pos(const ntrk::Module *m, uint8_t effect, uint8_t param,
+                  int rows_to_render) {
+  ntrk::Player p;
+  ntrk::player_start(&p, m);
+  static double buf[200000];
+  const double per_row = ntrk::frames_per_tick(&p, 48000.0) * (double) m->speed;
+  const int n = (int) (per_row * (double) rows_to_render);
+  for (int i = 0; i < n * 2; ++i) buf[i] = 0.0;
+  ntrk::render_add(&p, buf, n, 2, 48000.f);
+  (void) effect;
+  (void) param;
+  return p.channels[0].pos;
+}
+
+static void
+test_slc_effect() {
+  printf("SLC starts a note at the table\'s frame, exactly\n");
+
+  // A long sample and a slow tune, so a rendered row moves the position by far
+  // less than the distance between boundaries -- the assertions below compare
+  // where a voice STARTED, and that only means anything if it has not yet run
+  // past the next slice.
+  Spec s;
+  s.channels = 1;
+  s.rows = 4;
+  s.sample_len = 20000;
+  s.loop_len = 0;                       // one-shot, so nothing wraps
+  build(s, false);
+  ntrk::Module a;
+  CHECK(ntrk::module_load(&a, g_bytes, g_size));
+
+  // Boundaries that are deliberately NOT multiples of 256, which is the whole
+  // argument for the command: `9xx` can only address every 256th frame, so a
+  // break chopped by ear lands between two of its steps.
+  const uint32_t frames[4] = {1u, 4097u, 9001u, 15003u};
+  set_slices(&a.instruments[0], frames, 4);
+  size_t need = 0;
+  CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_saved, need));
+  CHECK(m.instruments[0].slice_count == 4);
+
+  // Row 0 carries the note and the command; the buffer is rendered for a
+  // fraction of a row, so the position is the start plus that little.
+  const size_t cell = 0;
+  static uint8_t bytes[1 << 16];
+  memcpy(bytes, g_saved, need);
+
+  for (int k = 0; k < 4; ++k) {
+    memcpy(bytes, g_saved, need);
+    const size_t at = ntrk::read_u32(bytes + 22) == 0u ? 0u : 0u;
+    (void) at;
+    (void) cell;
+    ntrk::Module mm;
+    CHECK(ntrk::module_load(&mm, bytes, need));
+    ntrk::Player p;
+    ntrk::player_start(&p, &mm);
+    ntrk::Channel *ch = &p.channels[0];
+    ch->instrument = 1;
+    // Straight at the trigger, which is what this command is: a starting frame
+    // and nothing else. Going through a rendered row would measure the sample
+    // walker too, and that is `render_add`'s test rather than this one.
+    ntrk::channel_trigger(&mm, ch, 25,
+                          (double) ntrk::slice_offset(mm.instruments[0], k),
+                          48000.0);
+    // **Exactly**, not within 256. That is the sentence the whole block exists
+    // for, and `== frames[k]` is how it is said.
+    CHECK(ch->pos == (double) frames[k]);
+  }
+
+  // **`SLC 00` is slice 0, not "no slice".** Every memory effect here spends
+  // the value zero on its sentinel; this one must not, because slice 0 is the
+  // downbeat and the most-used index in a chopped break.
+  {
+    ntrk::Player p;
+    ntrk::player_start(&p, &m);
+    ntrk::Channel *ch = &p.channels[0];
+    ch->instrument = 1;
+    ntrk::channel_trigger(&m, ch, 25,
+                          (double) ntrk::slice_offset(m.instruments[0], 0),
+                          48000.0);
+    CHECK(ch->pos == 1.0);              // frames[0], which is not zero
+  }
+
+  // **An index past the table plays from the top**, audibly rather than
+  // inaudibly. Not `9xx`'s silence: that is a memory-safety rule about a
+  // position past the buffer, and a bad index never produces a position at all.
+  CHECK(ntrk::slice_offset(m.instruments[0], 4) == 0u);
+  CHECK(ntrk::slice_offset(m.instruments[0], 255) == 0u);
+  {
+    ntrk::Instrument bare;                  // no table at all is the same rule
+    CHECK(ntrk::slice_offset(bare, 0) == 0u);
+  }
+
+  // ---- through `player_row`, which is where the effect byte is read --------
+  //
+  // Row 0: a note with `SLC 02`. The position after a short render is the
+  // slice's frame plus however far the walker got, and comparing two renders
+  // of different slices is what makes that difference the slice's.
+  {
+    static uint8_t with[1 << 16];
+    memcpy(with, g_saved, need);
+    // The pattern data sits where `build` put it and the block was appended
+    // after, so the cell offsets are still the plain file's.
+    const size_t c0 = cell_at(s, 0, 0);
+    with[c0 + 0] = 25u;                     // note
+    with[c0 + 1] = 1u;                      // instrument
+    with[c0 + 2] = ntrk::kFxSlice;
+    with[c0 + 3] = 2u;                      // slice 2 -> frame 9001
+
+    ntrk::Module mm;
+    CHECK(ntrk::module_load(&mm, with, need));
+    const double pos2 = first_channel_pos(&mm, ntrk::kFxSlice, 2u, 1);
+
+    with[c0 + 3] = 1u;                      // slice 1 -> frame 4097
+    CHECK(ntrk::module_load(&mm, with, need));
+    const double pos1 = first_channel_pos(&mm, ntrk::kFxSlice, 1u, 1);
+
+    // The two voices ran the same distance, so the gap between them is the gap
+    // between the boundaries. Stated as the difference rather than as two
+    // absolute positions, which is what makes it independent of how far a row
+    // happens to advance.
+    //
+    // **Within a thousandth of a frame rather than bit-exact**, and the reason
+    // is arithmetic rather than slack: the two positions carry an identical
+    // fractional part at different magnitudes, so they are stored at different
+    // ulp sizes and their difference is not the exact integer. The claim that
+    // IS exact -- the frame a trigger writes -- is asserted with `==` above,
+    // where nothing has been added to it yet.
+    CHECK(fabs((pos2 - pos1) - (double) (frames[2] - frames[1])) < 1e-3);
+
+    // ...and the negative control: without the command the note starts at the
+    // top, so the same render leaves the voice a whole slice earlier.
+    with[c0 + 2] = 0u;
+    with[c0 + 3] = 0u;
+    CHECK(ntrk::module_load(&mm, with, need));
+    const double none = first_channel_pos(&mm, 0u, 0u, 1);
+    CHECK(fabs((pos1 - none) - (double) frames[1]) < 1e-3);
+  }
+
+  // **`SLC` must not touch `ch->offset`**, so a later `900` still repeats the
+  // last `9xx` offset. The table is `SLC`'s memory; borrowing `9xx`'s would
+  // quietly break a pattern that uses both commands on the same channel.
+  {
+    Spec t;
+    t.channels = 1;
+    t.rows = 4;
+    t.sample_len = 20000;
+    t.loop_len = 0;
+    build(t, false);
+    ntrk::Module n;
+    CHECK(ntrk::module_load(&n, g_bytes, g_size));
+    const uint32_t f2[2] = {1u, 9001u};
+    set_slices(&n.instruments[0], f2, 2);
+    size_t n5 = 0;
+    CHECK(ntrk::module_save(&n, g_saved, sizeof g_saved, &n5));
+
+    static uint8_t mix[1 << 16];
+    memcpy(mix, g_saved, n5);
+    const size_t c0 = cell_at(t, 0, 0);
+    const size_t c1 = cell_at(t, 1, 0);
+    const size_t c2 = cell_at(t, 2, 0);
+    mix[c0 + 0] = 25u; mix[c0 + 1] = 1u; mix[c0 + 2] = 0x9u; mix[c0 + 3] = 0x10u;
+    mix[c1 + 0] = 25u; mix[c1 + 1] = 1u; mix[c1 + 2] = ntrk::kFxSlice; mix[c1 + 3] = 1u;
+    mix[c2 + 0] = 25u; mix[c2 + 1] = 1u; mix[c2 + 2] = 0x9u; mix[c2 + 3] = 0x00u;
+
+    ntrk::Module mm;
+    CHECK(ntrk::module_load(&mm, mix, n5));
+    ntrk::Player p;
+    ntrk::player_start(&p, &mm);
+    static double buf[200000];
+    const double per_row =
+        ntrk::frames_per_tick(&p, 48000.0) * (double) mm.speed;
+
+    // Row 0: `910` sets the memory to 0x10 -> frame 4096.
+    int n1 = (int) per_row;
+    for (int i = 0; i < n1 * 2; ++i) buf[i] = 0.0;
+    ntrk::render_add(&p, buf, n1, 2, 48000.f);
+    CHECK(p.channels[0].offset == 0x10u);
+
+    // Row 1: `SLC 01` starts at 9001 and leaves the memory alone.
+    for (int i = 0; i < n1 * 2; ++i) buf[i] = 0.0;
+    ntrk::render_add(&p, buf, n1, 2, 48000.f);
+    CHECK(p.channels[0].offset == 0x10u);        // THE GATE
+
+    // Row 2: `900` repeats 0x10, which it could not do if SLC had clobbered it.
+    for (int i = 0; i < n1 * 2; ++i) buf[i] = 0.0;
+    ntrk::render_add(&p, buf, n1, 2, 48000.f);
+    CHECK(p.channels[0].pos >= 4096.0);
+    CHECK(p.channels[0].pos < 4096.0 + per_row + 1.0);
+  }
+
+  // **A module using no SLC renders bit-identically.** The structural change to
+  // `channel_trigger` touched every trigger in the player, so this is the gate
+  // that says the other four call sites still start where they did.
+  {
+    Spec t;
+    t.channels = 2;
+    t.rows = 8;
+    t.sample_len = 4096;
+    build(t);
+    ntrk::Module n;
+    CHECK(ntrk::module_load(&n, g_bytes, g_size));
+    ntrk::Player p;
+    ntrk::player_start(&p, &n);
+    static double before[200000];
+    const int frames_n = 40000;
+    for (int i = 0; i < frames_n * 2; ++i) before[i] = 0.0;
+    ntrk::render_add(&p, before, frames_n, 2, 48000.f);
+    // Bit-identical to the fingerprints this file already carries is
+    // `test_render_hashes`' job; what is asserted here is that the render is
+    // deterministic across the change, which the hash suite then pins.
+    ntrk::Player q;
+    ntrk::player_start(&q, &n);
+    static double after[200000];
+    for (int i = 0; i < frames_n * 2; ++i) after[i] = 0.0;
+    ntrk::render_add(&q, after, frames_n, 2, 48000.f);
+    CHECK(memcmp(before, after,
+                 (size_t) frames_n * 2u * sizeof(double)) == 0);
+  }
+}
+
+static void
+test_slc_display() {
+  printf("SLC names, describes and renders as itself, not as an arpeggio\n");
+
+  // The three functions that mask `effect & 15`. Every one of them would report
+  // `SLC` as ARP / Arpeggio / `005` without a test past the nibble, and `005`
+  // would COLLIDE with a real arpeggio in a pattern grid.
+  char m[4];
+  ntrk::note_fx_mnemonic(ntrk::kFxSlice, 5u, m);
+  CHECK(strcmp(m, "SLC") == 0);
+  ntrk::note_fx_mnemonic(0x00u, 5u, m);
+  CHECK(strcmp(m, "ARP") == 0);         // the one it would have been
+
+  char r[16];
+  ntrk::note_fx_repr(ntrk::kFxSlice, 5u, r, sizeof r);
+  CHECK(strcmp(r, "G05") == 0);         // a letter, as XM does
+  ntrk::note_fx_repr(0x00u, 5u, r, sizeof r);
+  CHECK(strcmp(r, "005") == 0);         // ...and the collision it avoids
+  ntrk::note_fx_repr(ntrk::kFxSlice, 255u, r, sizeof r);
+  CHECK(strcmp(r, "GFF") == 0);
+
+  char d[64];
+  ntrk::note_fx_describe(ntrk::kFxSlice, 5u, d, sizeof d);
+  CHECK(strstr(d, "slice") != NULL);
+  CHECK(strstr(d, "5") != NULL);
+  CHECK(strstr(d, "rpeggio") == NULL);  // the wrong answer, named
+  ntrk::note_fx_describe(ntrk::kFxSlice, 0u, d, sizeof d);
+  CHECK(strstr(d, "0") != NULL);        // SLC 00 describes slice 0, not silence
+
+  // The table is one longer, and the new row is the command it says it is.
+  int count = 0;
+  const ntrk::CmdInfo *table = ntrk::note_fx_table(&count);
+  CHECK(count == 33);
+  CHECK(table[32].cmd == ntrk::kFxSlice);
+  CHECK(strcmp(table[32].mnemonic, "SLC") == 0);
+  CHECK(ntrk::note_fx_index(ntrk::kFxSlice, 0u) == 32);
+  // Every byte still lands in the table -- the guarantee `note_fx_index`
+  // carries, now over a wider set.
+  for (int e = 0; e < 256; ++e)
+    for (int pv = 0; pv < 256; pv += 17) {
+      const int idx = ntrk::note_fx_index((uint8_t) e, (uint8_t) pv);
+      CHECK(idx >= 0 && idx < count);
+    }
+}
+
 static void
 test_mixr_block() {
   printf("the mixer block survives a save, and a malformed one is refused\n");
@@ -6083,6 +6616,11 @@ main(void) {
   test_instrument_param_enforced();
   test_instrument_param_round_trip();
   test_module_param_table();
+
+  test_slic_block();
+  test_slic_refusals();
+  test_slc_effect();
+  test_slc_display();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
