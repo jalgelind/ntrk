@@ -3572,6 +3572,70 @@ test_config_set_round_trips() {
   }
 }
 
+// **A slot switched on must be audible.** Every knob at zero is a reverb of size 0 and mix 0
+// -- an effect the panel names and the ear cannot find. The claim with polarity is that at
+// least one knob of every kind starts away from zero, and that the wet ones differ between a
+// send and the master.
+static void
+test_config_seed_gives_an_audible_effect() {
+  printf("a slot seeded for its kind starts somewhere audible\n");
+
+  uint8_t block[kMixrBytes];
+  CHECK(mix::config_init(block));
+
+  const mix::FxKind kinds[] = {mix::FxKind::kShape, mix::FxKind::kFilter,
+                              mix::FxKind::kDelay, mix::FxKind::kReverb};
+  for (const mix::FxKind k : kinds) {
+    mix::config_set_slot_kind(block, 0, k);
+    mix::config_seed_slot(block, 0);
+    float sum = 0.f;
+    for (int p = 0; p < kMixrSlotParams; ++p) {
+      const float v = mix::config_slot_param(block, 0, p);
+      CHECK(v >= 0.f);
+      CHECK(v <= 1.f);
+      // A knob the kind does not have stays at zero rather than picking up a neighbour's
+      // default -- the eight bytes are shared and the spare ones must read as spare.
+      if (mix::fx_param_name(k, p) == nullptr)
+        CHECK(v == 0.f);
+      sum += v;
+    }
+    CHECK(sum > 0.f);
+  }
+
+  // **Changing kind reseeds**, which is what stops a delay's Time arriving as a reverb's
+  // Size: the eight bytes are shared, so without this a user sees a number they never typed.
+  mix::config_set_slot_kind(block, 0, mix::FxKind::kDelay);
+  mix::config_seed_slot(block, 0);
+  const float delayTime = mix::config_slot_param(block, 0, 0);
+  mix::config_set_slot_kind(block, 0, mix::FxKind::kReverb);
+  mix::config_seed_slot(block, 0);
+  CHECK(mix::config_slot_param(block, 0, 0) != delayTime);
+
+  // A send is fully wet and the master is not: a master reverb at full wet replaces the mix.
+  mix::config_set_slot_kind(block, 0, mix::FxKind::kReverb);
+  mix::config_seed_slot(block, 0);
+  mix::config_set_slot_kind(block, kMixrSlots - 1, mix::FxKind::kReverb);
+  mix::config_seed_slot(block, kMixrSlots - 1);
+  int mixIndex = -1;
+  for (int p = 0; p < kMixrSlotParams; ++p) {
+    const char *n = mix::fx_param_name(mix::FxKind::kReverb, p);
+    if (n != nullptr && strcmp(n, "Mix") == 0) mixIndex = p;
+  }
+  CHECK(mixIndex >= 0);
+  CHECK(mix::config_slot_param(block, 0, mixIndex) >
+        mix::config_slot_param(block, kMixrSlots - 1, mixIndex));
+
+  // Seeding a block the reader would refuse touches nothing.
+  uint8_t bad[kMixrBytes];
+  memcpy(bad, block, sizeof bad);
+  bad[0] = 0xffu;
+  uint8_t before[kMixrBytes];
+  memcpy(before, bad, sizeof before);
+  mix::config_seed_slot(bad, 0);
+  CHECK(memcmp(before, bad, sizeof bad) == 0);
+  mix::config_seed_slot(nullptr, 0);
+}
+
 // **Nothing at all, not "as far as it parsed".** A block the reader refuses is
 // a file the player refuses whole, so a partial write would produce a mixer the
 // editor can see and nobody can hear.
@@ -3716,6 +3780,7 @@ main(void) {
   test_config_init_makes_a_readable_block();
   test_config_set_round_trips();
   test_config_set_refuses_a_bad_block();
+  test_config_seed_gives_an_audible_effect();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

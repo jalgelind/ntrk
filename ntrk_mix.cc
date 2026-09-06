@@ -1453,6 +1453,54 @@ fx_param_name(FxKind kind, int param) {
   }
 }
 
+float
+fx_param_default(FxKind kind, int param, bool wet) {
+  if (param < 0 || param >= kMixrSlotParams)
+    return 0.f;
+  // **Beside `fx_param_name`, and in the same shape**, because they answer two halves of one
+  // question: what a knob is called and where it starts. A table in an editor would be the
+  // second answer, and the one that goes stale when an effect grows a knob here.
+  //
+  // A slot switched on with every knob at zero is an effect that does nothing -- a reverb of
+  // size 0 and mix 0 -- so the tune sounds identical and the panel says "Reverb". These are
+  // the numbers that make "switch it on" mean "hear it".
+  static const float shape[kMixrSlotParams]  = {0.f, 0.3f, 0.f};
+  static const float filter[kMixrSlotParams] = {0.f, 0.7f, 0.2f};
+  static const float delay[kMixrSlotParams]  = {0.3f, 0.35f, 0.3f, 1.f, 0.f};
+  static const float reverb[kMixrSlotParams] = {0.5f, 0.4f, 0.1f, 1.f,
+                                                1.f,  0.5f, 0.3f, 0.7f};
+  const float *t;
+  switch (kind) {
+    case FxKind::kShape:  t = shape;  break;
+    case FxKind::kFilter: t = filter; break;
+    case FxKind::kDelay:  t = delay;  break;
+    case FxKind::kReverb: t = reverb; break;
+    default: return 0.f;
+  }
+  float v = t[param];
+  // **A send is fully wet and an insert is not**, which is the one default that depends on
+  // where the slot sits rather than on what is in it: a send carries only the effect and the
+  // dry path is the channel itself, while a master slot at full wet replaces the whole mix.
+  if (!wet && fx_param_name(kind, param) != nullptr) {
+    const char *n = fx_param_name(kind, param);
+    if (n[0] == 'M' && n[1] == 'i' && n[2] == 'x' && n[3] == '\0')
+      v = 0.25f;
+  }
+  return v;
+}
+
+void
+config_seed_slot(uint8_t *block, int slot) {
+  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots)
+    return;
+  const FxKind kind = config_slot_kind(block, slot);
+  // The master is the last slot; everything before it is a send. `kMixrSlots == kSends + 1`
+  // is asserted where the layout is, so this is reading that fact rather than restating it.
+  const bool wet = slot < kSends;
+  for (int p = 0; p < kMixrSlotParams; ++p)
+    config_set_slot_param(block, slot, p, fx_param_default(kind, p, wet));
+}
+
 // The send names below are spelled out rather than counted, so this is the
 // place that notices if the bus count ever moves.
 static_assert(kSends == 4, "the slot and value names below name four sends");

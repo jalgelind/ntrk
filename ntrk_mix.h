@@ -688,6 +688,21 @@ void config_set_slot_param(uint8_t *block, int slot, int param, float v);
 void config_set_master_gain(uint8_t *block, float v);
 void config_set_width(uint8_t *block, float v);
 
+// Where a knob starts. The sibling of `fx_param_name` -- what a knob is called and where it
+// starts are two halves of one question, and an editor's own table of starting points would
+// be the half that goes stale when an effect grows a knob.
+//
+// `wet` is whether the slot's output stands alone: a SEND carries only the effect and the dry
+// path is the channel itself, while an insert at full wet replaces what it is inserted into.
+// The only default that depends on where a slot sits rather than on what is in it.
+float fx_param_default(FxKind kind, int param, bool wet);
+
+// Put every parameter of `slot` at its kind's default, taking `wet` from the slot's own
+// position. **What a slot should be given when its kind CHANGES** -- a reverb switched on with
+// every knob at zero is a reverb nobody can hear, and the eight bytes are shared across kinds,
+// so a delay's Time would otherwise arrive as a reverb's Size.
+void config_seed_slot(uint8_t *block, int slot);
+
 // The same, for a module: `kNone` when it carries no `MIXR` block at all.
 inline FxKind
 config_slot_kind(const ntrk::Module *module, int slot) {
