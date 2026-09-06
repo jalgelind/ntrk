@@ -1774,6 +1774,16 @@ mac_render(int ticks, double *out) {
   mix::mixer_render_add(&g_mixer, &g_mac_player, out, frames, 2, 48000.f);
 }
 
+// More ticks, on the player and mixer `mac_render` left standing. **Without the
+// reset**, which is the point: an external input is set between blocks, and a
+// helper that restarted would clear the very mask under test.
+static void
+mac_render_resume(int ticks, double *out) {
+  const int frames = kTickFrames * ticks;
+  memset(out, 0, (size_t) frames * 2u * sizeof(double));
+  mix::mixer_render_add(&g_mixer, &g_mac_player, out, frames, 2, 48000.f);
+}
+
 static float
 mac_val(int c, int index) {
   return g_mixer.fxpl_val[c][index];
@@ -1917,6 +1927,249 @@ test_macro_scope_all_reaches_every_channel() {
   }
   for (int c = kMacChannels; c < kMaxChannels; ++c)
     CHECK(mac_val(c, mix::kFxplPan) != 220.f);
+}
+
+// ---------------------------------------------------------------------------
+// External macro input -- a macro invoked from outside the pattern.
+// ---------------------------------------------------------------------------
+
+// **At the row boundary, not on the spot.** A parameter applied the moment the
+// host set it would land on the audio thread's block schedule instead of the
+// music's, so the same game input would render differently depending on the
+// buffer size.
+static void
+test_external_macro_lands_on_the_row() {
+  printf("an external macro input lands on the next row, not mid-row\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_render(1, g_a);                        // row 0, tick 0
+  // The plane seeds itself from where the player already stands, so the base
+  // here is centre pan and not zero.
+  const float base = mac_val(0, mix::kFxplPan);
+
+  mix::mixer_set_macro(&g_mixer, 1, 200);
+  CHECK(g_mixer.macro_pending == 1u);
+  mac_render_resume(5, g_a);                 // the rest of row 0
+  CHECK(mac_val(0, mix::kFxplPan) == base);  // still nothing: it is queued
+  CHECK(g_mixer.macro_pending == 1u);
+
+  mac_render_resume(1, g_a);                 // row 1, tick 0
+  CHECK(mac_val(0, mix::kFxplPan) == 200.f);
+  CHECK(g_mixer.macro_pending == 0u);
+  // And it reached the knob, not only the accumulator.
+  CHECK(g_mac_player.pan[0] == mix::fxpl_to_pan(200.f));
+}
+
+// **The host outranks the tune for the row it speaks on.** The other order
+// would make a pattern able to ignore its game, which is not what a parameter
+// is for -- and it is the reason the pending set is applied after the cells
+// rather than before them.
+static void
+test_external_macro_outranks_the_row() {
+  printf("an external macro input outranks the row's own cell\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_chan(1, 0, 0, 0x01, 50);               // row 1 sets pan 50 itself
+  mac_render(1, g_a);
+
+  mix::mixer_set_macro(&g_mixer, 1, 200);
+  mac_render_resume(6, g_a);                 // through row 1's tick 0
+  CHECK(mac_val(0, mix::kFxplPan) == 200.f);
+}
+
+// **Applied once, not held.** A pending input that re-fired every row would be
+// a parameter the tune could never take back, and for a delta macro it would
+// ramp for ever on one call.
+static void
+test_external_macro_applies_once() {
+  printf("an external macro input applies once, and the tune has the row "
+         "after\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_chan(2, 0, 0, 0x01, 50);               // row 2 takes it back
+  mac_render(1, g_a);
+
+  mix::mixer_set_macro(&g_mixer, 1, 200);
+  mac_render_resume(6, g_a);                 // row 1
+  CHECK(mac_val(0, mix::kFxplPan) == 200.f);
+  mac_render_resume(6, g_a);                 // row 2
+  CHECK(mac_val(0, mix::kFxplPan) == 50.f);
+}
+
+// A parameter is a value, not a stream of invocations: a host setting one three
+// times between rows means the third.
+static void
+test_external_macro_last_call_wins() {
+  printf("two external inputs between rows apply once, at the later value\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_render(1, g_a);
+
+  mix::mixer_set_macro(&g_mixer, 1, 40);
+  mix::mixer_set_macro(&g_mixer, 1, 210);
+  mac_render_resume(6, g_a);
+  CHECK(mac_val(0, mix::kFxplPan) == 210.f);
+}
+
+// Two macros pending at once, applied in index order -- so a later macro's
+// target overwrites an earlier one's, which is the same last-writer rule every
+// other set in the plane follows.
+static void
+test_external_macro_two_at_once() {
+  printf("two external inputs both apply, in index order\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_target(2, 0, mix::kFxplGain, 0, 256, 0);
+  mac_target(2, 1, mix::kFxplPan, 0, 0, 90 * 256);   // constant 90, applied last
+  mac_render(1, g_a);
+
+  mix::mixer_set_macro(&g_mixer, 2, 150);
+  mix::mixer_set_macro(&g_mixer, 1, 200);
+  CHECK(g_mixer.macro_pending == 3u);
+  mac_render_resume(6, g_a);
+  CHECK(mac_val(0, mix::kFxplGain) == 150.f);
+  CHECK(mac_val(0, mix::kFxplPan) == 90.f);
+}
+
+// An index outside the table is ignored, and it is ignored *without queueing* --
+// a bit set for a macro that will never be applied would leave the plane doing
+// work on every row for ever.
+static void
+test_external_macro_index_is_checked() {
+  printf("an external macro index outside the table is ignored, and queues "
+         "nothing\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_render(1, g_a);
+  const float base = mac_val(0, mix::kFxplPan);
+
+  mix::mixer_set_macro(&g_mixer, 0, 200);            // one-based: 0 is no macro
+  mix::mixer_set_macro(&g_mixer, kMaxMacros + 1, 200);
+  mix::mixer_set_macro(&g_mixer, -3, 200);
+  CHECK(g_mixer.macro_pending == 0u);
+
+  // Inside the mixer's range but past the *module's* table: queued, and dropped
+  // when it is applied -- the same terms a meta lane's index gets.
+  mix::mixer_set_macro(&g_mixer, kMaxMacros, 200);
+  CHECK(g_mixer.macro_pending != 0u);
+  mac_render_resume(6, g_a);
+  CHECK(g_mixer.macro_pending == 0u);
+  CHECK(mac_val(0, mix::kFxplPan) == base);
+}
+
+// An input is a byte, and a caller that computed 300 meant "as far as it goes".
+static void
+test_external_macro_input_is_clamped() {
+  printf("an external macro input is clamped to a byte\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_render(1, g_a);
+
+  mix::mixer_set_macro(&g_mixer, 1, 4000);
+  mac_render_resume(6, g_a);
+  CHECK(mac_val(0, mix::kFxplPan) == 255.f);
+
+  mix::mixer_set_macro(&g_mixer, 1, -1);
+  mac_render_resume(6, g_a);
+  CHECK(mac_val(0, mix::kFxplPan) == 0.f);
+}
+
+// **The guarantee, and it is written so it can fail.** With nothing pending the
+// plane runs the program it ran before any of this existed. The way to say that
+// with polarity is to leave an input in `macro_in` that WOULD move a target and
+// clear only the mask: a block that scanned the inputs rather than the mask, or
+// that lost its `!= 0` guard, moves the target and this goes red.
+static void
+test_external_macro_absent_touches_nothing() {
+  printf("with the mask clear, a value left in macro_in changes nothing\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_render(1, g_a);
+  const float base = mac_val(0, mix::kFxplPan);
+
+  mix::mixer_set_macro(&g_mixer, 1, 200);
+  CHECK(g_mixer.macro_in[0] == 200u);
+  g_mixer.macro_pending = 0u;          // the input stays; only the mask is clear
+
+  mac_render_resume(12, g_a);          // two whole rows
+  CHECK(mac_val(0, mix::kFxplPan) == base);
+  CHECK(g_mixer.macro_in[0] == 200u);  // and the row did not consume it either
+}
+
+// A queued input belongs to the tune that was playing. `mixer_reset` is where a
+// caller says that tune is over, so it drops -- carried across, it fires on the
+// first row of the next one at an index that means something else there.
+static void
+test_external_macro_reset_drops_the_queue() {
+  printf("a reset drops a queued external input\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_render(1, g_a);
+  const float base = mac_val(0, mix::kFxplPan);
+
+  mix::mixer_set_macro(&g_mixer, 1, 200);
+  mix::mixer_reset(&g_mixer);
+  CHECK(g_mixer.macro_pending == 0u);
+  mac_render_resume(6, g_a);
+  CHECK(mac_val(0, mix::kFxplPan) == base);
+}
+
+// Same reason, the other way a tune ends: a module with no plane has nowhere to
+// apply a macro, so what was queued is dropped while it plays rather than
+// waiting for a module that does have one.
+static void
+test_external_macro_drops_without_a_plane() {
+  printf("a module with no effect plane drops a queued external input\n");
+
+  mac_build(1, 1);
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  mac_render(1, g_a);
+
+  const FxCell *saved_fx = g_mac.fx;
+  g_mac.fx = nullptr;                  // a v1 module, on the same mixer
+  mix::mixer_set_macro(&g_mixer, 1, 200);
+  mac_render_resume(6, g_a);
+  CHECK(g_mixer.macro_pending == 0u);
+
+  // And now a plane comes back: the first row must not fire the stale input.
+  g_mac.fx = saved_fx;
+  const float base = mac_val(0, mix::kFxplPan);
+  mac_render_resume(6, g_a);
+  CHECK(mac_val(0, mix::kFxplPan) == base);
+}
+
+// **A delta macro is not reachable from outside.** It is a per-tick step the
+// meta-lane latch re-fires for a whole row; external input has no latch, so one
+// step would be an arbitrary fraction of a slide. Skipped, and the queued input
+// is dropped rather than left pending for ever.
+static void
+test_external_macro_skips_a_delta() {
+  printf("an external input on a delta macro is skipped, not half-applied\n");
+
+  mac_build(1, 1);
+  g_mac.macros[0].flags = kMacroDelta;
+  mac_target(1, 0, mix::kFxplPan, 0, 256, 0);
+  // A second, absolute macro queued in the same breath: the delta is skipped and
+  // this one still applies, so the skip is a `continue` and not a `break`.
+  mac_target(2, 0, mix::kFxplGain, 0, 256, 0);
+  mac_render(1, g_a);
+  const float base = mac_val(0, mix::kFxplPan);
+
+  mix::mixer_set_macro(&g_mixer, 1, 40);
+  mix::mixer_set_macro(&g_mixer, 2, 180);
+  mac_render_resume(12, g_a);
+  CHECK(mac_val(0, mix::kFxplPan) == base);
+  CHECK(mac_val(0, mix::kFxplGain) == 180.f);
+  CHECK(g_mixer.macro_pending == 0u);
 }
 
 // **Meta lanes are stored last and evaluated first, and that is what makes
@@ -3308,6 +3561,17 @@ main(void) {
   test_macro_scope_all_reaches_every_channel();
   test_meta_first_lets_a_column_override();
   test_macro_index_past_the_table_is_ignored();
+  test_external_macro_lands_on_the_row();
+  test_external_macro_outranks_the_row();
+  test_external_macro_applies_once();
+  test_external_macro_last_call_wins();
+  test_external_macro_two_at_once();
+  test_external_macro_index_is_checked();
+  test_external_macro_input_is_clamped();
+  test_external_macro_absent_touches_nothing();
+  test_external_macro_reset_drops_the_queue();
+  test_external_macro_drops_without_a_plane();
+  test_external_macro_skips_a_delta();
   test_macro_extremes_stay_bounded();
   test_slot_units_are_normalised();
   test_slot_commands_set_and_slide();

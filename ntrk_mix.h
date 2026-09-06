@@ -544,6 +544,26 @@ struct Mixer {
   uint64_t fxpl_seen = 0;
   bool     fxpl_synced = false;
 
+  // -- External macro input: a macro invoked from outside the pattern.
+  //
+  // A game parameter is a macro whose input byte came from the host rather than
+  // from a meta-lane cell, which is the whole of the mechanism -- the format
+  // gains nothing and there is no second automation system. `mixer_set_macro`
+  // writes these; `fxpl_row` applies and clears them.
+  //
+  // **A mask, and it is what keeps the guarantee.** With nothing pending,
+  // `fxpl_row` reads one integer and touches nothing -- the same bit-identity a
+  // null `fx` gets. A per-macro "changed" flag scanned every row would cost 32
+  // reads to say the same thing.
+  //
+  // Latched rather than applied on the spot because a mixer is not a sequencer:
+  // applying mid-row would put a parameter change on the audio thread's block
+  // schedule instead of the music's.
+  uint8_t  macro_in[kMaxMacros] = {};
+  uint32_t macro_pending = 0;     // bit i is macro i+1, one-based as a cell is
+  static_assert(kMaxMacros <= 32,
+                "macro_pending is a uint32_t mask, one bit per macro");
+
   // Replaces `Player::gain`; the player's own is not applied here, or the two
   // would multiply and the tune would come out at half the level the player
   // renders it. Defaulted to the same 0.7 for exactly that reason.
@@ -742,8 +762,47 @@ int slot_delta_row(int slot, int channel);
 void fxpl_macro(Mixer *mx, Player *player, const Macro *mac, int input,
                 FxplDeltas *deltas);
 
-// Tick 0 of a row: latch every lane's cell and apply the sets.
+// Tick 0 of a row: latch every lane's cell, apply the sets, then apply whatever
+// external input is pending.
 void fxpl_row(Mixer *mx, Player *player, int order, int row);
+
+// Invoke `macro` (one-based, as a meta cell is) with `input` at the next row
+// boundary.
+//
+// **Same thread as `mixer_render_add`, like every other call on a Mixer.** This
+// is a plain read-modify-write of two fields and nothing here is atomic: a
+// caller that sets it from a game thread while a block is rendering can have the
+// mask cleared out from under the bit it just set, and the parameter is then
+// dropped for good. A host with its own thread posts through the command queue
+// it already drains at the block boundary; that is where this belongs. **Queued, not applied**: a parameter that landed mid-row would be
+// heard on the audio thread's block schedule rather than the music's, and two
+// calls between rows would be two different renders of the same input.
+//
+// The last call before a row wins, which is what a parameter means: a game
+// setting "intensity" three times between two rows wants the third value, not
+// three invocations.
+//
+// **After the row's own cells**, so a game parameter outranks the pattern for
+// that row. The other order would make a tune able to ignore its host, which is
+// not what a host asks a parameter for.
+//
+// An index outside 1..kMaxMacros is ignored, and one past the module's
+// `macro_count` is ignored when it is applied -- the same terms a meta lane's
+// index gets, rather than a second answer about what an unknown macro means.
+//
+// **A delta macro cannot be invoked from here.** It is a per-tick step that the
+// meta-lane latch re-fires for the length of a row; external input has no latch,
+// so a single step would be an arbitrary fraction of a slide. The queued input
+// is dropped at the row, not held. A host parameter is a value: point it at an
+// absolute macro.
+//
+// Requires the module to carry an effect plane: a macro writes plane state, and
+// the plane does not run for a module whose `fx` is null. A v1 file has no
+// macros to invoke either, and a queued input is DROPPED while such a module
+// plays rather than waiting for one that has a plane -- held, it would fire on
+// the first row of the next tune at an index that means something else there.
+// `mixer_reset` drops it too, for the same reason.
+void mixer_set_macro(Mixer *mx, int macro, int input);
 
 // Any tick that is not a row's first.
 void fxpl_slide(Mixer *mx, Player *player);

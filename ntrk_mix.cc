@@ -441,6 +441,11 @@ mixer_reset(Mixer *mx) {
   // cleared to defaults here: those knobs are settings, and this call keeps
   // settings.
   mx->fxpl_synced = false;
+  // A queued external input is NOT a setting -- it is an invocation that has not
+  // happened yet, and a reset is where the caller says the last tune is over.
+  // Carried across, it would fire on the first row of whatever comes next, at a
+  // macro index that means something else there.
+  mx->macro_pending = 0u;
 }
 
 // ---- MIXR ------------------------------------------------------------------
@@ -753,6 +758,17 @@ fxpl_macro(Mixer *mx, Player *player, const Macro *mac, int input,
 }
 
 void
+mixer_set_macro(Mixer *mx, int macro, int input) {
+  if (macro < 1 || macro > kMaxMacros)
+    return;
+  const int i = macro - 1;
+  // Clamped rather than masked: an input is a byte and a caller that computed
+  // 300 meant "as far as it goes", not 44.
+  mx->macro_in[i] = (uint8_t) (input < 0 ? 0 : (input > 255 ? 255 : input));
+  mx->macro_pending |= (uint32_t) 1u << i;
+}
+
+void
 fxpl_row(Mixer *mx, Player *player, int order, int row) {
   const Module *m = player->module;
 
@@ -885,6 +901,41 @@ fxpl_row(Mixer *mx, Player *player, int order, int row) {
           break;
         }
       }
+    }
+  }
+
+  // **External input, after the row's own cells.** A macro invoked from outside
+  // the pattern is the host's parameter, and a host that could be overruled by
+  // the tune it is driving is not a parameter -- so the game's value lands last
+  // and wins for this row.
+  //
+  // One integer read when nothing is pending, which is the bit-identity
+  // guarantee: a mixer nobody has called `mixer_set_macro` on runs exactly the
+  // program it ran before this existed.
+  if (mx->macro_pending != 0u) {
+    const uint32_t pending = mx->macro_pending;
+    mx->macro_pending = 0u;
+    // **In index order, and a plain scan of 32 bits.** A count-trailing-zeros
+    // intrinsic is a compiler builtin with no portable spelling, and this file
+    // may not reach for one: the render match across targets is a measured
+    // property, so nothing in the path gets to depend on the toolchain.
+    for (int i = 0; i < kMaxMacros; ++i) {
+      if ((pending & ((uint32_t) 1u << i)) == 0u)
+        continue;
+      // Past the module's table is ignored here rather than refused at the
+      // setter, exactly as a meta lane's index is: the setter has no module to
+      // ask, and two answers about what an unknown macro means is one too many.
+      if (i >= m->macro_count)
+        continue;
+      // **A delta macro is not reachable from outside, and the skip is written
+      // rather than left to `fxpl_macro`'s early return.** A delta macro is a
+      // per-tick step re-fired from the meta latch for the length of a row;
+      // external input has no latch, so one step would be an arbitrary fraction
+      // of a slide nobody asked for. A host parameter is a value -- invoke an
+      // absolute macro with it.
+      if ((m->macros[i].flags & kMacroDelta) != 0u)
+        continue;
+      fxpl_macro(mx, player, &m->macros[i], (int) mx->macro_in[i], nullptr);
     }
   }
 }
@@ -1118,6 +1169,14 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
     // an assertion here compiles to nothing in the build that ships.
     if (run > kMaxBlock)
       run = kMaxBlock;
+
+    // **A module with no plane drops what was queued rather than holding it.** The
+    // plane is where a macro is applied, so a pending input has nowhere to go --
+    // and held, it would fire on the first row of the next module that DOES have
+    // one, at an index that means something else there. Guarded on the mask, so a
+    // mixer nobody has queued anything on is not written to at all.
+    if (!plane && mx->macro_pending != 0u)
+      mx->macro_pending = 0u;
 
     if (plane) {
       fxpl_run(mx, player, at_order, at_row, at_tick);
