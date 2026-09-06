@@ -534,6 +534,57 @@ config_width(const uint8_t *block) {
 }
 
 bool
+config_init(uint8_t *block) {
+  if (block == nullptr)
+    return false;
+  for (int k = 0; k < kMixrBytes; ++k)
+    block[k] = 0u;
+  ntrk::write_u16(block + 0, (uint16_t) kMixrVersion);
+  ntrk::write_u16(block + 2, (uint16_t) kMixrSlots);
+  // **Unity, not zero.** A block whose master gain is a literal zero is a tune
+  // that plays silently, and "I added a mixer and the sound went away" is the
+  // one first impression a mixer must not make. `mixer_config_write` of a fresh
+  // Mixer would write these two the same way.
+  ntrk::write_u16(block + 4, mixr_q12(1.f));
+  ntrk::write_u16(block + 6, mixr_q12(1.f));
+  return true;
+}
+
+void
+config_set_slot_kind(uint8_t *block, int slot, FxKind kind) {
+  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots)
+    return;
+  // The same ceiling `config_readable` enforces, so a set can never leave a
+  // block this file would then refuse to read back.
+  if ((uint8_t) kind > (uint8_t) FxKind::kReverb)
+    return;
+  block[kMixrHeaderBytes + slot * kMixrSlotBytes] = (uint8_t) kind;
+}
+
+void
+config_set_slot_param(uint8_t *block, int slot, int param, float v) {
+  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots || param < 0 ||
+      param >= kMixrSlotParams)
+    return;
+  uint8_t *r = block + kMixrHeaderBytes + slot * kMixrSlotBytes;
+  ntrk::write_u16(r + 2 + param * 2, mixr_unit(v));
+}
+
+void
+config_set_master_gain(uint8_t *block, float v) {
+  if (!config_readable(block))
+    return;
+  ntrk::write_u16(block + 4, mixr_q12(v));
+}
+
+void
+config_set_width(uint8_t *block, float v) {
+  if (!config_readable(block))
+    return;
+  ntrk::write_u16(block + 6, mixr_q12(v));
+}
+
+bool
 mixer_config_read(Mixer *mx, const uint8_t *block) {
   if (mx == nullptr || block == nullptr)
     return false;

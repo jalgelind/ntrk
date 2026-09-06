@@ -3488,6 +3488,127 @@ test_config_slot_kind_reads_without_a_mixer() {
     CHECK(mix::config_slot_kind(&bad, i) == mix::FxKind::kNone);
 }
 
+// ---------------------------------------------------------------------------
+// The editor's half: writing a configuration without building a Mixer.
+// ---------------------------------------------------------------------------
+
+// A module that never had a mixer is the common case, so an editor has to be
+// able to make one. Unity gain and width, or "I added a mixer" would mean "the
+// sound went away".
+static void
+test_config_init_makes_a_readable_block() {
+  printf("a fresh config block is readable, at unity gain and width\n");
+
+  Module m;
+  CHECK(mix::config_init(m.mix));
+  m.has_mix = true;
+  CHECK(fabsf(mix::config_master_gain(&m) - 1.f) < 1.f / 1000.f);
+  CHECK(fabsf(mix::config_width(&m) - 1.f) < 1.f / 1000.f);
+  for (int s = 0; s < kMixrSlots; ++s) {
+    CHECK(mix::config_slot_kind(&m, s) == mix::FxKind::kNone);
+    for (int p = 0; p < kMixrSlotParams; ++p)
+      CHECK(mix::config_slot_param(&m, s, p) == 0.f);
+  }
+  // And the player accepts it, which is the only thing "readable" can mean.
+  static mix::Mixer b;
+  mix::mixer_reset(&b);
+  CHECK(mix::mixer_config_read(&b, &m));
+  CHECK(mix::config_init(nullptr) == false);
+}
+
+// Set, then get, at both ends and in between -- for every slot and every
+// parameter, because a record offset that was wrong for slot 3 alone is exactly
+// what a spot check misses.
+static void
+test_config_set_round_trips() {
+  printf("every slot and parameter set-then-gets, at both bounds\n");
+
+  Module m;
+  CHECK(mix::config_init(m.mix));
+  m.has_mix = true;
+
+  const mix::FxKind kinds[] = {mix::FxKind::kNone, mix::FxKind::kDelay,
+                              mix::FxKind::kReverb};
+  for (int s = 0; s < kMixrSlots; ++s) {
+    for (const mix::FxKind k : kinds) {
+      mix::config_set_slot_kind(m.mix, s, k);
+      CHECK(mix::config_slot_kind(&m, s) == k);
+    }
+    for (int p = 0; p < kMixrSlotParams; ++p) {
+      const float want[] = {0.f, 0.5f, 1.f};
+      for (const float v : want) {
+        mix::config_set_slot_param(m.mix, s, p, v);
+        CHECK(fabsf(mix::config_slot_param(&m, s, p) - v) < 2.f / 65534.f);
+      }
+      // Out of range clamps rather than wrapping.
+      mix::config_set_slot_param(m.mix, s, p, 4.f);
+      CHECK(mix::config_slot_param(&m, s, p) == 1.f);
+      mix::config_set_slot_param(m.mix, s, p, -1.f);
+      CHECK(mix::config_slot_param(&m, s, p) == 0.f);
+      mix::config_set_slot_param(m.mix, s, p, 0.f);
+    }
+  }
+
+  mix::config_set_master_gain(m.mix, 1.9f);
+  CHECK(fabsf(mix::config_master_gain(&m) - 1.9f) < 1.f / 1000.f);
+  mix::config_set_width(m.mix, 0.f);
+  CHECK(mix::config_width(&m) == 0.f);
+
+  // **And the player agrees, slot for slot.** An editor that wrote a mixer the
+  // player builds differently is the whole failure this pairing prevents.
+  for (int s = 0; s < kMixrSlots; ++s) {
+    mix::config_set_slot_kind(m.mix, s, mix::FxKind::kDelay);
+    for (int p = 0; p < kMixrSlotParams; ++p)
+      mix::config_set_slot_param(m.mix, s, p, 0.125f * (float) (p + 1));
+  }
+  static mix::Mixer b;
+  mix::mixer_reset(&b);
+  CHECK(mix::mixer_config_read(&b, &m));
+  for (int s = 0; s < kMixrSlots; ++s) {
+    CHECK(mix::mixr_slot_at(&b, s)->kind == mix::FxKind::kDelay);
+    for (int p = 0; p < kMixrSlotParams; ++p)
+      CHECK(fabsf(mix::config_slot_param(&m, s, p) -
+                  mix::mixr_slot_at(&b, s)->base[p]) < 2.f / 65534.f);
+  }
+}
+
+// **Nothing at all, not "as far as it parsed".** A block the reader refuses is
+// a file the player refuses whole, so a partial write would produce a mixer the
+// editor can see and nobody can hear.
+static void
+test_config_set_refuses_a_bad_block() {
+  printf("a set on a block the reader would refuse leaves every byte alone\n");
+
+  uint8_t good[kMixrBytes];
+  CHECK(mix::config_init(good));
+
+  uint8_t bad[kMixrBytes];
+  memcpy(bad, good, sizeof bad);
+  bad[0] = 0xffu;                       // a version nothing reads
+  uint8_t before[kMixrBytes];
+  memcpy(before, bad, sizeof before);
+
+  mix::config_set_slot_kind(bad, 0, mix::FxKind::kReverb);
+  mix::config_set_slot_param(bad, 0, 0, 1.f);
+  mix::config_set_master_gain(bad, 0.25f);
+  mix::config_set_width(bad, 0.25f);
+  CHECK(memcmp(before, bad, sizeof bad) == 0);
+
+  // A kind past the ceiling is refused for the same reason: it would leave a
+  // block that reads back as nothing at all.
+  memcpy(bad, good, sizeof bad);
+  mix::config_set_slot_kind(bad, 0, (mix::FxKind) 99);
+  CHECK(memcmp(good, bad, sizeof bad) == 0);
+
+  // And an index outside the record touches nothing either.
+  mix::config_set_slot_kind(bad, kMixrSlots, mix::FxKind::kDelay);
+  mix::config_set_slot_param(bad, 0, kMixrSlotParams, 1.f);
+  mix::config_set_slot_param(bad, -1, 0, 1.f);
+  CHECK(memcmp(good, bad, sizeof bad) == 0);
+  mix::config_set_slot_kind(nullptr, 0, mix::FxKind::kDelay);
+  mix::config_set_master_gain(nullptr, 1.f);
+}
+
 static void
 test_config_reads_params_without_a_mixer() {
   printf("a slot's parameters and the master read back without a mixer\n");
@@ -3592,6 +3713,9 @@ main(void) {
   test_mixr_writes_the_setting_not_the_slide();
   test_config_slot_kind_reads_without_a_mixer();
   test_config_reads_params_without_a_mixer();
+  test_config_init_makes_a_readable_block();
+  test_config_set_round_trips();
+  test_config_set_refuses_a_bad_block();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

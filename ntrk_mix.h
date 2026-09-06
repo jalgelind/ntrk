@@ -657,6 +657,37 @@ float config_slot_param(const uint8_t *block, int slot, int param);
 float config_master_gain(const uint8_t *block);
 float config_width(const uint8_t *block);
 
+// ---- and the editor's half of the same ------------------------------------
+//
+// **Symmetric with the readers above, and for the identical reason.**
+// `mixer_config_write` takes a `Mixer` -- four reverb tanks and four delay
+// lines, megabytes -- which is exactly the price `config_slot_kind` exists to
+// avoid. An editor changing one knob should not instantiate a mixer to do it.
+//
+// Each refuses a block `mixer_config_read` would refuse, touching **nothing**:
+// a half-written block is a file the player rejects whole, so there is no
+// partial success worth having. A value out of range is CLAMPED rather than
+// refused, on the same terms `instrument_param_set` gives -- a bool return would
+// hand the decision to every caller and one of them would drop it.
+
+// A valid, empty block: version, slot count, and unity master gain and width.
+// **For the modules that carry no mixer at all**, which is most of them --
+// without this, "configure the sends" is impossible for every file that never
+// had one. False only for a null pointer.
+bool config_init(uint8_t *block);
+
+// A slot's kind. Refused (not clamped) past `kReverb`, which is the same ceiling
+// `config_readable` enforces: a set that left a block this file would refuse to
+// read back would be a mixer the editor can see and the player cannot.
+void config_set_slot_kind(uint8_t *block, int slot, FxKind kind);
+
+// One saved parameter, 0..1, clamped.
+void config_set_slot_param(uint8_t *block, int slot, int param, float v);
+
+// The master gain and the stereo width, clamped to what Q12 can carry.
+void config_set_master_gain(uint8_t *block, float v);
+void config_set_width(uint8_t *block, float v);
+
 // The same, for a module: `kNone` when it carries no `MIXR` block at all.
 inline FxKind
 config_slot_kind(const ntrk::Module *module, int slot) {
