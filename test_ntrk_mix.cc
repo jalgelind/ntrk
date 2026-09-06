@@ -3636,6 +3636,50 @@ test_config_seed_gives_an_audible_effect() {
   mix::config_seed_slot(nullptr, 0);
 }
 
+// **Three parameters are not knobs**, and an editor has to be able to tell. The claim with
+// polarity: the ones `slot_apply` puts through `slot_choice` answer their own count, every
+// other parameter answers 0, and each choice has a word.
+static void
+test_choice_params_name_themselves() {
+  printf("a parameter that picks one of N says so, and names them\n");
+
+  CHECK(mix::fx_param_choice_count(mix::FxKind::kShape, 0) == 4);
+  CHECK(mix::fx_param_choice_count(mix::FxKind::kFilter, 0) == 3);
+  CHECK(mix::fx_param_choice_count(mix::FxKind::kDelay, 4) == 2);
+
+  // Everything else is continuous — including the reverb, which has no choices at all.
+  int choices = 0;
+  for (int k = 0; k <= (int) mix::FxKind::kReverb; ++k)
+    for (int p = 0; p < kMixrSlotParams; ++p) {
+      const mix::FxKind kind = (mix::FxKind) k;
+      const int n = mix::fx_param_choice_count(kind, p);
+      if (n == 0) {
+        CHECK(mix::fx_param_choice_name(kind, p, 0) == nullptr);
+        continue;
+      }
+      ++choices;
+      // A choice with a nameless value is a row that would print a number anyway.
+      for (int i = 0; i < n; ++i) {
+        const char *nm = mix::fx_param_choice_name(kind, p, i);
+        CHECK(nm != nullptr);
+        CHECK(nm[0] != '\0');
+      }
+      CHECK(mix::fx_param_choice_name(kind, p, -1) == nullptr);
+      CHECK(mix::fx_param_choice_name(kind, p, n) == nullptr);
+      // ...and every choice is REACHABLE through the same decode the player uses, or the
+      // editor would offer a value the mixer rounds to a different one.
+      for (int i = 0; i < n; ++i)
+        CHECK(mix::slot_choice(mix::slot_choice_param(i, n), n) == i);
+    }
+  CHECK(choices == 3);
+
+  // The filter's words are `filter_mode_names`', not a copy of them.
+  int nModes = 0;
+  const char *const *modes = filter_mode_names(&nModes);
+  for (int i = 0; i < mix::fx_param_choice_count(mix::FxKind::kFilter, 0); ++i)
+    CHECK(mix::fx_param_choice_name(mix::FxKind::kFilter, 0, i) == modes[i]);
+}
+
 // **Nothing at all, not "as far as it parsed".** A block the reader refuses is
 // a file the player refuses whole, so a partial write would produce a mixer the
 // editor can see and nobody can hear.
@@ -3781,6 +3825,7 @@ main(void) {
   test_config_set_round_trips();
   test_config_set_refuses_a_bad_block();
   test_config_seed_gives_an_audible_effect();
+  test_choice_params_name_themselves();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

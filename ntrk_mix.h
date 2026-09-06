@@ -697,6 +697,21 @@ void config_set_width(uint8_t *block, float v);
 // The only default that depends on where a slot sits rather than on what is in it.
 float fx_param_default(FxKind kind, int param, bool wet);
 
+// How many values a parameter really has, or 0 when it is continuous.
+//
+// **Three of them are not knobs.** A shaper's Kind picks one of four curves, a filter's Mode
+// one of three, and a delay's Ping-pong is on or off — `slot_apply` puts each through
+// `slot_choice`, so the byte between the steps means nothing and an editor dragging them as
+// 0..1 shows "Mode 0.33" while the filter changes type at invisible thresholds.
+//
+// The counts are the ones `slot_apply` itself passes, so this reads the decode rather than
+// offering a second opinion about it.
+int fx_param_choice_count(FxKind kind, int param);
+
+// What choice `i` is called, or null when the parameter is continuous or `i` is out of range.
+// The filter's four words are `filter_mode_names`', not a copy.
+const char *fx_param_choice_name(FxKind kind, int param, int i);
+
 // Put every parameter of `slot` at its kind's default, taking `wet` from the slot's own
 // position. **What a slot should be given when its kind CHANGES** -- a reverb switched on with
 // every knob at zero is a reverb nobody can hear, and the eight bytes are shared across kinds,

@@ -1453,6 +1453,36 @@ fx_param_name(FxKind kind, int param) {
   }
 }
 
+int
+fx_param_choice_count(FxKind kind, int param) {
+  // **The counts `slot_apply` itself passes to `slot_choice`**, which is what makes this a
+  // reading of the decode rather than a second opinion about it. A parameter with no choices
+  // is continuous and answers 0.
+  if (kind == FxKind::kShape && param == 0)
+    return 4;                            // slot_choice(param[0], 4) -> fx::ShapeKind
+  if (kind == FxKind::kFilter && param == 0)
+    return 3;                            // slot_choice(param[0], 3) -> FilterMode
+  if (kind == FxKind::kDelay && param == 4)
+    return 2;                            // param[4] > 0.5f -> ping-pong on/off
+  return 0;
+}
+
+const char *
+fx_param_choice_name(FxKind kind, int param, int i) {
+  const int n = fx_param_choice_count(kind, param);
+  if (i < 0 || i >= n)
+    return nullptr;
+  static const char *const shapes[4] = {"warm", "crunch", "tape", "fold"};
+  static const char *const offOn[2]  = {"off", "on"};
+  if (kind == FxKind::kShape)
+    return shapes[i];
+  // The filter's own list, which `instrument_param_table` already reads — an editor's copy
+  // would have been the third place these four words were written.
+  if (kind == FxKind::kFilter)
+    return filter_mode_names(nullptr)[i];
+  return offOn[i];
+}
+
 float
 fx_param_default(FxKind kind, int param, bool wet) {
   if (param < 0 || param >= kMixrSlotParams)
