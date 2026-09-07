@@ -747,6 +747,13 @@ config_slot_param(const ntrk::Module *module, int slot, int param) {
 }
 
 inline float
+config_send_level(const ntrk::Module *module, int channel, int send) {
+  return module != nullptr && module->has_mix
+             ? config_send_level(module->mix, channel, send)
+             : 0.f;
+}
+
+inline float
 config_master_gain(const ntrk::Module *module) {
   return module != nullptr && module->has_mix ? config_master_gain(module->mix) : 1.f;
 }
