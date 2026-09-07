@@ -1322,7 +1322,10 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       // position and a channel that stopped being read would freeze and then
       // jump back in when it unmuted. Everything downstream is skipped, sends
       // included: a mute you can still hear through the reverb is not a mute.
-      if (player->muted[c])
+      // `channel_silent` rather than a second reading of `muted`: the tune's
+      // own per-section mute has to reach this loop as well, and it did not the
+      // day it was added to the other one.
+      if (channel_silent(m, player, c))
         continue;
 
       slot_process_mono(&mx->insert[c], v, run, frate);

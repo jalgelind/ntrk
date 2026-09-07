@@ -458,6 +458,61 @@ test_no_filter_flag_is_untouched() {
 // before it blew up. A long render at res 255 has to stay finite and inside the
 // limiter's ceiling -- and a NaN would sail through that ceiling untouched,
 // since every comparison against it is false, so it is checked for by name.
+// **The mixer is a SECOND render loop**, and that is the whole reason for this
+// case. `render_add` in ntrk.h and `mixer_render_add` here each walk the
+// channels and each used to spell the mute test for itself. Adding the tune's
+// own per-section mute to one of them made it work through the plain renderer
+// and do nothing through the mixer -- which is the path every host with sends
+// actually takes, so the feature was dead in the only build anybody runs.
+// `channel_silent` is the one answer now; this says the mixer asks it.
+static void
+test_slot_mute_reaches_the_mixer() {
+  printf("a slot mute silences a section through the mixer, not only through "
+         "render_add\n");
+
+  build();
+  Module m;
+  CHECK(module_load(&m, g_bytes, g_size));
+  CHECK(m.order_count >= 1);
+
+  auto peak_at = [&](const Module *mod, int order) {
+    Player p;
+    player_start(&p, mod);
+    player_seek(&p, order, 0);
+    mix::mixer_reset(&g_mixer);
+    g_mixer.master_gain = p.gain;
+    double top = 0.0;
+    for (int window = 0; window < 8; ++window) {
+      const int frames = 512;
+      memset(g_a, 0, (size_t) frames * 2u * sizeof(double));
+      mix::mixer_render_add(&g_mixer, &p, g_a, frames, 2, 48000.f);
+      for (int i = 0; i < frames * 2; ++i) {
+        const double x = g_a[i] < 0.0 ? -g_a[i] : g_a[i];
+        if (x > top)
+          top = x;
+      }
+    }
+    return top;
+  };
+
+  const double open_peak = peak_at(&m, 0);
+  CHECK(open_peak > 0.01);
+
+  // Silence every channel at position 0. Through the mixer, that has to be
+  // silence -- sends included, because a mute you can still hear through the
+  // reverb is not a mute.
+  for (int c = 0; c < m.channels; ++c)
+    slot_set_muted(&m, 0, c, true);
+  CHECK(m.has_slot_mute);
+  CHECK(peak_at(&m, 0) == 0.0);
+
+  // ...and taking it back restores exactly what was there, which is what says
+  // the drop happens after the sample rather than instead of it.
+  for (int c = 0; c < m.channels; ++c)
+    slot_set_muted(&m, 0, c, false);
+  CHECK(peak_at(&m, 0) == open_peak);
+}
+
 static void
 test_max_resonance_stays_finite() {
   printf("maximum resonance stays finite over a long render\n");
@@ -3816,6 +3871,7 @@ main(void) {
   test_reverb_slot_late_knobs();
   test_shaper_dry();
   test_command_enumeration();
+  test_slot_mute_reaches_the_mixer();
   test_mixr_round_trip();
   test_mixr_refuses_an_unknown_kind();
   test_mixr_writes_the_setting_not_the_slide();

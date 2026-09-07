@@ -3607,13 +3607,10 @@ render_add(Player *player, double *buffer, int frames, int channels,
         continue;
       // Sampled even when muted, and then dropped. See Player::muted.
       const float s = channel_sample(ch, m->instruments[ch->instrument - 1]);
-      // **Two mutes, one drop, and both after the sample.** `Player::muted` is
-      // the listener's ("silence this track while I work"); `slot_muted` is the
-      // tune's ("this track does not play in this section") and travels in the
-      // file. Dropping the sample rather than skipping the walk is what keeps a
-      // voice's position advancing while it is silent, so coming back does not
-      // jump -- the same reason the line above says what it says.
-      if (player->muted[c] || slot_muted(m, player->order, c))
+      // **`channel_silent`, not a test written here.** It answers for both the
+      // listener's mute and the tune's, and it is asked from the mixer's own
+      // render loop too -- one rule, one implementation.
+      if (channel_silent(m, player, c))
         continue;
       left += s * gain_l[c];
       right += s * gain_r[c];

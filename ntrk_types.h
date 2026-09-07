@@ -851,6 +851,27 @@ struct Player {
   int loop_count = 0;
 };
 
+// Whether channel `c` should be dropped where the player currently is -- the
+// listener's mute, or the tune's own for the section it is in.
+//
+// **The one answer, because there are two render loops.** `render_add` in
+// ntrk.h and `mixer_render_add` in ntrk_mix.cc each walk the channels and each
+// used to spell the mute test for itself; adding the slot mute to one of them
+// made it work through the plain renderer and do nothing through the mixer,
+// which is the path every host with sends actually takes. A rule with two
+// implementations is a rule that holds in one of them.
+//
+// The CALLER samples first and then drops, in both loops: `channel_sample` is
+// what advances the position, so a channel that stopped being read would freeze
+// and jump back in when it came off mute. This answers what to drop, never
+// whether to sample.
+inline bool
+channel_silent(const Module *m, const Player *p, int c) {
+  if (p != nullptr && c >= 0 && c < kMaxChannels && p->muted[c])
+    return true;
+  return slot_muted(m, p != nullptr ? p->order : -1, c);
+}
+
 }  // namespace ntrk
 
 #endif  // NTRK_TYPES_H_
