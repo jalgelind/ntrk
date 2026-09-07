@@ -4292,6 +4292,106 @@ test_plane_slide_zero_and_the_guard() {
 // to bake the shift into its cells instead, and `ntrk_gen`'s coverage module
 // has been setting it to -12 for a knob wired to nothing.
 static void
+test_fractional_frame_and_note_step() {
+  printf("a fractional frame blends its neighbours, and a note's step is the "
+         "player's own\n");
+
+  // A ramp, so the blend is readable off the position: frame f holds f * 10.
+  static int8_t ramp[8];
+  for (int i = 0; i < 8; ++i)
+    ramp[i] = (int8_t) (i * 10);
+
+  ntrk::Instrument ins = ntrk::Instrument();
+  ins.data = ramp;
+  ins.length = 8u;
+  ins.volume = 64u;
+
+  // The integers are the frames themselves...
+  for (int i = 0; i < 8; ++i)
+    CHECK(ntrk::instrument_frame_at(ins, (double) i) == (float) (i * 10));
+  // ...and the halves are half way between two of them.
+  CHECK(fabs(ntrk::instrument_frame_at(ins, 2.5) - 25.f) < 1e-4f);
+  CHECK(fabs(ntrk::instrument_frame_at(ins, 0.25) - 2.5f) < 1e-4f);
+
+  // The last frame has no successor, so with no loop it holds rather than
+  // blending toward whatever follows the blob in memory.
+  CHECK(fabs(ntrk::instrument_frame_at(ins, 7.5) - 70.f) < 1e-4f);
+  // With a loop, its neighbour is the loop start -- so a looping sample does
+  // not dip through the value it happens to end on.
+  ins.loop_start = 0u;
+  ins.loop_len = 8u;
+  CHECK(fabs(ntrk::instrument_frame_at(ins, 7.5) - 35.f) < 1e-4f);
+
+  // Out of range is silence, both ways.
+  CHECK(ntrk::instrument_frame_at(ins, 8.0) == 0.f);
+  CHECK(ntrk::instrument_frame_at(ins, -0.5) == 0.f);
+  ntrk::Instrument empty = ntrk::Instrument();
+  CHECK(ntrk::instrument_frame_at(empty, 0.0) == 0.f);
+
+  // ---- and the step ----------------------------------------------------
+  //
+  // **The claim is that it IS the player's chain**, so it is checked against
+  // the player rather than against arithmetic written here: a preview at a
+  // different pitch from the tune is the one thing a preview must not be.
+  fx_clear();
+  g_fx_pat[0].note = 25u;
+  g_fx_pat[0].instrument = 1u;
+
+  ntrk::Module m;
+  fx_module(&m, false);
+  ntrk::Instrument &mi = m.instruments[0];
+  mi = ntrk::Instrument();
+  mi.data = ramp;
+  mi.length = 8u;
+  mi.loop_len = 8u;
+  mi.volume = 64u;
+
+  for (int transpose = -12; transpose <= 12; transpose += 12)
+    for (int finetune = -8; finetune <= 7; finetune += 5) {
+      mi.transpose = (int8_t) transpose;
+      mi.finetune = (int8_t) finetune;
+
+      ntrk::Player p;
+      ntrk::player_start(&p, &m);
+      ntrk::player_tick(&p, kSynRate);
+      const double theirs = p.channels[0].step;
+      const double ours =
+          ntrk::instrument_note_step(mi, 25, m.note_max, kSynRate);
+      CHECK(fabs(ours - theirs) < 1e-12);
+    }
+
+  // A note that cannot sound, a rate that cannot, and a module with no range:
+  // zero, which is silence rather than a position that runs away.
+  CHECK(ntrk::instrument_note_step(mi, 0, m.note_max, kSynRate) == 0.0);
+  CHECK(ntrk::instrument_note_step(mi, 25, m.note_max, 0.0) == 0.0);
+  CHECK(ntrk::instrument_note_step(mi, 25, 0, kSynRate) == 0.0);
+
+  // The clamp `note_transposed` applies is applied here too, and BOTH ends are
+  // checked because only one of them is reachable from a file -- which is
+  // itself the finding. The loader bounds `transpose` to -48..48 and a note to
+  // 1..note_max, so the lowest sum a file can name is `1 - 48`, which is
+  // exactly `kMinNote`: the floor is a guard sitting on the boundary rather
+  // than a case anything reaches, and asking for less is refused one line up as
+  // a note of zero.
+  mi.transpose = -48;
+  mi.finetune = 0;
+  CHECK(ntrk::instrument_note_step(mi, 1, m.note_max, kSynRate) > 0.0);
+  CHECK(ntrk::instrument_note_step(mi, 0, m.note_max, kSynRate) == 0.0);
+
+  // The ceiling IS reachable -- `note_max + 48` is past it for every module --
+  // so it is asserted as the clamp's own effect rather than by restating the
+  // formula: two notes that both land above it give the same step, and one that
+  // does not is untouched.
+  mi.transpose = 48;
+  const double capped =
+      ntrk::instrument_note_step(mi, m.note_max, m.note_max, kSynRate);
+  CHECK(capped > 0.0);
+  CHECK(ntrk::instrument_note_step(mi, m.note_max - 1, m.note_max, kSynRate) ==
+        capped);
+  CHECK(ntrk::instrument_note_step(mi, 1, m.note_max, kSynRate) != capped);
+}
+
+static void
 test_instrument_transpose() {
   printf("an instrument's transpose shifts the notes it plays\n");
 
@@ -6601,6 +6701,7 @@ main(void) {
   test_plane_slide_reaches_a_sample();
   test_panning_commands();
   test_instrument_transpose();
+  test_fractional_frame_and_note_step();
   test_plane_every_column();
   test_synth_grid();
   test_loader_fuzz();

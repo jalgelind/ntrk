@@ -3164,6 +3164,65 @@ instrument_frame(const Instrument &ins, uint32_t frame) {
   return (float) ins.data[frame];
 }
 
+// One frame at a FRACTIONAL position: the two neighbours, linearly blended.
+//
+// **Split out of `channel_sample` so an editor can hear what the player will.**
+// A preview voice that read nearest-neighbour while the player interpolates is
+// a preview at a different timbre from the tune -- audibly so on anything
+// transposed up, which is the difference this file's own comment about modems
+// describes. One reader of a fractional position, and both callers use it.
+//
+// The neighbour of the last frame is the loop start when there is a loop, so a
+// looping sample does not dip through the value it happens to end on.
+// Out of range is silence rather than a read past the blob: a caller that has
+// walked off the end is the one that decides whether that ends the note.
+inline float
+instrument_frame_at(const Instrument &ins, double pos) {
+  if (ins.data == nullptr || ins.length == 0 || pos < 0.0)
+    return 0.f;
+  const uint32_t index = (uint32_t) pos;
+  if (index >= ins.length)
+    return 0.f;
+  const uint32_t next_index =
+      (index + 1u < ins.length)
+          ? index + 1u
+          : (ins.loop_len > 0 ? ins.loop_start : index);
+  const double frac = pos - (double) index;
+  const float a = instrument_frame(ins, index);
+  const float b = instrument_frame(ins, next_index);
+  return (float) ((double) a + ((double) b - (double) a) * frac);
+}
+
+// The step a note plays an instrument at, with no channel to hold it.
+//
+// **The pitch chain, in one place.** `channel_trigger` walks it for the player:
+// the instrument's `transpose` shifts the cell's note, `note_transposed` clamps
+// the sum because neither bound says anything about it, `period_for` takes the
+// instrument's `finetune`, and `channel_set_step` turns a period into a step.
+// An editor auditioning a note has to walk the same chain or the preview sounds
+// at a different pitch from the tune, which is the one thing a preview must not
+// do -- and a second spelling of it is the copy that drifts when a format field
+// joins the chain.
+//
+// `note_max` is the module's, for the same reason `note_transposed` takes it.
+// Zero for a note or a rate that cannot sound, which is silence rather than a
+// position that runs away.
+inline double
+instrument_note_step(const Instrument &ins, int note, int note_max,
+                     double sample_rate) {
+  if (note <= 0 || note_max <= 0 || sample_rate <= 0.0)
+    return 0.0;
+  int shifted = note + (int) ins.transpose;
+  if (shifted < kMinNote)
+    shifted = kMinNote;
+  if (shifted > note_max)
+    shifted = note_max;
+  const double period = period_for(shifted, ins.finetune);
+  if (period <= 0.0)
+    return 0.0;
+  return (kAmigaClock / (2.0 * period)) / sample_rate;
+}
+
 // One channel's contribution, and the sample walk that goes with it.
 //
 // **Linearly interpolated rather than nearest.** A module's samples are a few
@@ -3220,14 +3279,7 @@ channel_sample(Channel *ch, const Instrument &ins) {
     return 0.f;
   }
 
-  const uint32_t next_index =
-      (index + 1u < ins.length)
-          ? index + 1u
-          : (ins.loop_len > 0 ? ins.loop_start : index);
-  const double frac = ch->pos - (double) index;
-  const float a = instrument_frame(ins, index);
-  const float b = instrument_frame(ins, next_index);
-  const float s = (float) ((double) a + ((double) b - (double) a) * frac);
+  const float s = instrument_frame_at(ins, ch->pos);
 
   ch->pos += ch->step;
 
