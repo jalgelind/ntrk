@@ -771,6 +771,13 @@ config_send_level(const ntrk::Module *module, int channel, int send) {
 }
 
 inline float
+config_return_level(const ntrk::Module *module, int slot) {
+  // Unity for a module with no block, which is what every reader of one should hear: no
+  // block means no mixer configuration, not a mixer configured to silence.
+  return module != nullptr && module->has_mix ? config_return_level(module->mix, slot) : 1.f;
+}
+
+inline float
 config_master_gain(const ntrk::Module *module) {
   return module != nullptr && module->has_mix ? config_master_gain(module->mix) : 1.f;
 }
