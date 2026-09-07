@@ -3526,6 +3526,9 @@ test_mixr_version_follows_the_levels() {
   mix::mixer_reset(&quiet);
   mix::slot_set_kind(&quiet.master_fx, mix::FxKind::kShape);
   mix::mixer_config_write(&quiet, &plain);
+  // **Unity returns are not new information.** They are exactly what a v1 file meant, so a
+  // mixer that feeds nothing and returns everything still needs no v2 bytes — which is what
+  // keeps a file that does not use the feature byte-identical through an open and a save.
   CHECK(!mix::config_has_send_levels(plain.mix));
 
   size_t need_v1 = 0;
@@ -3561,7 +3564,8 @@ test_mixr_version_follows_the_levels() {
   CHECK(mix::config_has_send_levels(back_v1.mix));
   size_t need_v2 = 0;
   CHECK(module_save(&back_v1, nullptr, 0, &need_v2));
-  CHECK(need_v2 == need_v1 + (size_t) kMixrSendLevelBytes);
+  // The level table AND the return bytes — both are what v2 added.
+  CHECK(need_v2 == need_v1 + (size_t) kMixrSendLevelBytes + (size_t) kMixrReturnBytes);
 
   size_t wrote_v2 = 0;
   CHECK(module_save(&back_v1, g_saved, sizeof g_saved, &wrote_v2));
@@ -3569,6 +3573,92 @@ test_mixr_version_follows_the_levels() {
   CHECK(module_load(&back_v2, g_saved, wrote_v2));
   CHECK(fabs(mix::config_send_level(back_v2.mix, 1, 0) - 0.75f) < 0.005f);
   CHECK(mix::config_send_level(back_v2.mix, 0, 0) == 0.f);
+}
+
+// **A return level, which a kind's own `Mix` knob could not be.** Only delay and reverb have
+// one of those — a shaper or a filter on a send was audible or bypassed with nothing between —
+// and a blend inside an effect is a different quantity anyway: `Mix` at half on a send returns
+// half the DRY signal too, which is the channel arriving twice rather than a quieter effect.
+static void
+test_send_return_level() {
+  printf("a send's return level scales what comes back, and unity is bit-identical\n");
+
+  build();
+  Module m;
+  CHECK(module_load(&m, g_bytes, g_size));
+
+  // A shaper on send 0, fed from channel 0 — the kind that has no `Mix` knob at all, so its
+  // return level is the ONLY thing that can quieten it.
+  const auto peak_at = [&](float ret) {
+    static mix::Mixer mx;
+    mix::mixer_reset(&mx);
+    mix::slot_set_kind(&mx.send[0], mix::FxKind::kShape);
+    mix::mixer_config_read(&mx, m.mix);
+    mix::slot_set_kind(&mx.send[0], mix::FxKind::kShape);
+    for (int c = 0; c < kMaxChannels; ++c)
+      mx.send_level[c][0] = 1.f;
+    mx.return_level[0] = ret;
+    mx.master_gain = 1.f;
+
+    Player p;
+    player_start(&p, &m);
+    double top = 0.0;
+    for (int w = 0; w < 8; ++w) {
+      const int frames = 512;
+      memset(g_a, 0, (size_t) frames * 2u * sizeof(double));
+      mix::mixer_render_add(&mx, &p, g_a, frames, 2, 48000.f);
+      for (int i = 0; i < frames * 2; ++i) {
+        const double x = g_a[i] < 0.0 ? -g_a[i] : g_a[i];
+        if (x > top)
+          top = x;
+      }
+    }
+    return top;
+  };
+
+  const double full = peak_at(1.f);
+  const double none = peak_at(0.f);
+  CHECK(full > 0.01);
+  // At zero the send contributes nothing, so what is left is the dry mix alone — quieter than
+  // the dry plus the effect.
+  CHECK(none < full);
+  CHECK(none > 0.0);            // ...and not silence: the channels still reach the mix
+
+  // **Unity is the path it always was, bit for bit**, which is why the render branches on it
+  // rather than multiplying by 1: `1.f * x` turns a negative zero positive, and every blessed
+  // fingerprint rests on the unscaled path.
+  CHECK(peak_at(1.f) == full);
+
+  // ---- the block's half ----------------------------------------------------
+  //
+  // **A real block first.** `build()` makes a module with no MIXR, and `config_readable`
+  // refuses one — so every setter below would be a silent no-op while the READER answered
+  // unity for that very case, which is what made the first version of these checks fail in a
+  // way that looked like a broken setter.
+  CHECK(mix::config_init(m.mix));
+  m.has_mix = true;
+  CHECK(mix::config_return_level(m.mix, 0) == 1.f);       // a fresh block returns everything
+  mix::config_set_return_level(m.mix, 0, 0.5f);
+  CHECK(fabs(mix::config_return_level(m.mix, 0) - 0.5f) < 0.005f);
+  // Out of range reads unity and writes nothing rather than off the end.
+  CHECK(mix::config_return_level(m.mix, -1) == 1.f);
+  CHECK(mix::config_return_level(m.mix, kMixrSlots) == 1.f);
+  mix::config_set_return_level(m.mix, 99, 0.f);
+  CHECK(fabs(mix::config_return_level(m.mix, 0) - 0.5f) < 0.005f);
+  // Clamped rather than wrapped, at both ends.
+  mix::config_set_return_level(m.mix, 1, 2.f);
+  CHECK(mix::config_return_level(m.mix, 1) == 1.f);
+  mix::config_set_return_level(m.mix, 1, -1.f);
+  CHECK(mix::config_return_level(m.mix, 1) == 0.f);
+
+  // And it survives the mixer round trip, which is what says the number the panel shows is
+  // the gain the render applies.
+  static mix::Mixer back;
+  mix::mixer_reset(&back);
+  CHECK(mix::mixer_config_read(&back, m.mix));
+  CHECK(fabs(back.return_level[0] - 0.5f) < 0.005f);
+  CHECK(back.return_level[1] == 0.f);
+  CHECK(back.return_level[2] == 1.f);
 }
 
 static void
@@ -3990,6 +4080,7 @@ main(void) {
   test_slot_mute_reaches_the_mixer();
   test_mixr_round_trip();
   test_mixr_send_levels();
+  test_send_return_level();
   test_mixr_version_follows_the_levels();
   test_mixr_refuses_an_unknown_kind();
   test_mixr_writes_the_setting_not_the_slide();

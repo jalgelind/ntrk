@@ -548,6 +548,32 @@ config_set_send_level(uint8_t *block, int channel, int send, float v) {
   *const_cast<uint8_t *>(at) = (uint8_t) (c * 255.f + 0.5f);
 }
 
+// A return level's byte, or null where the slot does not name one.
+static const uint8_t *
+config_return_at(const uint8_t *block, int slot) {
+  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots)
+    return nullptr;
+  return block + kMixrBytesV1 + kMixrSendLevelBytes + slot;
+}
+
+float
+config_return_level(const uint8_t *block, int slot) {
+  const uint8_t *at = config_return_at(block, slot);
+  // **Unity for a block that has none**, which is what a v1 file meant: a send returned at
+  // full and the only thing that could quieten it was the effect's own mix knob, where it had
+  // one. Defaulting to zero would silence every existing tune's sends.
+  return at != nullptr ? (float) *at / 255.f : 1.f;
+}
+
+void
+config_set_return_level(uint8_t *block, int slot, float v) {
+  const uint8_t *at = config_return_at(block, slot);
+  if (at == nullptr)
+    return;
+  const float c = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+  *const_cast<uint8_t *>(at) = (uint8_t) (c * 255.f + 0.5f);
+}
+
 // Whether any channel feeds any send. **The version the writer chooses**: all-zero is what a
 // v1 file meant, so it is written back as one and an unchanged file keeps its bytes.
 bool
@@ -556,6 +582,13 @@ config_has_send_levels(const uint8_t *block) {
     return false;
   for (int i = 0; i < kMixrSendLevelBytes; ++i)
     if (block[kMixrBytesV1 + i] != 0u)
+      return true;
+  // A return below unity is also something v1 could not say. **Unity itself is not** — it is
+  // exactly what a v1 file meant, so a block whose returns are all full needs no v2 bytes to
+  // express it and is written narrow. The master's byte is ignored here for the same reason
+  // it is ignored at render: its output IS the mix, so whatever it holds changes nothing.
+  for (int i = 0; i < kMixrSends; ++i)
+    if (block[kMixrBytesV1 + kMixrSendLevelBytes + i] != 255u)
       return true;
   return false;
 }
@@ -588,6 +621,11 @@ config_init(uint8_t *block) {
   // Mixer would write these two the same way.
   ntrk::write_u16(block + 4, mixr_q12(1.f));
   ntrk::write_u16(block + 6, mixr_q12(1.f));
+  // **The returns at unity, for the same reason the master gain is.** A fresh block whose
+  // returns were zero is a mixer where switching a send on produces silence, and "I added a
+  // reverb and nothing happened" is the other half of the first impression this guards.
+  for (int i = 0; i < kMixrReturnBytes; ++i)
+    block[kMixrBytesV1 + kMixrSendLevelBytes + i] = 255u;
   return true;
 }
 
@@ -661,6 +699,9 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
   for (int c = 0; c < kMaxChannels; ++c)
     for (int t = 0; t < kMixrSends; ++t)
       mx->send_level[c][t] = (float) p[kMixrBytesV1 + (size_t) c * kMixrSends + t] / 255.f;
+  for (int i = 0; i < kMixrSlots; ++i)
+    mx->return_level[i] =
+        (float) p[kMixrBytesV1 + kMixrSendLevelBytes + i] / 255.f;
   return true;
 }
 
@@ -696,6 +737,11 @@ mixer_config_write(const Mixer *mx, uint8_t *block) {
       const float cl = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
       p[kMixrBytesV1 + (size_t) c * kMixrSends + t] = (uint8_t) (cl * 255.f + 0.5f);
     }
+  for (int i = 0; i < kMixrSlots; ++i) {
+    const float v = mx->return_level[i];
+    const float cl = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+    p[kMixrBytesV1 + kMixrSendLevelBytes + i] = (uint8_t) (cl * 255.f + 0.5f);
+  }
 }
 
 void
@@ -1423,10 +1469,26 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       // skip above is the whole behaviour. It is an effect send, not a second
       // copy of the dry mix, and returning the dry would just double every
       // voice feeding it.
-      for (int i = 0; i < run; ++i) {
-        mx->mix_l[i] += bus_l[i];
-        mx->mix_r[i] += bus_r[i];
+      //
+      // **The return level scales what comes back**, and the unity case is branched rather
+      // than multiplied by 1: `1.f * x` is not the identity for every x this can carry --
+      // it turns a negative zero positive -- and the fully-returned path is what every
+      // blessed fingerprint rests on, bit for bit.
+      const float ret = mx->return_level[s];
+      if (ret >= 1.f) {
+        for (int i = 0; i < run; ++i) {
+          mx->mix_l[i] += bus_l[i];
+          mx->mix_r[i] += bus_r[i];
+        }
+      } else if (ret > 0.f) {
+        for (int i = 0; i < run; ++i) {
+          mx->mix_l[i] += bus_l[i] * ret;
+          mx->mix_r[i] += bus_r[i] * ret;
+        }
       }
+      // ...and at zero nothing is added at all, so a silenced send costs the mix nothing
+      // while its tail still runs -- which is what keeps turning one down and back up from
+      // restarting the reverb.
     }
 
     // Gain before the master effect, because a saturator's character is a

@@ -1117,6 +1117,13 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // none goes back out as v1 and is unchanged.
       for (int k = 0; k < kMixrBytes; ++k)
         module->mix[k] = k < (int) bytes ? data[offset + (uint32_t) k] : (uint8_t) 0u;
+      // **The RETURNS come up at unity, not at zero.** Zero is right for a send level -- a v1
+      // file fed its sends from the plane and nothing else -- but a return of zero is a send
+      // that runs and cannot be heard, so every existing tune's reverb would go silent on the
+      // first load by a reader that understands v2. Unity is what v1 meant.
+      if (bytes < (uint32_t) kMixrBytes)
+        for (int k = 0; k < kMixrReturnBytes; ++k)
+          module->mix[kMixrBytesV1 + kMixrSendLevelBytes + k] = 255u;
       write_u16(module->mix, (uint16_t) kMixrVersion);
       module->has_mix = true;
     } else if ((flags & kBlockCritical) != 0u) {

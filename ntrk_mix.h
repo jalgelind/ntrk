@@ -478,6 +478,12 @@ struct Mixer {
   // Zero everywhere, so a fresh mixer sends nothing. An effect a caller has not
   // asked for must not appear in the mix because the struct defaulted into it.
   float send_level[kMaxChannels][kSends] = {};
+  // How much of each send's OUTPUT reaches the mix. **Unity, unlike `send_level`**: nothing
+  // feeds a send until a caller says so, but once something does, a return of zero would be
+  // an effect that runs and cannot be heard. `kMixrSlots` rather than `kSends` so a slot
+  // index means the same thing here as in the block; the master's is not applied, because its
+  // output IS the mix and scaling it would be a second master gain.
+  float return_level[kMixrSlots] = {1.f, 1.f, 1.f, 1.f, 1.f};
   Slot  send[kSends];
 
   Slot  insert[kMaxChannels];
@@ -656,6 +662,17 @@ FxKind config_slot_kind(const uint8_t *block, int slot);
 // bytes back out of it. Answers 0 for a block the reader would refuse, so an
 // editor cannot draw a value out of a file the player will not load.
 float config_slot_param(const uint8_t *block, int slot, int param);
+
+// How much of what slot `slot` produces reaches the mix, 0..1.
+//
+// **A return level, which a kind's own `Mix` knob is not.** Only delay and reverb have one of
+// those, so a shaper or a filter on a send was audible or bypassed with nothing between — and
+// a blend inside an effect is a different quantity anyway: `Mix` at half on a send returns
+// half the DRY signal too, which is the channel arriving twice rather than a quieter effect.
+//
+// Unity for a block that carries none, which is what a v1 file meant.
+float config_return_level(const uint8_t *block, int slot);
+void config_set_return_level(uint8_t *block, int slot, float v);
 
 // How much of `channel` reaches `send`, 0..1 — the number `mixer_render_add` multiplies a
 // voice by on its way to the bus, and the one thing a send needs that the block could not

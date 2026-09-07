@@ -449,7 +449,7 @@ const int kFxplValueCount = 8;
 //
 //   u16 version (2)   u16 slots   u16 master gain   u16 width
 //   then per slot: u8 kind, u8 reserved, u16 param[8]
-//   then, at v2 only: u8 send_level[kMaxChannels][kMixrSends]
+//   then, at v2 only: u8 send_level[kMaxChannels][kMixrSends], u8 return_level[kMixrSlots]
 //
 // Gain and width are Q12 -- 4096 is unity -- which reaches 16 with a resolution
 // of 0.00024, far finer than a fader moves. A parameter is normalised 0..1 over
@@ -478,7 +478,20 @@ const int kMixrBytesV1 = kMixrHeaderBytes + kMixrSlots * kMixrSlotBytes;
 // than the plane's own command resolution, which is also a byte -- so the block can say
 // anything an automation of it could.
 const int kMixrSendLevelBytes = kMaxChannels * kMixrSends;
-const int kMixrBytes = kMixrBytesV1 + kMixrSendLevelBytes;
+// A RETURN level per slot: how much of what the slot produces reaches the mix.
+//
+// **Not the same as a kind's own `Mix` knob**, which is what stood in for this and could not.
+// Only two of the four kinds have one — delay at parameter 3, reverb at 4 — and a shaper or a
+// filter on a send had no level at all, so it was audible or bypassed with nothing in between.
+// A blend inside an effect is also a different quantity from how loud its bus comes back:
+// `mix` at 0.5 on a send means half the DRY signal returning too, which on a send is the
+// channel arriving twice rather than a quieter effect.
+//
+// The master's own byte is written and read like the rest and is simply not applied — its
+// output IS the mix, so scaling it here would be a second master gain. It stays in the layout
+// so a slot index means the same thing in every table.
+const int kMixrReturnBytes = kMixrSlots;
+const int kMixrBytes = kMixrBytesV1 + kMixrSendLevelBytes + kMixrReturnBytes;
 const int kMixrQUnit = 4096;       // Q12: what 1.0 is stored as
 
 
