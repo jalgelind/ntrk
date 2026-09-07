@@ -414,6 +414,35 @@ limiter_ceil(float x) {
   return x < -kLimiterCeiling ? -kLimiterCeiling : x;
 }
 
+namespace {
+
+// The loudest magnitude in a run, both channels.
+float
+run_peak(const float *l, const float *r, int run) {
+  float peak = 0.f;
+  for (int i = 0; i < run; ++i) {
+    const float a = l[i] < 0.f ? -l[i] : l[i];
+    if (a > peak)
+      peak = a;
+    const float b = r[i] < 0.f ? -r[i] : r[i];
+    if (b > peak)
+      peak = b;
+  }
+  return peak;
+}
+
+// A peak with a release: the loudest of what just arrived and what is left of
+// what was there. **The release is what lets a host sample this slower than the
+// block rate** -- at 512 frames a block runs about every 12 ms and a UI looks
+// about every 16, so without one a transient would land in a block nobody read.
+void
+peak_hold(float *held, float peak, float run_secs) {
+  const float fell = *held * std::pow(10.f, -Mixer::kPeakFallDbPerSec * run_secs / 20.f);
+  *held = peak > fell ? peak : fell;
+}
+
+}  // namespace
+
 void
 mixer_reset(Mixer *mx) {
   if (mx == nullptr)
@@ -437,6 +466,11 @@ mixer_reset(Mixer *mx) {
   slot_revert(&mx->master_fx);
   slot_set_kind(&mx->master_fx, mx->master_fx.kind);
   mx->limit_gain = 1.f;
+  // Every tail is gone, so every meter is empty. Left to the release it would
+  // fall from wherever the last tune left it, which reads as a bus still
+  // running after the thing feeding it was dropped.
+  for (int i = 0; i < kMixrSlots; ++i)
+    mx->slot_peak[i] = 0.f;
   // The plane re-seeds itself from the knobs on the next tick rather than being
   // cleared to defaults here: those knobs are settings, and this call keeps
   // settings.
@@ -1324,6 +1358,10 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
     // an assertion here compiles to nothing in the build that ships.
     if (run > kMaxBlock)
       run = kMaxBlock;
+    // How long this chunk is, for the meters' release. A run is a real slice of
+    // time and not a fixed one -- `player_run_begin` cuts it at the next tick --
+    // so a fall per BLOCK would be a fall that changed with the tempo.
+    const float run_secs = frate > 0.f ? (float) run / frate : 0.f;
 
     // **A module with no plane drops what was queued rather than holding it.** The
     // plane is where a macro is applied, so a pending input has nowhere to go --
@@ -1474,6 +1512,11 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       // than multiplied by 1: `1.f * x` is not the identity for every x this can carry --
       // it turns a negative zero positive -- and the fully-returned path is what every
       // blessed fingerprint rests on, bit for bit.
+      // What this send is putting out, AFTER its effect and before the return:
+      // the question is whether the bus has signal, and a return of zero is a
+      // choice about the mix rather than a silent send.
+      peak_hold(&mx->slot_peak[s], run_peak(bus_l, bus_r, run), run_secs);
+
       const float ret = mx->return_level[s];
       if (ret >= 1.f) {
         for (int i = 0; i < run; ++i) {
@@ -1516,6 +1559,15 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
     }
 
     limiter_process(mx, mx->mix_l, mx->mix_r, run, frate);
+
+    // The master is what the caller is about to hear -- after the gain, the
+    // master effect, the width and the limiter. **And every send that did NOT
+    // run this block falls too**: a slot switched off mid-tail would otherwise
+    // hold its last peak forever, which reads as a bus still running.
+    peak_hold(&mx->slot_peak[kSends], run_peak(mx->mix_l, mx->mix_r, run), run_secs);
+    for (int s = 0; s < kSends; ++s)
+      if (!send_on[s])
+        peak_hold(&mx->slot_peak[s], 0.f, run_secs);
 
     for (int i = 0; i < run; ++i) {
       const int at = frame + i;

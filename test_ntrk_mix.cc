@@ -3575,6 +3575,80 @@ test_mixr_version_follows_the_levels() {
   CHECK(mix::config_send_level(back_v2.mix, 0, 0) == 0.f);
 }
 
+// **Whether anything is FEEDING a send is the one thing about this mixer a listener cannot
+// locate.** A slot carries an effect or it does not, and a host can read that out of the
+// block; the signal on the bus exists only inside `mixer_render_add`, between the channel
+// loop that fills it and the return that empties it. So the mixer records it.
+static void
+test_slot_peaks() {
+  printf("every bus reports what it is putting out, and it falls when nothing feeds it\n");
+
+  build();
+  Module m;
+  CHECK(module_load(&m, g_bytes, g_size));
+
+  static mix::Mixer mx;
+  mix::mixer_reset(&mx);
+  // A fresh mixer has heard nothing, on every slot — including indices it has no slot for,
+  // which read zero rather than off the end.
+  for (int i = 0; i < kMixrSlots; ++i)
+    CHECK(mix::mixer_slot_peak(&mx, i) == 0.f);
+  CHECK(mix::mixer_slot_peak(&mx, -1) == 0.f);
+  CHECK(mix::mixer_slot_peak(&mx, kMixrSlots) == 0.f);
+  CHECK(mix::mixer_slot_peak(nullptr, 0) == 0.f);
+
+  // Send 0 carries a shaper and every channel feeds it; send 1 carries the same effect and
+  // nothing feeds it. **That is the pair the whole feature is for** — the two look identical
+  // in the block and are the difference between a reverb you can hear and one you cannot.
+  mix::slot_set_kind(&mx.send[0], mix::FxKind::kShape);
+  mix::slot_set_kind(&mx.send[1], mix::FxKind::kShape);
+  for (int c = 0; c < kMaxChannels; ++c)
+    mx.send_level[c][0] = 1.f;
+  mx.master_gain = 1.f;
+
+  Player p;
+  player_start(&p, &m);
+  for (int w = 0; w < 8; ++w) {
+    const int frames = 512;
+    memset(g_a, 0, (size_t) frames * 2u * sizeof(double));
+    mix::mixer_render_add(&mx, &p, g_a, frames, 2, 48000.f);
+  }
+
+  const float fed = mix::mixer_slot_peak(&mx, 0);
+  CHECK(fed > 0.01f);
+  CHECK(mix::mixer_slot_peak(&mx, 1) == 0.f);   // the same effect, nothing arriving
+  // The master is what the caller is about to hear, so it carries the tune whatever the
+  // sends do.
+  CHECK(mix::mixer_slot_peak(&mx, mix::kSends) > 0.01f);
+
+  // **The release, which is what lets a host sample this slower than the block rate.** With
+  // the transport stopped nothing is rendered at all, so the fall is asserted where it can
+  // be: on a send whose feed is cut while the tune keeps playing.
+  for (int c = 0; c < kMaxChannels; ++c)
+    mx.send_level[c][0] = 0.f;
+  // One block: still falling, not yet gone — a peak that cleared on the first silent block
+  // would be a peak nobody sampling at 60 Hz could ever see.
+  memset(g_a, 0, 512u * 2u * sizeof(double));
+  mix::mixer_render_add(&mx, &p, g_a, 512, 2, 48000.f);
+  const float after_one = mix::mixer_slot_peak(&mx, 0);
+  CHECK(after_one < fed);
+  CHECK(after_one > 0.f);
+
+  // ...and gone once enough time has passed. 24 dB/s over two seconds is 48 dB down, which
+  // is under a thousandth of what it was.
+  for (int w = 0; w < 200; ++w) {
+    memset(g_a, 0, 512u * 2u * sizeof(double));
+    mix::mixer_render_add(&mx, &p, g_a, 512, 2, 48000.f);
+  }
+  CHECK(mix::mixer_slot_peak(&mx, 0) < fed * 0.01f);
+
+  // A reset empties every meter rather than leaving them to fall: the tails are gone, and a
+  // bus reading half full with nothing in it is worse than one reading nothing.
+  mix::mixer_reset(&mx);
+  for (int i = 0; i < kMixrSlots; ++i)
+    CHECK(mix::mixer_slot_peak(&mx, i) == 0.f);
+}
+
 // **A return level, which a kind's own `Mix` knob could not be.** Only delay and reverb have
 // one of those — a shaper or a filter on a send was audible or bypassed with nothing between —
 // and a blend inside an effect is a different quantity anyway: `Mix` at half on a send returns
@@ -4081,6 +4155,7 @@ main(void) {
   test_mixr_round_trip();
   test_mixr_send_levels();
   test_send_return_level();
+  test_slot_peaks();
   test_mixr_version_follows_the_levels();
   test_mixr_refuses_an_unknown_kind();
   test_mixr_writes_the_setting_not_the_slide();

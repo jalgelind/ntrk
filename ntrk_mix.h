@@ -586,6 +586,29 @@ struct Mixer {
   // shifts the stereo image every time one side goes loud.
   float limit_gain = 1.f;
 
+  // -- What each bus is doing, for a host that wants to show it.
+  //
+  // **A send is the one thing in this mixer a listener cannot locate.** A slot
+  // carries an effect or it does not, and that is all a host could ask; whether
+  // anything is FEEDING it is the question somebody asks when a reverb they set
+  // up cannot be heard, and the answer only exists inside `mixer_render_add`,
+  // where the buses live and die within a run.
+  //
+  // Peak magnitude per slot -- the four sends after their effect, then the
+  // master after everything -- with a release, so a reader sampling slower than
+  // the block rate cannot miss a transient. Written once per run and read by
+  // nobody in here: the audio thread is the only writer, and a host copies it
+  // out of the block like it copies `player->row`.
+  //
+  // **Not clear-on-read**, which is the shape this obviously wants and cannot
+  // have: the reader is another thread. A release the writer applies is the
+  // version with one writer.
+  float slot_peak[kMixrSlots] = {};
+
+  // How fast a peak falls, in dB per second. Slow enough to see, fast enough
+  // that a stopped tune's meters empty rather than hanging.
+  static constexpr float kPeakFallDbPerSec = 24.f;
+
   // **Scratch, and it lives here rather than on the stack.** A render thread
   // gets 512 KB on macOS and every one of these is written before it is read
   // within a run, so none of them needs clearing between calls.
@@ -603,6 +626,19 @@ Slot *slot_at(Mixer *mx, int slot, int channel);
 // this is the "stop the sound" call, not the "forget the patch" one -- so a
 // slot the plane had automated goes back to its `base`, which is the setting.
 void mixer_reset(Mixer *mx);
+
+// What slot `index` last put out, as a peak magnitude with a release applied:
+// 0..kSends-1 are the sends after their own effect, kSends is the master after
+// the gain, the master effect, the width and the limiter -- which is to say,
+// what the caller is about to hear.
+//
+// Zero for an index this mixer has no slot for, so a host that walks
+// `kMixrSlots` needs no bound of its own.
+inline float
+mixer_slot_peak(const Mixer *mx, int index) {
+  return mx != nullptr && index >= 0 && index < kMixrSlots ? mx->slot_peak[index]
+                                                           : 0.f;
+}
 
 // ---- MIXR, the mixer's half of the file ------------------------------------
 //
