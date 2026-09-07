@@ -576,6 +576,168 @@ test_mute() {
 }
 
 static void
+test_slot_mute() {
+  printf("a slot mute silences one track for one section, and travels in the "
+         "file\n");
+
+  Spec s;
+  s.channels = 2;
+  s.orders = 2;
+  s.patterns = 2;
+  build(s);
+  // Both channels sound from row 0. Both order positions play pattern 0, which
+  // is what makes this a test of a per-POSITION mute rather than a per-pattern
+  // one: the same pattern is silent in one position and not in the other.
+  set_cell(s, 0, 1, 25u, 1u, 0u, 0u);
+
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+  CHECK(!m.has_slot_mute);
+  CHECK(!ntrk::slot_muted(&m, 0, 1));
+
+  // ---- the accessors -------------------------------------------------
+  ntrk::slot_set_muted(&m, 0, 1, true);
+  CHECK(m.has_slot_mute);
+  CHECK(ntrk::slot_muted(&m, 0, 1));
+  CHECK(!ntrk::slot_muted(&m, 0, 0));      // the other channel
+  CHECK(!ntrk::slot_muted(&m, 1, 1));      // the same channel, other position
+
+  // Out of range is "not muted" rather than silence, and writing there is a
+  // no-op rather than a stray bit somewhere else.
+  CHECK(!ntrk::slot_muted(&m, -1, 0));
+  CHECK(!ntrk::slot_muted(&m, m.order_count, 0));
+  CHECK(!ntrk::slot_muted(&m, 0, m.channels));
+  ntrk::slot_set_muted(&m, 99, 0, true);
+  ntrk::slot_set_muted(&m, 0, 99, true);
+  CHECK(m.slot_mute[0] == 2u);             // still just channel 1
+
+  // Clearing the last bit clears the flag, so a file stops carrying a block it
+  // no longer needs.
+  ntrk::slot_set_muted(&m, 0, 1, false);
+  CHECK(!m.has_slot_mute);
+  ntrk::slot_set_muted(&m, 0, 1, true);
+
+  // ---- the player ----------------------------------------------------
+  // **The reference is a SEPARATE module.** Rendering both from `m` and setting
+  // the bit in between would compare a muted tune against itself, which is a
+  // pair of identical peaks and a test that passes for the wrong reason.
+  ntrk::Module open_module;
+  CHECK(ntrk::module_load(&open_module, g_bytes, g_size));
+  CHECK(!open_module.has_slot_mute);
+
+  ntrk::Player open_player;
+  ntrk::player_start(&open_player, &open_module);
+  double both[128] = {0};
+  ntrk::render_add(&open_player, both, 128, 1, 22050.f);
+
+  ntrk::Player muted;
+  ntrk::player_start(&muted, &m);
+  double one[128] = {0};
+  ntrk::render_add(&muted, one, 128, 1, 22050.f);
+
+  CHECK(abs_peak(one, 128) > 0.0);                       // channel 0 sounds
+  CHECK(abs_peak(one, 128) < abs_peak(both, 128));       // channel 1 does not
+
+  // **Sampled and dropped, like the listener's mute** -- the position has to be
+  // where an unmuted reference left it, or the track jumps when the tune walks
+  // into the next section.
+  CHECK(muted.channels[1].pos == open_player.channels[1].pos);
+
+  // ...and the OTHER position is untouched: a slot mute is a section, not a
+  // track. Both order entries play the same pattern here, so the second
+  // position sounding louder than the first can only be the mute.
+  ntrk::Player at_one;
+  ntrk::player_start(&at_one, &m);
+  ntrk::player_seek(&at_one, 1, 0);
+  double second[128] = {0};
+  ntrk::render_add(&at_one, second, 128, 1, 22050.f);
+  CHECK(abs_peak(second, 128) > abs_peak(one, 128));
+
+  // ---- the round trip ------------------------------------------------
+  size_t need = 0;
+  CHECK(ntrk::module_save(&m, nullptr, 0, &need));
+  size_t wrote = 0;
+  CHECK(ntrk::module_save(&m, g_saved, sizeof g_saved, &wrote));
+  CHECK(wrote == need);
+
+  ntrk::Module back;
+  CHECK(ntrk::module_load(&back, g_saved, wrote));
+  CHECK(back.has_slot_mute);
+  CHECK(ntrk::slot_muted(&back, 0, 1));
+  CHECK(!ntrk::slot_muted(&back, 1, 1));
+  CHECK(!ntrk::slot_muted(&back, 0, 0));
+
+  // **Nothing muted writes no block**, so a file that does not use the feature
+  // stays readable by a reader that does not know the id -- which matters
+  // because the block is critical.
+  ntrk::Module clean;
+  CHECK(ntrk::module_load(&clean, g_bytes, g_size));
+  size_t clean_need = 0;
+  CHECK(ntrk::module_save(&clean, nullptr, 0, &clean_need));
+  CHECK(clean_need < need);
+  CHECK(need - clean_need ==
+        (size_t) ntrk::kDirectoryEntryBytes + (size_t) ntrk::kSmutHeaderBytes +
+            (size_t) m.order_count * 2u);
+}
+
+static void
+test_slot_mute_refusals() {
+  printf("a SMUT block that disagrees with the module is refused\n");
+
+  Spec s;
+  s.channels = 2;
+  s.orders = 2;
+  s.patterns = 2;
+  build(s);
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+  ntrk::slot_set_muted(&m, 0, 1, true);
+  size_t wrote = 0;
+  CHECK(ntrk::module_save(&m, g_saved, sizeof g_saved, &wrote));
+
+  // Find the block's payload through its own directory ENTRY rather than by
+  // counting bytes here: the directory sits after the positional blocks, so a
+  // test that hard-coded an offset would be re-implementing the parse and would
+  // stop testing the format the day the layout moves. The entry is identified
+  // by all three of its fields at once, which no other twelve bytes match.
+  const size_t want_bytes =
+      (size_t) ntrk::kSmutHeaderBytes + (size_t) m.order_count * 2u;
+  size_t payload = 0;
+  for (size_t e = 0; e + (size_t) ntrk::kDirectoryEntryBytes <= wrote; ++e) {
+    if (ntrk::read_u16(g_saved + e) != ntrk::kBlockSmut) continue;
+    if (ntrk::read_u16(g_saved + e + 2) != ntrk::kBlockCritical) continue;
+    if ((size_t) ntrk::read_u32(g_saved + e + 8) != want_bytes) continue;
+    const size_t off = (size_t) ntrk::read_u32(g_saved + e + 4);
+    if (off + want_bytes > wrote) continue;
+    // The payload says the geometry it was written for, which is the last
+    // confirmation that this is the entry and not twelve coincidental bytes.
+    if (ntrk::read_u16(g_saved + off) != (uint16_t) m.order_count) continue;
+    payload = off;
+    break;
+  }
+  CHECK(payload != 0);
+
+  ntrk::Module back;
+  // The counts are the module's own, or the table would silence whichever
+  // tracks its bits happened to land on.
+  ntrk::write_u16(g_saved + payload + 0, 3u);        // order_count says 3
+  CHECK(!ntrk::module_load(&back, g_saved, wrote));
+  ntrk::write_u16(g_saved + payload + 0, 2u);
+  CHECK(ntrk::module_load(&back, g_saved, wrote));
+
+  ntrk::write_u16(g_saved + payload + 2, 4u);        // channels says 4
+  CHECK(!ntrk::module_load(&back, g_saved, wrote));
+  ntrk::write_u16(g_saved + payload + 2, 2u);
+  CHECK(ntrk::module_load(&back, g_saved, wrote));
+
+  // A bit above the channel count names a channel that is not there.
+  ntrk::write_u16(g_saved + payload + ntrk::kSmutHeaderBytes, 0x0004u);
+  CHECK(!ntrk::module_load(&back, g_saved, wrote));
+  ntrk::write_u16(g_saved + payload + ntrk::kSmutHeaderBytes, 0x0002u);
+  CHECK(ntrk::module_load(&back, g_saved, wrote));
+}
+
+static void
 test_seek() {
   printf("seek lands on a row without playing up to it\n");
 
@@ -6661,6 +6823,8 @@ main(void) {
   test_loop_range();
   test_skip();
   test_mute();
+  test_slot_mute();
+  test_slot_mute_refusals();
   test_seek();
   test_geometry_shrinks_under_player();
   test_preview();

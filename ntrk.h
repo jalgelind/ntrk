@@ -816,7 +816,22 @@ const uint16_t kBlockTune = 0x0006;
 const uint16_t kBlockMacr = 0x0004;
 const uint16_t kBlockMixr = 0x0005;
 const uint16_t kBlockSlic = 0x000A;
+const uint16_t kBlockSmut = 0x000B;
 const uint16_t kBlockCritical = 0x0001;   // a directory entry's flags, bit 0
+
+// SMUT: `u16 order_count`, `u16 channels`, then one `u16 LE` per order position
+// -- bit `c` set means channel `c` is silent for that position. `kMaxChannels`
+// is 16, so a position is exactly one u16 and there is no packing arithmetic
+// anywhere in the format, the player or an editor.
+//
+// **Critical, and written only when a bit is set.** A tune whose arrangement
+// depends on slot mutes plays WRONG without them -- a part that should be
+// silent is heard, which is not a degraded rendering but a different piece of
+// music. That is unlike MIXR, where a reader that skips the block still plays
+// the tune with the host's own sends. Writing the block only when it says
+// something means files that do not use the feature stay readable by every
+// reader, and only the files that genuinely need it refuse to be misread.
+const int kSmutHeaderBytes = 4;
 
 // SLIC: `u16 table_count`, `u16` reserved, then one four-byte record per
 // instrument that has slices -- `u8 instrument` (1-based), `u8` reserved,
@@ -980,6 +995,8 @@ module_load(Module *module, const uint8_t *data, size_t size) {
   size_t name_bytes = 0;
   const uint8_t *tune = nullptr;
   size_t tune_bytes = 0;
+  const uint8_t *smut = nullptr;
+  size_t smut_bytes = 0;
   const uint8_t *macr = nullptr;
   size_t macr_bytes = 0;
   const uint8_t *slic = nullptr;
@@ -1061,6 +1078,13 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // than a second copy of the parse made here.
       synp = data + offset;
       synp_bytes = (size_t) bytes;
+    } else if (id == kBlockSmut) {
+      // Judged against `order_count` and `channels`, which the header has
+      // already given -- but so has every other block's check been deferred to
+      // one place, and this one is validated below with them rather than half
+      // here.
+      smut = data + offset;
+      smut_bytes = (size_t) bytes;
     } else if (id == kBlockSlic) {
       // Judged against the instrument table -- both the count and every
       // instrument's `length` -- which is parsed below, so the check is made
@@ -1254,6 +1278,35 @@ module_load(Module *module, const uint8_t *data, size_t size) {
     module->rows_per_beat = rpbeat;
     module->rows_per_bar = rpbar;
     module->swing = sw;
+  }
+
+  // SMUT. Exact length, like every block here, and judged against the geometry
+  // the header already gave.
+  if (smut != nullptr) {
+    if (smut_bytes < (size_t) kSmutHeaderBytes)
+      return false;
+    const int so = (int) read_u16(smut + 0);
+    const int sc = (int) read_u16(smut + 2);
+    // **The counts must be the module's own.** A table sized for a different
+    // order list would silence whichever tracks its bits happened to land on --
+    // a wrong tune rather than a refused file, which is the failure every block
+    // here is checked to prevent.
+    if (so != module->order_count || sc != module->channels)
+      return false;
+    if (smut_bytes != (size_t) kSmutHeaderBytes + (size_t) so * 2u)
+      return false;
+    for (int i = 0; i < so; ++i) {
+      const uint16_t bits = read_u16(smut + kSmutHeaderBytes + (size_t) i * 2u);
+      // A bit above the channel count names a channel that is not there. It
+      // would be harmless to ignore and is refused anyway: it means the writer
+      // and this reader disagree about the geometry, and the next thing that
+      // disagreement touches may not be harmless.
+      if (sc < 16 && (bits >> sc) != 0u)
+        return false;
+      module->slot_mute[i] = bits;
+      if (bits != 0u)
+        module->has_slot_mute = true;
+    }
   }
 
   // NAME, once the instrument table has said how many instruments there are.
@@ -1600,10 +1653,19 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     if (module->instruments[i].name[0] != '\0')
       want_name = true;
 
+  // Written only where a bit is actually set -- see the block's own comment for
+  // why that matters more here than for the others: an empty SMUT would make
+  // every file refuse to open in a reader that does not know the id, to say
+  // that nothing is muted.
+  bool want_smut = false;
+  for (int i = 0; i < module->order_count && !want_smut; ++i)
+    if (module->slot_mute[i] != 0u)
+      want_smut = true;
+
   const int block_count = (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
                           (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
                           (want_macr ? 1 : 0) + (want_mixr ? 1 : 0) +
-                          (want_slic ? 1 : 0);
+                          (want_slic ? 1 : 0) + (want_smut ? 1 : 0);
   const size_t directory_bytes =
       (size_t) block_count * (size_t) kDirectoryEntryBytes;
   // Lanes rather than channels, and the four-byte prefix that says how many.
@@ -1627,10 +1689,13 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
                       (size_t) slic_tables * (size_t) kSlicRecordBytes +
                       slic_offsets * (size_t) kSlicOffsetBytes
                 : 0u;
+  const size_t smut_bytes =
+      want_smut ? (size_t) kSmutHeaderBytes + (size_t) module->order_count * 2u
+                : 0u;
   const size_t total = (size_t) kHeaderBytes + order_bytes + instrument_bytes +
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
                        tune_bytes + name_bytes + synp_bytes + macr_bytes +
-                       mixr_bytes + slic_bytes;
+                       mixr_bytes + slic_bytes + smut_bytes;
 
   *written = total;
   if (out == nullptr)
@@ -1770,6 +1835,26 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     write_u16(out + at + 4, (uint16_t) module->swing);
     write_u16(out + at + 6, 0u);
     at += (size_t) kTuneBytes;
+  }
+
+  if (want_smut) {
+    // **Critical, always** -- unlike TUNE, which is critical only when its
+    // swing is non-zero. There is no such condition here: the block is written
+    // only when a bit is set, and a set bit is by definition something that
+    // changes what is heard.
+    write_u16(out + entry + 0, kBlockSmut);
+    write_u16(out + entry + 2, (uint16_t) kBlockCritical);
+    write_u32(out + entry + 4, (uint32_t) at);
+    write_u32(out + entry + 8, (uint32_t) smut_bytes);
+    entry += (size_t) kDirectoryEntryBytes;
+
+    write_u16(out + at + 0, (uint16_t) module->order_count);
+    write_u16(out + at + 2, (uint16_t) module->channels);
+    at += (size_t) kSmutHeaderBytes;
+    for (int i = 0; i < module->order_count; ++i) {
+      write_u16(out + at, module->slot_mute[i]);
+      at += 2;
+    }
   }
 
   if (want_name) {
@@ -3522,7 +3607,13 @@ render_add(Player *player, double *buffer, int frames, int channels,
         continue;
       // Sampled even when muted, and then dropped. See Player::muted.
       const float s = channel_sample(ch, m->instruments[ch->instrument - 1]);
-      if (player->muted[c])
+      // **Two mutes, one drop, and both after the sample.** `Player::muted` is
+      // the listener's ("silence this track while I work"); `slot_muted` is the
+      // tune's ("this track does not play in this section") and travels in the
+      // file. Dropping the sample rather than skipping the walk is what keeps a
+      // voice's position advancing while it is silent, so coming back does not
+      // jump -- the same reason the line above says what it says.
+      if (player->muted[c] || slot_muted(m, player->order, c))
         continue;
       left += s * gain_l[c];
       right += s * gain_r[c];

@@ -42,6 +42,11 @@ const int kMaxChannels = 16;
 // coincidence.
 const int kMaxPatterns = 256;
 const int kMaxRows = 256;
+// The order list's own ceiling, which `module_param_range` has always enforced
+// as a literal 256 in the param table. Named here because SMUT sizes itself to
+// it: a table indexed by order position needs the format's bound, not a number
+// that happens to match.
+const int kMaxOrders = 256;
 
 // The longest run of frames rendered between two looks at the sequencer. A tick
 // at 125 BPM is around 460 frames, which is far too long to hold an effect
@@ -573,7 +578,58 @@ struct Module {
   // can act on, and `ntrk_mix` is where it is decoded.
   bool has_mix = false;
   uint8_t mix[kMixrBytes] = {};
+
+  // SMUT: which (order position, channel) pairs are silenced. One u16 per
+  // position, bit `c` for channel `c` -- `kMaxChannels` is 16, so a position
+  // fits a u16 exactly and no packing arithmetic is needed anywhere.
+  //
+  // **This is the tune's own state, not the listener's.** `Player::muted`
+  // silences a channel for whoever is listening and survives a `player_start`;
+  // this silences a track for a SECTION and is part of the composition, which
+  // is why it lives in the module, is saved, and is undoable in an editor.
+  //
+  // Copied out of the file rather than pointed at, for the reason `mix` gives
+  // one field up: an editor toggles these directly in the module it is about to
+  // save, and a view into the file's bytes would be read-only.
+  bool has_slot_mute = false;
+  uint16_t slot_mute[kMaxOrders] = {};
 };
+
+// Whether channel `c` is silenced at order position `o`. **The one reader**, so
+// the bit arithmetic is spelled once rather than at the player, the writer and
+// every editor that draws a matrix.
+//
+// Out-of-range is "not muted": a caller asking about a position that is not
+// there is asking about a slot that does not exist, and silence is the wrong
+// answer to give it.
+inline bool
+slot_muted(const Module *m, int o, int c) {
+  if (m == nullptr || o < 0 || o >= m->order_count || c < 0 || c >= m->channels)
+    return false;
+  return (m->slot_mute[o] & (uint16_t) (1u << c)) != 0u;
+}
+
+// Silence channel `c` at order position `o`, or let it sound. **The one
+// writer**, and it maintains `has_slot_mute` so nothing else has to remember
+// to: the flag is what decides whether a block is written at all.
+inline void
+slot_set_muted(Module *m, int o, int c, bool on) {
+  if (m == nullptr || o < 0 || o >= m->order_count || c < 0 || c >= m->channels)
+    return;
+  const uint16_t bit = (uint16_t) (1u << c);
+  if (on)
+    m->slot_mute[o] = (uint16_t) (m->slot_mute[o] | bit);
+  else
+    m->slot_mute[o] = (uint16_t) (m->slot_mute[o] & (uint16_t) ~bit);
+  // Recomputed rather than set, so clearing the last bit clears the flag and a
+  // file that no longer needs the block stops carrying one.
+  m->has_slot_mute = false;
+  for (int i = 0; i < m->order_count; ++i)
+    if (m->slot_mute[i] != 0u) {
+      m->has_slot_mute = true;
+      break;
+    }
+}
 
 // The plane's row stride, and the one place it is computed. A cell is at
 // `((pattern * rows + row) * module_lanes(m)) + lane`; channel `c`'s columns
