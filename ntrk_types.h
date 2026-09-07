@@ -447,19 +447,38 @@ const int kFxplValueCount = 8;
 // static_asserts that pin these to the mixer's own counts are in that header,
 // which is the end that can see both.
 //
-//   u16 version (1)   u16 slots   u16 master gain   u16 width
+//   u16 version (2)   u16 slots   u16 master gain   u16 width
 //   then per slot: u8 kind, u8 reserved, u16 param[8]
+//   then, at v2 only: u8 send_level[kMaxChannels][kMixrSends]
 //
 // Gain and width are Q12 -- 4096 is unity -- which reaches 16 with a resolution
 // of 0.00024, far finer than a fader moves. A parameter is normalised 0..1 over
 // the whole u16, because a slot's own ceiling is what denormalises it and a
 // delay time against a two-second ceiling wants better than a byte's 8 ms.
-const int kMixrVersion = 1;
+// **Version 2 adds the send levels.** A send only sounds if a channel feeds it --
+// `bus[i] += v[i] * send_level[c][s]` -- and until v2 the only thing that could write
+// that number was an effect-plane command, so a tune had to carry a command on row 0
+// to say which channels go to the reverb. That is exactly what this block's own
+// argument about the master gain says a file should not have to do.
+//
+// **A v1 block still loads**, with every level at zero, which is what a file written
+// before this meant: nothing fed the sends except what the plane said. And a module
+// whose levels are ALL zero is written back as v1, so a file that does not use the
+// feature round-trips byte-identical and an older reader keeps it -- the same policy
+// TUNE and SMUT follow, for the same reason.
+const int kMixrVersion = 2;
+const int kMixrVersion1 = 1;       // before the send levels; still read, never written new
 const int kMixrSlots = 5;          // the four sends, then the master
+const int kMixrSends = kMixrSlots - 1;
 const int kMixrSlotParams = 8;
 const int kMixrSlotBytes = 2 + kMixrSlotParams * 2;
 const int kMixrHeaderBytes = 8;
-const int kMixrBytes = kMixrHeaderBytes + kMixrSlots * kMixrSlotBytes;
+const int kMixrBytesV1 = kMixrHeaderBytes + kMixrSlots * kMixrSlotBytes;
+// One byte per (channel, send). A level is a gain in 0..1 and a byte's 1/255 is finer
+// than the plane's own command resolution, which is also a byte -- so the block can say
+// anything an automation of it could.
+const int kMixrSendLevelBytes = kMaxChannels * kMixrSends;
+const int kMixrBytes = kMixrBytesV1 + kMixrSendLevelBytes;
 const int kMixrQUnit = 4096;       // Q12: what 1.0 is stored as
 
 

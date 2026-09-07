@@ -47,6 +47,10 @@ static const int kRows = 8;
 static const int kSampleLen = 64;
 
 static uint8_t g_bytes[4096];
+// Two more, for the save side: one to write into and one to write again into, so a
+// round trip can be compared byte for byte rather than only by length.
+static uint8_t g_saved[8192];
+static uint8_t g_bytes2[8192];
 static size_t g_size = 0;
 
 static void
@@ -3455,6 +3459,118 @@ test_mixr_round_trip() {
   CHECK(mix::mixr_slot_at(&b, kMixrSlots) == NULL);
 }
 
+// **A send only sounds if a channel feeds it**, and until v2 the block could not say which
+// channels do. The level lived only in the mixer, written by an effect-plane command — so a
+// tune had to carry a command on row 0 to set up its own reverb, which is exactly what this
+// block's argument about the master gain says a file should not have to do.
+static void
+test_mixr_send_levels() {
+  printf("MIXR carries the per-channel send levels, and a v1 block still loads\n");
+
+  static mix::Mixer a;
+  mix::mixer_reset(&a);
+  mix::slot_set_kind(&a.send[0], mix::FxKind::kReverb);
+  a.send_level[0][0] = 1.f;
+  a.send_level[3][1] = 0.5f;
+  a.send_level[15][3] = 0.25f;
+
+  Module m;
+  mix::mixer_config_write(&a, &m);
+  CHECK(m.has_mix);
+
+  // Read back into a fresh mixer: the levels are where the render loop looks for them.
+  static mix::Mixer b;
+  mix::mixer_reset(&b);
+  CHECK(mix::mixer_config_read(&b, m.mix));
+  CHECK(b.send_level[0][0] == 1.f);                      // unity survives the byte exactly
+  CHECK(fabs(b.send_level[3][1] - 0.5f) < 0.005f);
+  CHECK(fabs(b.send_level[15][3] - 0.25f) < 0.005f);
+  CHECK(b.send_level[1][0] == 0.f);                      // and a channel that feeds nothing
+
+  // The block's own accessors agree with the mixer, at both ends and in between — an editor
+  // reads these without building a Mixer to do it.
+  CHECK(mix::config_send_level(m.mix, 0, 0) == 1.f);
+  CHECK(fabs(mix::config_send_level(m.mix, 3, 1) - 0.5f) < 0.005f);
+  CHECK(mix::config_send_level(m.mix, 1, 0) == 0.f);
+  CHECK(mix::config_has_send_levels(m.mix));
+
+  // Out of range reads zero and writes nothing rather than off the end of the block.
+  CHECK(mix::config_send_level(m.mix, -1, 0) == 0.f);
+  CHECK(mix::config_send_level(m.mix, kMaxChannels, 0) == 0.f);
+  CHECK(mix::config_send_level(m.mix, 0, kMixrSends) == 0.f);
+  mix::config_set_send_level(m.mix, 99, 0, 1.f);
+  mix::config_set_send_level(m.mix, 0, 99, 1.f);
+  CHECK(mix::config_send_level(m.mix, 0, 0) == 1.f);     // untouched
+
+  // A set round-trips through the byte at both ends of the range.
+  mix::config_set_send_level(m.mix, 2, 2, 0.f);
+  CHECK(mix::config_send_level(m.mix, 2, 2) == 0.f);
+  mix::config_set_send_level(m.mix, 2, 2, 1.f);
+  CHECK(mix::config_send_level(m.mix, 2, 2) == 1.f);
+  mix::config_set_send_level(m.mix, 2, 2, 2.f);          // clamped, not wrapped
+  CHECK(mix::config_send_level(m.mix, 2, 2) == 1.f);
+}
+
+// The file's half: which version is written, and what an old one means coming back.
+static void
+test_mixr_version_follows_the_levels() {
+  printf("a module feeding no send is written as v1, and a v1 file still loads\n");
+
+  build();
+  Module plain;
+  CHECK(module_load(&plain, g_bytes, g_size));
+
+  // A mixer with slots but NO send levels: nothing v1 could not express, so v1 is what is
+  // written — and a file that never used the feature keeps its bytes and its old reader.
+  static mix::Mixer quiet;
+  mix::mixer_reset(&quiet);
+  mix::slot_set_kind(&quiet.master_fx, mix::FxKind::kShape);
+  mix::mixer_config_write(&quiet, &plain);
+  CHECK(!mix::config_has_send_levels(plain.mix));
+
+  size_t need_v1 = 0;
+  CHECK(module_save(&plain, nullptr, 0, &need_v1));
+  size_t wrote_v1 = 0;
+  CHECK(module_save(&plain, g_saved, sizeof g_saved, &wrote_v1));
+
+  Module back_v1;
+  CHECK(module_load(&back_v1, g_saved, wrote_v1));
+  CHECK(back_v1.has_mix);
+  // Upgraded in memory whatever the file said, so every accessor sees one shape.
+  CHECK(ntrk::read_u16(back_v1.mix) == (uint16_t) kMixrVersion);
+  CHECK(mix::config_slot_kind(back_v1.mix, kMixrSlots - 1) == mix::FxKind::kShape);
+  CHECK(!mix::config_has_send_levels(back_v1.mix));
+  // ...and a v1 file means "nothing feeds the sends", which is zero everywhere.
+  for (int c = 0; c < kMaxChannels; ++c)
+    for (int t = 0; t < kMixrSends; ++t)
+      CHECK(mix::config_send_level(back_v1.mix, c, t) == 0.f);
+
+  // **Byte-identical through a load and a save**, which is what writing the narrowest block
+  // buys: a file that does not use v2 is not rewritten into it by being opened.
+  size_t again = 0;
+  CHECK(module_save(&back_v1, g_bytes2, sizeof g_bytes2, &again));
+  CHECK(again == wrote_v1);
+  bool same = true;
+  for (size_t i = 0; i < again; ++i)
+    if (g_bytes2[i] != g_saved[i])
+      same = false;
+  CHECK(same);
+
+  // Now feed a send: the block grows by exactly the level table and says v2.
+  mix::config_set_send_level(back_v1.mix, 1, 0, 0.75f);
+  CHECK(mix::config_has_send_levels(back_v1.mix));
+  size_t need_v2 = 0;
+  CHECK(module_save(&back_v1, nullptr, 0, &need_v2));
+  CHECK(need_v2 == need_v1 + (size_t) kMixrSendLevelBytes);
+
+  size_t wrote_v2 = 0;
+  CHECK(module_save(&back_v1, g_saved, sizeof g_saved, &wrote_v2));
+  Module back_v2;
+  CHECK(module_load(&back_v2, g_saved, wrote_v2));
+  CHECK(fabs(mix::config_send_level(back_v2.mix, 1, 0) - 0.75f) < 0.005f);
+  CHECK(mix::config_send_level(back_v2.mix, 0, 0) == 0.f);
+}
+
 static void
 test_mixr_refuses_an_unknown_kind() {
   printf("a block naming an effect this build has not got is refused whole\n");
@@ -3873,6 +3989,8 @@ main(void) {
   test_command_enumeration();
   test_slot_mute_reaches_the_mixer();
   test_mixr_round_trip();
+  test_mixr_send_levels();
+  test_mixr_version_follows_the_levels();
   test_mixr_refuses_an_unknown_kind();
   test_mixr_writes_the_setting_not_the_slide();
   test_config_slot_kind_reads_without_a_mixer();

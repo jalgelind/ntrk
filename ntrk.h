@@ -1097,14 +1097,27 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // with the sends its host set up rather than not at all. The length is
       // exact -- a block that disagrees with the layout is refused rather than
       // read as far as it goes, the same rule FXPL and MACR are held to.
-      if (bytes != (uint32_t) kMixrBytes)
-        return false;
-      if (read_u16(data + offset) != (uint16_t) kMixrVersion)
-        return false;
+      // **Two lengths, one per version.** v2 added the per-channel send levels; a v1 block
+      // is still read and means "nothing feeds the sends but the plane", which is what a
+      // file written before them meant. Each length is still exact for its own version --
+      // the rule is unchanged, there are simply two layouts rather than one.
+      {
+        const uint16_t v = read_u16(data + offset);
+        const bool v1 = v == (uint16_t) kMixrVersion1 && bytes == (uint32_t) kMixrBytesV1;
+        const bool v2 = v == (uint16_t) kMixrVersion && bytes == (uint32_t) kMixrBytes;
+        if (!v1 && !v2)
+          return false;
+      }
       if (read_u16(data + offset + 2) != (uint16_t) kMixrSlots)
         return false;
+      // **Upgraded to v2 in memory, whichever came in.** A v1 block is copied and the
+      // level region zeroed -- nothing fed the sends -- then the version stamped, so every
+      // accessor downstream reads one shape and none has to ask which version this is. The
+      // writer decides the version again from the levels themselves, so a file that carries
+      // none goes back out as v1 and is unchanged.
       for (int k = 0; k < kMixrBytes; ++k)
-        module->mix[k] = data[offset + (uint32_t) k];
+        module->mix[k] = k < (int) bytes ? data[offset + (uint32_t) k] : (uint8_t) 0u;
+      write_u16(module->mix, (uint16_t) kMixrVersion);
       module->has_mix = true;
     } else if ((flags & kBlockCritical) != 0u) {
       // A block the writer said the file cannot be played without, and this
@@ -1683,7 +1696,18 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
       want_macr ? (size_t) kMacroHeaderBytes +
                       (size_t) module->macro_count * (size_t) kMacroRecordBytes
                 : 0u;
-  const size_t mixr_bytes = want_mixr ? (size_t) kMixrBytes : 0u;
+  // **The narrowest block that says what this module means**, which is the policy TUNE and
+  // SMUT already follow: a module that feeds no send carries nothing v1 could not express,
+  // so it is written as v1 and a file that never used the feature round-trips byte for byte.
+  // `module->mix` is always v2 in memory (the loader upgrades one), so this is a decision
+  // about the FILE and not about the state.
+  bool mixr_v2 = false;
+  if (want_mixr)
+    for (int k = 0; k < kMixrSendLevelBytes && !mixr_v2; ++k)
+      if (module->mix[kMixrBytesV1 + k] != 0u)
+        mixr_v2 = true;
+  const size_t mixr_bytes =
+      want_mixr ? (size_t) (mixr_v2 ? kMixrBytes : kMixrBytesV1) : 0u;
   const size_t slic_bytes =
       want_slic ? (size_t) kSlicHeaderBytes +
                       (size_t) slic_tables * (size_t) kSlicRecordBytes +
@@ -2001,9 +2025,12 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     write_u32(out + entry + 8, (uint32_t) mixr_bytes);
     entry += (size_t) kDirectoryEntryBytes;
 
-    for (int k = 0; k < kMixrBytes; ++k)
-      out[at + (size_t) k] = module->mix[k];
-    at += (size_t) kMixrBytes;
+    for (size_t k = 0; k < mixr_bytes; ++k)
+      out[at + k] = module->mix[k];
+    // The version field says which layout the LENGTH is, so it is stamped here rather than
+    // taken from memory — where it is always v2.
+    write_u16(out + at, (uint16_t) (mixr_v2 ? kMixrVersion : kMixrVersion1));
+    at += mixr_bytes;
   }
 
   return at == total;

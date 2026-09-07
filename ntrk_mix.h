@@ -630,6 +630,10 @@ Slot *mixr_slot_at(Mixer *mx, int index);
 // was never laid out is a passthrough rather than a fault, so this may be
 // called before or after `delay_init`/`reverb_init` -- but the tune is silent
 // on that send until it has been.
+// Read `module->mix` into the mixer — the slots, the master, the width, and from v2 the
+// per-channel send levels. **The levels land in `send_level[c][s]`**, which is where the
+// plane's own `kFxplSend` command writes and where the render loop reads: the block is the
+// starting state and automation moves from it, exactly as the master gain does.
 bool mixer_config_read(Mixer *mx, const uint8_t *block);
 
 // What kind of effect a saved slot names, WITHOUT building a mixer to find out.
@@ -652,6 +656,16 @@ FxKind config_slot_kind(const uint8_t *block, int slot);
 // bytes back out of it. Answers 0 for a block the reader would refuse, so an
 // editor cannot draw a value out of a file the player will not load.
 float config_slot_param(const uint8_t *block, int slot, int param);
+
+// How much of `channel` reaches `send`, 0..1 — the number `mixer_render_add` multiplies a
+// voice by on its way to the bus, and the one thing a send needs that the block could not
+// say before v2. Zero for a block that does not carry them, which is what a v1 file meant.
+float config_send_level(const uint8_t *block, int channel, int send);
+void config_set_send_level(uint8_t *block, int channel, int send, float v);
+
+// Whether any level is non-zero. The writer asks this to choose the version, so a module
+// that feeds no send is written as v1 and an untouched file keeps its bytes.
+bool config_has_send_levels(const uint8_t *block);
 
 // The master gain and the stereo width the block carries, 0..1 and 0..1.
 float config_master_gain(const uint8_t *block);

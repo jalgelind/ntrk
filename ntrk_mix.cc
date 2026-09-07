@@ -492,6 +492,9 @@ bool
 config_readable(const uint8_t *block) {
   if (block == nullptr)
     return false;
+  // **v2 only, because a v1 block never reaches here.** `module_load` upgrades one on the
+  // way in -- zero levels, version stamped -- so everything downstream reads one shape and
+  // no accessor has to ask which. The writer decides the version again at save time.
   if (ntrk::read_u16(block) != (uint16_t) kMixrVersion ||
       ntrk::read_u16(block + 2) != (uint16_t) kMixrSlots)
     return false;
@@ -517,6 +520,44 @@ config_slot_param(const uint8_t *block, int slot, int param) {
     return 0.f;
   const uint8_t *r = block + kMixrHeaderBytes + slot * kMixrSlotBytes;
   return (float) ntrk::read_u16(r + 2 + param * 2) / 65535.f;
+}
+
+// A send level's byte, or null where the arguments do not name one.
+static const uint8_t *
+config_level_at(const uint8_t *block, int channel, int send) {
+  if (!config_readable(block) || channel < 0 || channel >= kMaxChannels || send < 0 ||
+      send >= kMixrSends)
+    return nullptr;
+  return block + kMixrBytesV1 + (size_t) channel * kMixrSends + send;
+}
+
+float
+config_send_level(const uint8_t *block, int channel, int send) {
+  const uint8_t *at = config_level_at(block, channel, send);
+  return at != nullptr ? (float) *at / 255.f : 0.f;
+}
+
+void
+config_set_send_level(uint8_t *block, int channel, int send, float v) {
+  const uint8_t *at = config_level_at(block, channel, send);
+  if (at == nullptr)
+    return;
+  const float c = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+  // Rounded rather than truncated, so a level read back is the level set to within half a
+  // step -- a truncating write makes 1.0 read as 254/255 and a fader that never reaches unity.
+  *const_cast<uint8_t *>(at) = (uint8_t) (c * 255.f + 0.5f);
+}
+
+// Whether any channel feeds any send. **The version the writer chooses**: all-zero is what a
+// v1 file meant, so it is written back as one and an unchanged file keeps its bytes.
+bool
+config_has_send_levels(const uint8_t *block) {
+  if (!config_readable(block))
+    return false;
+  for (int i = 0; i < kMixrSendLevelBytes; ++i)
+    if (block[kMixrBytesV1 + i] != 0u)
+      return true;
+  return false;
 }
 
 float
@@ -613,6 +654,13 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
     // after this is one the first plane resync throws away.
     slot_set_kind(slot, (FxKind) r[0]);
   }
+
+  // The send levels, which are the block's whole point at v2: without them a slot carries an
+  // effect nothing feeds. They go where the plane's own command writes, so the block is the
+  // starting state and an automation moves from it.
+  for (int c = 0; c < kMaxChannels; ++c)
+    for (int t = 0; t < kMixrSends; ++t)
+      mx->send_level[c][t] = (float) p[kMixrBytesV1 + (size_t) c * kMixrSends + t] / 255.f;
   return true;
 }
 
@@ -638,6 +686,16 @@ mixer_config_write(const Mixer *mx, uint8_t *block) {
     for (int k = 0; k < kMixrSlotParams; ++k)
       ntrk::write_u16(r + 2 + k * 2, mixr_unit(slot->base[k]));
   }
+
+  // The send levels, so a mixer written out and read back feeds the same channels into the
+  // same sends. Rounded rather than truncated, for the reason `config_set_send_level` gives:
+  // a truncating write makes unity read back as 254/255.
+  for (int c = 0; c < kMaxChannels; ++c)
+    for (int t = 0; t < kMixrSends; ++t) {
+      const float v = mx->send_level[c][t];
+      const float cl = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+      p[kMixrBytesV1 + (size_t) c * kMixrSends + t] = (uint8_t) (cl * 255.f + 0.5f);
+    }
 }
 
 void
