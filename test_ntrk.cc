@@ -6220,6 +6220,36 @@ test_instrument_param_shape() {
   CHECK(ntrk::instrument_param_state(&pl, lstart) == ntrk::ParamState::Live);
 }
 
+// NTRK-24: an editor grouping the table's rows would otherwise keep a list of ids beside it
+// -- the second table this file refuses. `group` answers "which cluster" without one.
+static void
+test_instrument_param_group() {
+  printf("every instrument parameter has a group, and groups are contiguous\n");
+
+  for (int id = 0; id < ntrk::instrument_param_count(); ++id) {
+    const ntrk::InsParamInfo *info = ntrk::instrument_param_at(id);
+    CHECK(info != NULL);
+    if (info == NULL)
+      continue;
+    CHECK(info->group != NULL && info->group[0] != '\0');
+  }
+
+  // Contiguous: walking ids in order, once a group name is left behind it never recurs --
+  // the shape a "draw a heading when the group changes" reader depends on.
+  const char *seen[(int) ntrk::InsParam::kCount];
+  int seenCount = 0;
+  const char *prev = NULL;
+  for (int id = 0; id < ntrk::instrument_param_count(); ++id) {
+    const char *g = ntrk::instrument_param_at(id)->group;
+    if (prev != NULL && strcmp(g, prev) == 0)
+      continue;   // same run
+    for (int i = 0; i < seenCount; ++i)
+      CHECK(strcmp(seen[i], g) != 0);
+    seen[seenCount++] = g;
+    prev = g;
+  }
+}
+
 static void
 test_instrument_param_clamps() {
   printf("no value set through the table can author a module that will not save\n");
@@ -6877,6 +6907,7 @@ main(void) {
   test_render_hashes();
   test_mixr_block();
   test_instrument_param_shape();
+  test_instrument_param_group();
   test_instrument_param_clamps();
   test_instrument_param_enforced();
   test_instrument_param_round_trip();

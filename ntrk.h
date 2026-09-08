@@ -168,6 +168,14 @@ struct InsParamInfo {
   int               lo, hi;
   int               choice_count; // 0 unless shape == Choice
   const char *const *choice;      // choice_count strings, else null
+  // Which control cluster this field belongs to, for an editor that wants to draw a
+  // heading over a run of them — "voice", "envelope", "filter", "synth". Contiguous in
+  // table order, so an editor finds the boundaries by walking the table once rather than
+  // keeping a second list of where each group starts. Appended last and with no default:
+  // the compiler lists every row that has not been given one, so a table edit that adds a
+  // field cannot silently ship with no group at all. Display metadata only — crosses no
+  // file, and neither the loader nor `instrument_fields_valid` may learn it exists.
+  const char       *group;
 };
 
 // The four filter modes, in the order `voice_filter_sample` switches on them.
@@ -202,48 +210,54 @@ instrument_param_table(int *count) {
       "square", "saw", "triangle", "pulse 25%", "pulse 12%"};
 
   static const InsParamInfo kTable[(int) InsParam::kCount] = {
-      {"type", ParamShape::Choice, 0, 4, 5, kTypes},
-      {"volume", ParamShape::Continuous, 0, 64, 0, nullptr},
-      {"finetune", ParamShape::Continuous, -8, 7, 0, nullptr},
+      {"type", ParamShape::Choice, 0, 4, 5, kTypes, "voice"},
+      {"volume", ParamShape::Continuous, 0, 64, 0, nullptr, "voice"},
+      {"finetune", ParamShape::Continuous, -8, 7, 0, nullptr, "voice"},
       // A whole signed byte on purpose: the playable range is
       // kMinNote..note_max and an XM's `relative_note` lands here, so four
       // octaves is not enough to express what a file can ask for.
       // `note_transposed` clamps the RESULT, which is what makes any value safe.
-      {"transpose", ParamShape::Continuous, -128, 127, 0, nullptr},
+      {"transpose", ParamShape::Continuous, -128, 127, 0, nullptr, "voice"},
       // The two whose ceiling is the sample's. `instrument_param_range`
       // overrides both; the zeroes here are what a caller gets with no
       // instrument to measure, and reading `hi` off the row is a bug.
-      {"loop start", ParamShape::Continuous, 0, 0, 0, nullptr},
-      {"loop len", ParamShape::Continuous, 0, 0, 0, nullptr},
-      {"envelope", ParamShape::Choice, 0, 1, 2, kOffOn},
-      {"attack ms", ParamShape::Continuous, 0, 65535, 0, nullptr},
-      {"decay ms", ParamShape::Continuous, 0, 65535, 0, nullptr},
-      {"sustain", ParamShape::Continuous, 0, 64, 0, nullptr},
-      {"release ms", ParamShape::Continuous, 0, 65535, 0, nullptr},
-      {"filter", ParamShape::Choice, 0, 1, 2, kOffOn},
-      {"cutoff hz", ParamShape::Continuous, 20, 20000, 0, nullptr},
-      {"resonance", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"filter type", ParamShape::Choice, 0, 3, 4, filter_mode_names(nullptr)},
+      {"loop start", ParamShape::Continuous, 0, 0, 0, nullptr, "voice"},
+      {"loop len", ParamShape::Continuous, 0, 0, 0, nullptr, "voice"},
+      {"envelope", ParamShape::Choice, 0, 1, 2, kOffOn, "envelope"},
+      {"attack ms", ParamShape::Continuous, 0, 65535, 0, nullptr, "envelope"},
+      {"decay ms", ParamShape::Continuous, 0, 65535, 0, nullptr, "envelope"},
+      {"sustain", ParamShape::Continuous, 0, 64, 0, nullptr, "envelope"},
+      {"release ms", ParamShape::Continuous, 0, 65535, 0, nullptr, "envelope"},
+      {"filter", ParamShape::Choice, 0, 1, 2, kOffOn, "filter"},
+      {"cutoff hz", ParamShape::Continuous, 20, 20000, 0, nullptr, "filter"},
+      {"resonance", ParamShape::Continuous, 0, 255, 0, nullptr, "filter"},
+      {"filter type", ParamShape::Choice, 0, 3, 4, filter_mode_names(nullptr),
+       "filter"},
+      // `wave` sits between the filter block and the synth-prefixed rows in
+      // table order, and is not itself filter- or synth-specific — a
+      // wave-builtin's own generator shape. Grouped with `synth` (the OTHER
+      // "which shape does the generator draw" field, `synth wave`) rather
+      // than left an orphan of one, which contiguity would not allow anyway.
       {"wave", ParamShape::Choice, 0, kBuiltinWaveCount - 1, kBuiltinWaveCount,
-       kWaves},
+       kWaves, "synth"},
       {"synth voice", ParamShape::Choice, 0, kSynthVoiceCount - 1,
-       kSynthVoiceCount, kVoices},
-      {"synth tune", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth decay", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth sweep", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth tone", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth noise", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth noise decay", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth drive", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth cutoff", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth reso", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth env mod", ParamShape::Continuous, 0, 255, 0, nullptr},
-      {"synth accent", ParamShape::Continuous, 0, 255, 0, nullptr},
+       kSynthVoiceCount, kVoices, "synth"},
+      {"synth tune", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth decay", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth sweep", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth tone", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth noise", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth noise decay", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth drive", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth cutoff", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth reso", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth env mod", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
+      {"synth accent", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
       {"synth dist", ParamShape::Choice, 0, kSynthDistKinds - 1,
-       kSynthDistKinds, kDistKinds},
-      {"synth dist mix", ParamShape::Continuous, 0, 255, 0, nullptr},
+       kSynthDistKinds, kDistKinds, "synth"},
+      {"synth dist mix", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
       {"synth wave", ParamShape::Choice, 0, kSynthWaveCount - 1,
-       kSynthWaveCount, kSynthWaves},
+       kSynthWaveCount, kSynthWaves, "synth"},
   };
   static_assert(sizeof(kTable) / sizeof(*kTable) == (size_t) InsParam::kCount,
                 "the table and InsParam are one list");
