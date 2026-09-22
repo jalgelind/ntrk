@@ -631,7 +631,7 @@ struct ModParamInfo {
 inline const ModParamInfo *
 module_param_table(int *count) {
   static const ModParamInfo kTable[(int) ModParam::kCount] = {
-      {"channels", 1, kMaxChannels},
+      {"channels", kMaxChannels, kMaxChannels},  // fixed: every module has all sixteen
       {"rows", 1, kMaxRows},
       {"speed", 1, 31},
       {"bpm", 32, 255},
@@ -782,8 +782,8 @@ write_i16(uint8_t *p, int16_t v) {
 
 // The header is fixed at 32 bytes and every count in it is a u16, so the
 // arithmetic below cannot overflow a size_t on any machine this runs on. The
-// largest file the ranges permit is 4 MB of patterns and 16.5 MB of plane:
-// 256 patterns of 256 rows, sixteen channels of eight effect columns plus four
+// largest file the ranges permit is 4 MB of patterns and 16.6 MB of plane:
+// 256 patterns of 256 rows, sixteen channels of eight effect columns plus five
 // meta lanes, two bytes a cell. The plane figure was 2 MB when a lane was a
 // lane and a channel had one; it grew with `kMaxFxColumns`.
 //
@@ -1139,7 +1139,6 @@ module_load(Module *module, const uint8_t *data, size_t size) {
         for (int k = 0; k < kMixrReturnBytes; ++k)
           module->mix[kMixrBytesV1 + kMixrSendLevelBytes + k] = 255u;
       write_u16(module->mix, (uint16_t) kMixrVersion);
-      module->has_mix = true;
     } else if ((flags & kBlockCritical) != 0u) {
       // A block the writer said the file cannot be played without, and this
       // reader does not know it. Playing anyway would be playing something else.
@@ -1330,13 +1329,10 @@ module_load(Module *module, const uint8_t *data, size_t size) {
     if (smut_bytes != (size_t) kSmutHeaderBytes + (size_t) so * 2u)
       return false;
     for (int i = 0; i < so; ++i) {
+      // `sc` above is already pinned to `module->channels`, which is always
+      // `kMaxChannels` (16) -- every bit of a u16 names a channel that exists,
+      // so there is no "bit above the channel count" case left to refuse.
       const uint16_t bits = read_u16(smut + kSmutHeaderBytes + (size_t) i * 2u);
-      // A bit above the channel count names a channel that is not there. It
-      // would be harmless to ignore and is refused anyway: it means the writer
-      // and this reader disagree about the geometry, and the next thing that
-      // disagreement touches may not be harmless.
-      if (sc < 16 && (bits >> sc) != 0u)
-        return false;
       module->slot_mute[i] = bits;
       if (bits != 0u)
         module->has_slot_mute = true;
@@ -1625,10 +1621,10 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   // The two fields the loader will check on the way back in. Everything else in
   // the block is the mixer's to validate; these two are the format's, and a
   // writer that emits a block its own reader refuses has written a file nobody
-  // can open.
-  if (module->has_mix &&
-      (read_u16(module->mix) != (uint16_t) kMixrVersion ||
-       read_u16(module->mix + 2) != (uint16_t) kMixrSlots))
+  // can open. Every module carries a mixer now, so this is no longer gated on
+  // whether one is present -- only a caller that corrupted the block fails it.
+  if (read_u16(module->mix) != (uint16_t) kMixrVersion ||
+      read_u16(module->mix + 2) != (uint16_t) kMixrSlots)
     return false;
 
   const size_t order_bytes = (size_t) module->order_count;
@@ -1638,7 +1634,12 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const bool want_fx = module->fx != nullptr;
   const bool want_synp = synth_count > 0;
   const bool want_macr = module->macro_count > 0;
-  const bool want_mixr = module->has_mix;
+  // **Written only when it says something a default block does not.** A module
+  // that never touched its mixer carries `mix_default`'s bytes, and writing
+  // those out would be a `MIXR` block that means nothing an absent one doesn't
+  // already mean -- the same "a file that does not use the feature round-trips
+  // byte-identical" rule TUNE and SMUT are held to.
+  const bool want_mixr = !mix_is_default(module->mix);
 
   // SLIC. **Every load-side invariant again**, plus one the loader gets for
   // free: a `slice_count` with no `slices` pointer is a module that cannot be

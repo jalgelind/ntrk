@@ -34,9 +34,10 @@
 #include <stdio.h>
 #include <string.h>
 
-// Four channels, two patterns of thirty-two rows. Two bars of sixteen, so a
-// riff written once per bar repeats and the second pattern can differ.
-static const int kChannels = 4;
+// Sixteen channels (every ntrk module has all of them now), two patterns of
+// thirty-two rows. Two bars of sixteen, so a riff written once per bar
+// repeats and the second pattern can differ.
+static const int kChannels = 16;
 static const int kRows = 32;
 static const int kPatterns = 2;
 static const int kOrders = 2;

@@ -412,11 +412,13 @@ static_assert(sizeof(FxCell) == 2,
 // which is why a file declares what it uses rather than always paying for the
 // ceiling.
 //
-// The meta lanes stay at four. They are whole-row automation, and four
-// simultaneous macro invocations on one row is already more than a song has
-// ever wanted -- widening them costs every channel's row, not one channel's.
+// The meta lanes stay at five. A lane's byte carries either a macro index or
+// a global mixer-slot command, and there are five global destinations -- the
+// four sends and the master -- so five is what lets a song automate every
+// one of them on the same row. Widening past that costs every channel's row,
+// not one channel's, which is still the reason it is not eight.
 const int kMaxFxColumns = 8;
-const int kMaxMetaColumns = 4;
+const int kMaxMetaColumns = 5;
 
 // How many macros a file may name, and how many parameters one may reach.
 // **Eight targets is not a budget, it is the whole space**: the mixer's
@@ -494,6 +496,45 @@ const int kMixrReturnBytes = kMixrSlots;
 const int kMixrBytes = kMixrBytesV1 + kMixrSendLevelBytes + kMixrReturnBytes;
 const int kMixrQUnit = 4096;       // Q12: what 1.0 is stored as
 
+// **The mixer is no longer optional, so every `Module` needs a block even when
+// no file supplied one.** This is that block: version 2, every slot `kNone`,
+// every param zero, master gain and width at unity (`kMixrQUnit`), every send
+// level zero, every return level at unity (255). It is `config_init`'s own
+// bytes, written here instead, because `Module`'s constructor (below) is the
+// end that cannot see `ntrk_mix.h` — the same reason the layout comment above
+// lives in this file rather than that one.
+inline void
+mix_default(uint8_t block[kMixrBytes]) {
+  for (int i = 0; i < kMixrBytes; ++i)
+    block[i] = 0;
+  block[0] = (uint8_t) (kMixrVersion & 0xFF);
+  block[1] = (uint8_t) (kMixrVersion >> 8);
+  block[2] = (uint8_t) (kMixrSlots & 0xFF);
+  block[3] = (uint8_t) (kMixrSlots >> 8);
+  block[4] = (uint8_t) (kMixrQUnit & 0xFF);   // master gain, unity
+  block[5] = (uint8_t) (kMixrQUnit >> 8);
+  block[6] = (uint8_t) (kMixrQUnit & 0xFF);   // width, unity
+  block[7] = (uint8_t) (kMixrQUnit >> 8);
+  // Slot kind/reserved/params are already zero, which is `kNone` and silence.
+  const int returnOffset = kMixrBytesV1 + kMixrSendLevelBytes;
+  for (int s = 0; s < kMixrReturnBytes; ++s)
+    block[returnOffset + s] = 255;            // return level, unity
+}
+
+// Whether a block is exactly `mix_default`'s bytes — the writer's test for
+// "this file never touched its mixer", so a module that never does still
+// round-trips byte-identical with no `MIXR` block at all. Compares against a
+// scratch copy rather than restating the layout a second time.
+inline bool
+mix_is_default(const uint8_t block[kMixrBytes]) {
+  uint8_t d[kMixrBytes];
+  mix_default(d);
+  for (int i = 0; i < kMixrBytes; ++i)
+    if (block[i] != d[i])
+      return false;
+  return true;
+}
+
 
 // A macro's `flags`. Everything above bit 0 is reserved and a file that sets
 // any of it is refused, so those bits stay free to mean something.
@@ -551,6 +592,13 @@ struct Macro {
 };
 
 struct Module {
+  // A fresh `Module` already carries a mixer — `mix_default` — because the
+  // mixer is no longer an optional feature a file may or may not have used;
+  // it is the format's own shape. `Module{}` (the only brace-init this codebase
+  // does) still zero-inits every other field the way it always has; this
+  // constructor only reaches into `mix`.
+  Module() { mix_default(mix); }
+
   int version = 2;           // the only one; module_save refuses any other
 
   // The tune's own division of its grid, out of an optional TUNE block. **A
@@ -603,13 +651,18 @@ struct Module {
   int macro_count = 0;
   Macro macros[kMaxMacros];
 
-  // The MIXR block, copied out of the file rather than pointed at -- 98 bytes,
+  // The MIXR block, copied out of the file rather than pointed at -- 98+ bytes,
   // the same trade `macros` makes, and it means an editor can write a fader
   // straight into the module it is about to save. **Nothing in the replayer
   // reads a byte of it**: a mixer's configuration is not something `render_add`
   // can act on, and `ntrk_mix` is where it is decoded.
-  bool has_mix = false;
-  uint8_t mix[kMixrBytes] = {};
+  //
+  // **Always present, never a null state.** A file with no `MIXR` block loads
+  // with `mix_default`'s bytes rather than a flag saying there is nothing to
+  // read — the mixer is the format's fixed shape, not a feature a file opts
+  // into. `mix_is_default` is how the writer decides whether a block needs to
+  // be written at all.
+  uint8_t mix[kMixrBytes];
 
   // SMUT: which (order position, channel) pairs are silenced. One u16 per
   // position, bit `c` for channel `c` -- `kMaxChannels` is 16, so a position

@@ -215,13 +215,36 @@ test_convert_loads_and_renders() {
   ntrk::Module module;
   CHECK(ntrk::module_load(&module, g_out, out_size));
   CHECK(module.version == 2);
-  CHECK(module.channels == 4);
+  CHECK(module.channels == ntrk::kMaxChannels);
   CHECK(module.rows == 64);
   CHECK(module.speed == 6);
   CHECK(module.bpm == 125);
   CHECK(module.order_count == 2);
   CHECK(module.pattern_count == 2);
   CHECK(module.restart == 0);          // 127 is past the order list, so none
+
+  // The `.mod`'s own four channels are every one of them full -- `mod_build`
+  // never leaves a cell zero -- so the twelve padding channels are the only
+  // possible source of a zero cell here, and every row has one.
+  {
+    bool padding_empty = true;
+    bool native_populated = true;
+    const size_t rows =
+        (size_t) module.pattern_count * (size_t) module.rows;
+    for (size_t r = 0; r < rows; ++r) {
+      const ntrk::Note *row = module.patterns + r * (size_t) module.channels;
+      for (int c = 4; c < module.channels; ++c)
+        if (row[c].note != 0 || row[c].instrument != 0 ||
+            row[c].effect != 0 || row[c].param != 0)
+          padding_empty = false;
+      for (int c = 0; c < 4; ++c)
+        if (row[c].note == 0 && row[c].instrument == 0 &&
+            row[c].effect == 0 && row[c].param == 0)
+          native_populated = false;
+    }
+    CHECK(padding_empty);
+    CHECK(native_populated);
+  }
 
   // **Lengths in words.** Instrument 2's three words are six bytes; read as
   // bytes it would be three, and every sample after it would be misplaced.
@@ -359,8 +382,9 @@ test_refusals() {
   // Scratch one byte short of what was asked for. The cells have to become a
   // `Note` array somewhere, and there is no partial answer.
   const size_t need = ntrk::import_scratch_needed(g_mod, full);
-  CHECK(need == 5u * 64u * 4u * 4u ||
-        need == 2u * 64u * 4u * 4u);   // stale order absent here: 2 patterns
+  CHECK(need == 5u * 64u * (size_t) ntrk::kMaxChannels * 4u ||
+        need == 2u * 64u * (size_t) ntrk::kMaxChannels *
+                    4u);   // stale order absent here: 2 patterns
   CHECK(!ntrk::import_convert(g_mod, full, g_scratch, need - 1, g_out,
                               sizeof(g_out), &out_size));
   CHECK(ntrk::import_convert(g_mod, full, g_scratch, need, g_out, sizeof(g_out),
@@ -680,12 +704,15 @@ test_xm_cells() {
     CHECK(ntrk::module_load(&module, g_out, out_size));
     CHECK(module.version == 2);              // sixteen channels, ninety-six notes
     CHECK(module.note_max == ntrk::kMaxNote);
-    CHECK(module.channels == 4);
+    CHECK(module.channels == ntrk::kMaxChannels);
     CHECK(module.rows == 8);
     CHECK(module.speed == 6);
     CHECK(module.bpm == 125);
     CHECK(module.instrument_count == 2);
 
+    // The file's own four channels, padded to sixteen: cell `r * kCh + c`
+    // still names row `r`, channel `c` -- only the row stride grew.
+    const int kCh = ntrk::kMaxChannels;
     const ntrk::Note *n = module.patterns;
     // **The cells are the file's own, and the three octaves are on the
     // instrument.** XM's note 49 plays a sample at its recorded rate and ours
@@ -709,33 +736,33 @@ test_xm_cells() {
     CHECK(n[3].effect == 3);                 // the effect column, not the volume
     CHECK(n[3].param == 0x10);
 
-    CHECK(n[4].effect == 0x0e);              // R03 is exactly E93
-    CHECK(n[4].param == 0x93);
+    CHECK(n[1 * kCh + 0].effect == 0x0e);     // R03 is exactly E93
+    CHECK(n[1 * kCh + 0].param == 0x93);
 
-    CHECK(n[5].effect == 0x08);              // set panning 8 -> 8 * 17
-    CHECK(n[5].param == 136);
+    CHECK(n[1 * kCh + 1].effect == 0x08);     // set panning 8 -> 8 * 17
+    CHECK(n[1 * kCh + 1].param == 136);
 
-    CHECK(n[6].note == 0 && n[6].instrument == 0 && n[6].effect == 0 &&
-          n[6].param == 0);
+    CHECK(n[1 * kCh + 2].note == 0 && n[1 * kCh + 2].instrument == 0 &&
+          n[1 * kCh + 2].effect == 0 && n[1 * kCh + 2].param == 0);
 
-    CHECK(n[7].note == 50);
-    CHECK(n[7].instrument == 2);
-    CHECK(n[7].effect == 0x0c && n[7].param == 0);
+    CHECK(n[1 * kCh + 3].note == 50);
+    CHECK(n[1 * kCh + 3].instrument == 2);
+    CHECK(n[1 * kCh + 3].effect == 0x0c && n[1 * kCh + 3].param == 0);
 
     // An instrument number past the table would index off the end of it on
     // every row that named it.
-    CHECK(n[8].instrument == 0);
+    CHECK(n[2 * kCh + 0].instrument == 0);
 
     // `G` takes no effect slot of its own, so the volume column gets the one it
     // was refused -- and the `G20` is the global volume this row plays at, so
     // the 32 the volume column asked for is halved on the way in.
-    CHECK(n[9].effect == 0x0c && n[9].param == 16);
+    CHECK(n[2 * kCh + 1].effect == 0x0c && n[2 * kCh + 1].param == 16);
 
-    CHECK(n[10].effect == 0x0a && n[10].param == 0x03);   // slide down 3
+    CHECK(n[2 * kCh + 2].effect == 0x0a && n[2 * kCh + 2].param == 0x03);  // slide down 3
 
     // `Rxy` with a volume change in `x` has no equivalent and is skipped
     // rather than approximated by the retrigger alone.
-    CHECK(n[11].effect == 0 && n[11].param == 0);
+    CHECK(n[2 * kCh + 3].effect == 0 && n[2 * kCh + 3].param == 0);
 
     // **The delta decode, exactly.** A sample that only looked plausible would
     // pass a peak-and-RMS check and still be the wrong waveform.
@@ -911,16 +938,19 @@ test_xm_short_patterns() {
 
   // The second pattern is four rows in an eight-row block, so it breaks at the
   // end of row three rather than playing four rows of silence.
-  const ntrk::Note *p1 = module.patterns + 8 * 4;
+  const int kCh = ntrk::kMaxChannels;
+  const ntrk::Note *p1 = module.patterns + 8 * kCh;
   bool found = false;
   for (int c = 0; c < 4; ++c)
-    if (p1[3 * 4 + c].effect == 0x0d && p1[3 * 4 + c].param == 0)
+    if (p1[3 * kCh + c].effect == 0x0d && p1[3 * kCh + c].param == 0)
       found = true;
   CHECK(found);
-  // And the padding really is empty.
-  for (int r = 4; r < 8; ++r)
-    for (int c = 0; c < 4; ++c)
-      CHECK(p1[r * 4 + c].note == 0 && p1[r * 4 + c].effect == 0);
+  // And the padding really is empty -- both the rows past the break and the
+  // twelve channels the file never had.
+  for (int r = 0; r < 8; ++r)
+    for (int c = 0; c < kCh; ++c)
+      if (r >= 4 || c >= 4)
+        CHECK(p1[r * kCh + c].note == 0 && p1[r * kCh + c].effect == 0);
 
   // A pattern with no packed data at all is eight empty rows, and it still
   // needs the break, because it is not short -- it is the full eight here.
@@ -931,8 +961,8 @@ test_xm_short_patterns() {
     empty.empty_pattern[1] = true;
     CHECK(xm_convert(empty, &xm_size, &out_size));
     CHECK(ntrk::module_load(&module, g_out, out_size));
-    const ntrk::Note *e = module.patterns + 8 * 4;
-    for (int i = 0; i < 8 * 4; ++i)
+    const ntrk::Note *e = module.patterns + 8 * kCh;
+    for (int i = 0; i < 8 * kCh; ++i)
       CHECK(e[i].note == 0 && e[i].instrument == 0 && e[i].effect == 0);
   }
 }
@@ -945,8 +975,9 @@ test_xm_short_patterns() {
 // ramp down, a global volume that never leaves full, and a slide.
 static void
 test_xm_global_volume() {
-  // The cell at row `r`, channel `c`, in the probe layout.
-  const int kCh = 4;
+  // The cell at row `r`, channel `c`, in the probe layout: the file's own
+  // four channels, padded to sixteen.
+  const int kCh = ntrk::kMaxChannels;
 
   // ---- a `G` ramp, which is what a fade-out is written as -------------------
   {
@@ -1208,6 +1239,11 @@ test_xm_refusals() {
   {
     XmSpec spec;                     // thirty-two channels is more than we hold
     spec.channels = 32;
+    CHECK(!xm_convert(spec, &xm_size, &out_size));
+  }
+  {
+    XmSpec spec;                     // one past sixteen is refused, not padded
+    spec.channels = ntrk::kMaxChannels + 1;
     CHECK(!xm_convert(spec, &xm_size, &out_size));
   }
   {

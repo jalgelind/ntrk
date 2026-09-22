@@ -19,7 +19,11 @@ that drifts apart over sixteen bars.
 
 A one-target macro is therefore also a **named automation lane**: give macro 2
 the single target "send 1, channel 3" at unity scale and that meta lane's cells
-read as the send level directly. `meta_columns` goes up to 4, so four such lanes.
+read as the send level directly. `meta_columns` goes up to 5, so five such
+lanes — one for each of the four sends and the master, if a song wants all of
+them at once. A lane's own destination is still decided per cell, though: the
+5th slot is not reserved for anything in particular, it is the same generic
+lane as the other four.
 
 ## Geometry, and what a column costs
 

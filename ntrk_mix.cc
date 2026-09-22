@@ -645,21 +645,11 @@ bool
 config_init(uint8_t *block) {
   if (block == nullptr)
     return false;
-  for (int k = 0; k < kMixrBytes; ++k)
-    block[k] = 0u;
-  ntrk::write_u16(block + 0, (uint16_t) kMixrVersion);
-  ntrk::write_u16(block + 2, (uint16_t) kMixrSlots);
-  // **Unity, not zero.** A block whose master gain is a literal zero is a tune
-  // that plays silently, and "I added a mixer and the sound went away" is the
-  // one first impression a mixer must not make. `mixer_config_write` of a fresh
-  // Mixer would write these two the same way.
-  ntrk::write_u16(block + 4, mixr_q12(1.f));
-  ntrk::write_u16(block + 6, mixr_q12(1.f));
-  // **The returns at unity, for the same reason the master gain is.** A fresh block whose
-  // returns were zero is a mixer where switching a send on produces silence, and "I added a
-  // reverb and nothing happened" is the other half of the first impression this guards.
-  for (int i = 0; i < kMixrReturnBytes; ++i)
-    block[kMixrBytesV1 + kMixrSendLevelBytes + i] = 255u;
+  // `ntrk::mix_default` is this same byte layout — unity gain, unity width,
+  // unity returns, so "I added a mixer and the sound went away" never happens
+  // — kept in `ntrk_types.h` because that is the end `Module`'s own
+  // constructor can see. One writer of the default, not two.
+  ntrk::mix_default(block);
   return true;
 }
 

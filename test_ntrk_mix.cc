@@ -42,7 +42,7 @@ static int g_checks = 0;
 // which test_ntrk.cc covers at length.
 // ---------------------------------------------------------------------------
 
-static const int kChannels = 4;
+static const int kChannels = ntrk::kMaxChannels;
 static const int kRows = 8;
 static const int kSampleLen = 64;
 
@@ -92,14 +92,23 @@ build() {
   put_u32(itable + 4, kSampleLen);
   put_u32(itable + 8, 0u);
   put_u32(itable + 12, kSampleLen);
-  g_bytes[itable + 16] = 64;
+  // Half volume, not full: sixteen channels of a full-scale square wave, even
+  // spread across only eight rows, can peak hot enough to reach the mixer's
+  // own safety limiter -- which `render_add` does not have, and would make
+  // this fixture measure the limiter instead of the bypass path.
+  g_bytes[itable + 16] = 32;
 
   // A note on every channel, spread down the pattern so the channels are not
   // in phase — a mixer bug that sums wrongly hides when every voice matches.
+  // The row wraps at `kRows`, which is narrower than `kChannels`: several
+  // channels share a row, but no two adjacent ones do.
   const size_t pat = itable + instruments * 32u;
   for (int c = 0; c < kChannels; ++c) {
-    const size_t cell = pat + ((size_t) (c * 2) * kChannels + (size_t) c) * 4u;
-    g_bytes[cell + 0] = (uint8_t) (13 + c * 3);
+    const size_t row = (size_t) (c * 2) % (size_t) kRows;
+    const size_t cell = pat + (row * kChannels + (size_t) c) * 4u;
+    // `note_max` below is 36 (three octaves), so the pitch wraps at eight
+    // channels rather than climbing past it.
+    g_bytes[cell + 0] = (uint8_t) (13 + (c % 8) * 3);
     g_bytes[cell + 1] = 1;
   }
 
@@ -567,7 +576,10 @@ test_max_resonance_stays_finite() {
 static const int kV2Rows = 8;
 static const int kTickFrames = 960;   // 125 BPM at 48 kHz, and it divides exactly
 
-static uint8_t g_plane[kV2Rows * 2];  // one channel, so {cmd, param} per row
+// Every module is sixteen channels now, so the plane is sixteen lanes wide
+// (one fx column per channel, no meta lanes) even though only channel 0 ever
+// carries a command below -- the other fifteen stay zero.
+static uint8_t g_plane[kV2Rows * ntrk::kMaxChannels * 2];
 static size_t g_pat2 = 0;             // where the v2 pattern block landed
 
 static void
@@ -577,22 +589,23 @@ plane_clear() {
 
 static void
 plane_put(int row, uint8_t cmd, uint8_t param) {
-  g_plane[(size_t) row * 2u + 0] = cmd;
-  g_plane[(size_t) row * 2u + 1] = param;
+  const size_t at = (size_t) row * ntrk::kMaxChannels * 2u;   // lane 0: channel 0
+  g_plane[at + 0] = cmd;
+  g_plane[at + 1] = param;
 }
 
 static void
 build_v2(bool with_plane) {
   const size_t orders = 1;
   const size_t instruments = 1;
-  const size_t patterns = (size_t) kV2Rows * 4u;
+  const size_t patterns = (size_t) kV2Rows * (size_t) ntrk::kMaxChannels * 4u;
   // Four bytes of geometry in front of the cells. **Not optional and not
   // defaulted**: an FXPL payload without it is four bytes short of what every
   // reader now computes, and the exact-length check that was always there
   // refuses it -- which is what stops a v2 reader reading the first two cells
-  // as a geometry. One column, no meta lanes, which is what a plane written
-  // before the prefix existed meant.
-  const size_t plane_bytes = 4u + (size_t) kV2Rows * 2u;
+  // as a geometry. One column, no meta lanes -- sixteen lanes now that every
+  // channel is one of sixteen rather than the file's only one.
+  const size_t plane_bytes = 4u + sizeof g_plane;
 
   const size_t itable = 32u + orders;
   const size_t pat = itable + instruments * 32u;
@@ -604,7 +617,7 @@ build_v2(bool with_plane) {
 
   memcpy(g_bytes, "NTRK", 4);
   put_u16(4, 2);
-  put_u16(6, 1);                      // one channel
+  put_u16(6, (uint16_t) ntrk::kMaxChannels);
   put_u16(8, kV2Rows);
   put_u16(10, 6);                     // speed: six ticks to a row
   put_u16(12, 125);
@@ -647,8 +660,9 @@ build_v2(bool with_plane) {
 // counting has to survive, and it is written here rather than there.
 static void
 note_effect(int row, uint8_t effect, uint8_t param) {
-  g_bytes[g_pat2 + (size_t) row * 4u + 2] = effect;
-  g_bytes[g_pat2 + (size_t) row * 4u + 3] = param;
+  const size_t at = g_pat2 + (size_t) row * (size_t) ntrk::kMaxChannels * 4u;
+  g_bytes[at + 2] = effect;
+  g_bytes[at + 3] = param;
 }
 
 // Where the signal sits across the field over one window: -1 hard left, +1 hard
@@ -3424,9 +3438,9 @@ test_mixr_round_trip() {
   mixr_configure(&a);
 
   Module m;
-  CHECK(!mix::mixer_config_read(&a, &m));      // nothing to read yet
+  CHECK(ntrk::mix_is_default(m.mix));          // every module starts here
   mix::mixer_config_write(&a, &m);
-  CHECK(m.has_mix);
+  CHECK(!ntrk::mix_is_default(m.mix));
 
   static mix::Mixer b;
   mix::mixer_reset(&b);
@@ -3476,7 +3490,7 @@ test_mixr_send_levels() {
 
   Module m;
   mix::mixer_config_write(&a, &m);
-  CHECK(m.has_mix);
+  CHECK(!ntrk::mix_is_default(m.mix));
 
   // Read back into a fresh mixer: the levels are where the render loop looks for them.
   static mix::Mixer b;
@@ -3538,7 +3552,7 @@ test_mixr_version_follows_the_levels() {
 
   Module back_v1;
   CHECK(module_load(&back_v1, g_saved, wrote_v1));
-  CHECK(back_v1.has_mix);
+  CHECK(!ntrk::mix_is_default(back_v1.mix));
   // Upgraded in memory whatever the file said, so every accessor sees one shape.
   CHECK(ntrk::read_u16(back_v1.mix) == (uint16_t) kMixrVersion);
   CHECK(mix::config_slot_kind(back_v1.mix, kMixrSlots - 1) == mix::FxKind::kShape);
@@ -3710,7 +3724,6 @@ test_send_return_level() {
   // unity for that very case, which is what made the first version of these checks fail in a
   // way that looked like a broken setter.
   CHECK(mix::config_init(m.mix));
-  m.has_mix = true;
   CHECK(mix::config_return_level(m.mix, 0) == 1.f);       // a fresh block returns everything
   mix::config_set_return_level(m.mix, 0, 0.5f);
   CHECK(fabs(mix::config_return_level(m.mix, 0) - 0.5f) < 0.005f);
@@ -3792,7 +3805,7 @@ test_config_slot_kind_reads_without_a_mixer() {
   mixr_configure(&a);
   Module m;
   mix::mixer_config_write(&a, &m);
-  CHECK(m.has_mix);
+  CHECK(!ntrk::mix_is_default(m.mix));
 
   // **It agrees with the reader, slot for slot.** That is the whole contract: an
   // editor drawing what a module's sends are must not describe a different
@@ -3836,7 +3849,6 @@ test_config_init_makes_a_readable_block() {
 
   Module m;
   CHECK(mix::config_init(m.mix));
-  m.has_mix = true;
   CHECK(fabsf(mix::config_master_gain(&m) - 1.f) < 1.f / 1000.f);
   CHECK(fabsf(mix::config_width(&m) - 1.f) < 1.f / 1000.f);
   for (int s = 0; s < kMixrSlots; ++s) {
@@ -3860,7 +3872,6 @@ test_config_set_round_trips() {
 
   Module m;
   CHECK(mix::config_init(m.mix));
-  m.has_mix = true;
 
   const mix::FxKind kinds[] = {mix::FxKind::kNone, mix::FxKind::kDelay,
                               mix::FxKind::kReverb};

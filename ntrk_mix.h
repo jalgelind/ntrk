@@ -785,47 +785,42 @@ const char *fx_param_choice_name(FxKind kind, int param, int i);
 // so a delay's Time would otherwise arrive as a reverb's Size.
 void config_seed_slot(uint8_t *block, int slot);
 
-// The same, for a module: `kNone` when it carries no `MIXR` block at all.
+// The same, for a module. Every module carries a mixer now — `mix_default`'s
+// bytes if a file never touched one — so this is a null check, not a
+// has-one check.
 inline FxKind
 config_slot_kind(const ntrk::Module *module, int slot) {
-  return module != nullptr && module->has_mix ? config_slot_kind(module->mix, slot)
-                                              : FxKind::kNone;
+  return module != nullptr ? config_slot_kind(module->mix, slot) : FxKind::kNone;
 }
 
 inline float
 config_slot_param(const ntrk::Module *module, int slot, int param) {
-  return module != nullptr && module->has_mix
-             ? config_slot_param(module->mix, slot, param)
-             : 0.f;
+  return module != nullptr ? config_slot_param(module->mix, slot, param) : 0.f;
 }
 
 inline float
 config_send_level(const ntrk::Module *module, int channel, int send) {
-  return module != nullptr && module->has_mix
-             ? config_send_level(module->mix, channel, send)
-             : 0.f;
+  return module != nullptr ? config_send_level(module->mix, channel, send) : 0.f;
 }
 
 inline float
 config_return_level(const ntrk::Module *module, int slot) {
-  // Unity for a module with no block, which is what every reader of one should hear: no
-  // block means no mixer configuration, not a mixer configured to silence.
-  return module != nullptr && module->has_mix ? config_return_level(module->mix, slot) : 1.f;
+  return module != nullptr ? config_return_level(module->mix, slot) : 1.f;
 }
 
 inline float
 config_master_gain(const ntrk::Module *module) {
-  return module != nullptr && module->has_mix ? config_master_gain(module->mix) : 1.f;
+  return module != nullptr ? config_master_gain(module->mix) : 1.f;
 }
 
 inline float
 config_width(const ntrk::Module *module) {
-  return module != nullptr && module->has_mix ? config_width(module->mix) : 1.f;
+  return module != nullptr ? config_width(module->mix) : 1.f;
 }
 
-// The mirror: the mixer's current configuration into `module->mix`, and
-// `has_mix` set. What a slide has moved is deliberately *not* what is written
-// -- `Slot::base` is, which is the setting the automation departs from.
+// The mirror: the mixer's current configuration into `module->mix`. What a
+// slide has moved is deliberately *not* what is written -- `Slot::base` is,
+// which is the setting the automation departs from.
 void mixer_config_write(const Mixer *mx, uint8_t *block);
 
 // The same two against a module, which is where a block usually lives. Separate
@@ -834,8 +829,7 @@ void mixer_config_write(const Mixer *mx, uint8_t *block);
 // running -- has bytes and no module to put them in.
 inline bool
 mixer_config_read(Mixer *mx, const ntrk::Module *module) {
-  return module != nullptr && module->has_mix &&
-         mixer_config_read(mx, module->mix);
+  return module != nullptr && mixer_config_read(mx, module->mix);
 }
 
 inline void
@@ -843,7 +837,6 @@ mixer_config_write(const Mixer *mx, ntrk::Module *module) {
   if (module == nullptr)
     return;
   mixer_config_write(mx, module->mix);
-  module->has_mix = true;
 }
 
 // Takes the plane's accumulators from wherever the knobs currently stand, so a

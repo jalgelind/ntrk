@@ -49,7 +49,7 @@ static int g_checks = 0;
 // ---------------------------------------------------------------------------
 
 struct Spec {
-  int channels = 1;
+  int channels = ntrk::kMaxChannels;
   int rows = 4;
   int speed = 6;
   int bpm = 125;
@@ -183,7 +183,7 @@ test_loads() {
   build(s);
   ntrk::Module m;
   CHECK(ntrk::module_load(&m, g_bytes, g_size));
-  CHECK(m.channels == 1);
+  CHECK(m.channels == ntrk::kMaxChannels);
   CHECK(m.rows == 4);
   CHECK(m.instrument_count == 1);
   CHECK(m.instruments[0].length == 32u);
@@ -458,7 +458,6 @@ test_save_round_trip() {
   printf("a saved module is the file it was loaded from\n");
 
   Spec s;
-  s.channels = 2;
   s.rows = 8;
   s.patterns = 2;
   s.orders = 3;
@@ -541,7 +540,6 @@ test_mute() {
   printf("a muted channel is silent, and does not jump when it comes back\n");
 
   Spec s;
-  s.channels = 2;
   build(s);
   set_cell(s, 0, 1, 25u, 1u, 0u, 0u);   // both channels sound
 
@@ -581,7 +579,6 @@ test_slot_mute() {
          "file\n");
 
   Spec s;
-  s.channels = 2;
   s.orders = 2;
   s.patterns = 2;
   build(s);
@@ -685,7 +682,6 @@ test_slot_mute_refusals() {
   printf("a SMUT block that disagrees with the module is refused\n");
 
   Spec s;
-  s.channels = 2;
   s.orders = 2;
   s.patterns = 2;
   build(s);
@@ -727,14 +723,12 @@ test_slot_mute_refusals() {
 
   ntrk::write_u16(g_saved + payload + 2, 4u);        // channels says 4
   CHECK(!ntrk::module_load(&back, g_saved, wrote));
-  ntrk::write_u16(g_saved + payload + 2, 2u);
+  ntrk::write_u16(g_saved + payload + 2, (uint16_t) ntrk::kMaxChannels);
   CHECK(ntrk::module_load(&back, g_saved, wrote));
 
-  // A bit above the channel count names a channel that is not there.
-  ntrk::write_u16(g_saved + payload + ntrk::kSmutHeaderBytes, 0x0004u);
-  CHECK(!ntrk::module_load(&back, g_saved, wrote));
-  ntrk::write_u16(g_saved + payload + ntrk::kSmutHeaderBytes, 0x0002u);
-  CHECK(ntrk::module_load(&back, g_saved, wrote));
+  // Every module has all sixteen channels now, so the mute bitmask is
+  // exactly sixteen bits wide and every bit names a channel that exists --
+  // there is no "bit above the channel count" case left to refuse.
 }
 
 static void
@@ -884,7 +878,7 @@ test_preview() {
   CHECK(p.order == order_before);
 
   CHECK(!ntrk::player_preview(&p, 0, 0, 1, 22050.0));    // note out of range
-  CHECK(!ntrk::player_preview(&p, 9, 25, 1, 22050.0));   // channel
+  CHECK(!ntrk::player_preview(&p, ntrk::kMaxChannels, 25, 1, 22050.0));  // channel
   CHECK(!ntrk::player_preview(&p, 0, 25, 9, 22050.0));   // instrument
 }
 
@@ -988,7 +982,6 @@ test_render_hashes() {
 
     {
         Spec s;
-        s.channels = 4;
         s.rows = 8;
         s.patterns = 2;
         s.orders = 3;
@@ -1013,7 +1006,6 @@ test_pan() {
     printf("panning places a channel, and is a no-op when it is off\n");
 
     Spec s;
-    s.channels = 2;
     build(s);
     set_cell(s, 0, 1, 25u, 1u, 0u, 0u);   // both channels sound
 
@@ -1125,7 +1117,6 @@ test_block_invariance() {
     printf("the chunk size does not change a single sample\n");
 
     Spec s;
-    s.channels = 4;
     s.rows = 8;
     s.patterns = 2;
     s.orders = 3;
@@ -1886,7 +1877,6 @@ test_slc_effect() {
   // where a voice STARTED, and that only means anything if it has not yet run
   // past the next slice.
   Spec s;
-  s.channels = 1;
   s.rows = 4;
   s.sample_len = 20000;
   s.loop_len = 0;                       // one-shot, so nothing wraps
@@ -2008,7 +1998,6 @@ test_slc_effect() {
   // quietly break a pattern that uses both commands on the same channel.
   {
     Spec t;
-    t.channels = 1;
     t.rows = 4;
     t.sample_len = 20000;
     t.loop_len = 0;
@@ -2060,7 +2049,6 @@ test_slc_effect() {
   // that says the other four call sites still start where they did.
   {
     Spec t;
-    t.channels = 2;
     t.rows = 8;
     t.sample_len = 4096;
     build(t);
@@ -2138,7 +2126,7 @@ test_mixr_block() {
   build(s);
   ntrk::Module a;
   CHECK(ntrk::module_load(&a, g_bytes, g_size));
-  CHECK(!a.has_mix);                    // a file without the block carries none
+  CHECK(ntrk::mix_is_default(a.mix));   // a file without the block carries the default one
 
   // A payload with the two fields the format owns set correctly and every other
   // byte something that is obviously not zero, so a block that came back zeroed
@@ -2147,7 +2135,6 @@ test_mixr_block() {
     a.mix[i] = (uint8_t) (0x40 + i);
   ntrk::write_u16(a.mix + 0, (uint16_t) ntrk::kMixrVersion);
   ntrk::write_u16(a.mix + 2, (uint16_t) ntrk::kMixrSlots);
-  a.has_mix = true;
 
   size_t need = 0;
   CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
@@ -2156,7 +2143,6 @@ test_mixr_block() {
 
   ntrk::Module b;
   CHECK(ntrk::module_load(&b, g_saved, need));
-  CHECK(b.has_mix);
   CHECK(memcmp(b.mix, a.mix, (size_t) ntrk::kMixrBytes) == 0);
 
   // MIXR is written last of the payloads and the total is exact, so the block
@@ -2394,7 +2380,8 @@ test_lanes_and_macros_refusals() {
   ntrk::Module m;
 
   // The geometry prefix. Zero columns is a plane with no cells in it; nine is
-  // past the eight-column ceiling. Eight itself is tested as *accepted* in
+  // past the eight-column ceiling, and six is past the five-meta-lane
+  // ceiling. Eight itself is tested as *accepted* in
   // `test_lanes_and_macros_load`, so this pair pins the boundary from both
   // sides rather than only from above.
   //
@@ -2413,14 +2400,14 @@ test_lanes_and_macros_refusals() {
     build_v2(nine);
     CHECK(!ntrk::module_load(&m, g_bytes, g_size));
 
-    SpecV2 five_meta = s;
-    five_meta.meta_columns = 5;
-    build_v2(five_meta);
+    SpecV2 six_meta = s;
+    six_meta.meta_columns = 6;
+    build_v2(six_meta);
     CHECK(!ntrk::module_load(&m, g_bytes, g_size));
   }
 
   build_v2(s);
-  put_u16(v2_fx_at(s) + 2, 5u);
+  put_u16(v2_fx_at(s) + 2, 6u);
   CHECK(!ntrk::module_load(&m, g_bytes, g_size));
 
   // One cell's worth of disagreement between the declared length and the
@@ -2542,7 +2529,7 @@ test_lanes_and_macros_round_trip() {
   // the most room to show it.
   SpecV2 s;
   s.fx_columns = 8;
-  s.meta_columns = 4;
+  s.meta_columns = 5;
   s.macros = 5;
   build_v2(s);
 
@@ -2558,7 +2545,7 @@ test_lanes_and_macros_round_trip() {
   ntrk::Module b;
   CHECK(ntrk::module_load(&b, g_saved, wrote));
   CHECK(b.fx_columns == 8);
-  CHECK(b.meta_columns == 4);
+  CHECK(b.meta_columns == 5);
   CHECK(b.macro_count == 5);
 
   int same = 1;
@@ -2669,14 +2656,15 @@ static void
 build_env(const SpecEnv &s) {
   const size_t instrument_at = 32u + 1u;          // one order byte
   const size_t patterns_at = instrument_at + 32u;
-  const size_t pattern_bytes = (size_t) kEnvRows * 4u;
+  const size_t pattern_bytes =
+      (size_t) kEnvRows * (size_t) ntrk::kMaxChannels * 4u;
   const size_t blob_at = patterns_at + pattern_bytes;
   g_size = blob_at + (size_t) kEnvSampleFrames;
   memset(g_bytes, 0, g_size);
 
   memcpy(g_bytes, "NTRK", 4);
   put_u16(4, 2);
-  put_u16(6, 1);                                  // one channel
+  put_u16(6, (uint16_t) ntrk::kMaxChannels);      // every module has all sixteen
   put_u16(8, (uint16_t) kEnvRows);
   put_u16(10, 6);
   put_u16(12, 125);
@@ -2700,7 +2688,9 @@ build_env(const SpecEnv &s) {
   g_bytes[patterns_at + 0] = 25u;                 // the note, on row 0
   g_bytes[patterns_at + 1] = 1u;
   if (s.off_row > 0)
-    g_bytes[patterns_at + (size_t) s.off_row * 4u] = (uint8_t) ntrk::kNoteOff;
+    g_bytes[patterns_at +
+            (size_t) s.off_row * (size_t) ntrk::kMaxChannels * 4u] =
+        (uint8_t) ntrk::kNoteOff;
 
   for (int i = 0; i < kEnvSampleFrames; ++i)
     g_bytes[blob_at + (size_t) i] =
@@ -2911,7 +2901,8 @@ static size_t syn_patterns_at() {
   return syn_instruments_at() + (size_t) kSynInstruments * 32u;
 }
 static size_t syn_blob_at() {
-  return syn_patterns_at() + (size_t) kSynRows * 4u;
+  return syn_patterns_at() +
+         (size_t) kSynRows * (size_t) ntrk::kMaxChannels * 4u;
 }
 static size_t syn_dir_at() { return syn_blob_at() + (size_t) kSynPcmFrames; }
 static size_t syn_synp_at() { return syn_dir_at() + 12u; }
@@ -2976,7 +2967,7 @@ build_syn(const SpecSyn &s) {
 
   memcpy(g_bytes, "NTRK", 4);
   put_u16(4, 2);
-  put_u16(6, 1);                              // one channel
+  put_u16(6, (uint16_t) ntrk::kMaxChannels);  // every module has all sixteen
   put_u16(8, (uint16_t) kSynRows);
   put_u16(10, 6);
   put_u16(12, 125);
@@ -5121,7 +5112,6 @@ fuzz_build_base(int which) {
     build(s);
   } else if (which == 1) {
     Spec s;
-    s.channels = 4;
     s.rows = 8;
     s.patterns = 2;
     s.orders = 3;
@@ -5155,7 +5145,7 @@ fuzz_build_base(int which) {
     // sizes other things against.
     SpecV2 s;
     s.fx_columns = 8;
-    s.meta_columns = 4;
+    s.meta_columns = 5;
     s.macros = 4;
     build_v2(s);
   }
@@ -5271,7 +5261,7 @@ static const int kRtPatterns = 2;
 static const int kRtOrders = 3;
 static const int kRtCells = kRtPatterns * kRtRows * ntrk::kMaxChannels;
 // The plane is lanes wide, not channels wide, and the widest geometry the
-// format permits is every channel at four columns plus four meta lanes.
+// format permits is every channel at eight columns plus five meta lanes.
 static const int kRtPlaneCells =
     kRtPatterns * kRtRows *
     (ntrk::kMaxChannels * ntrk::kMaxFxColumns + ntrk::kMaxMetaColumns);
@@ -5284,7 +5274,7 @@ static ntrk::FxCell g_rt_fx[kRtPlaneCells];
 static int8_t g_rt_wave[64];
 
 struct RtSpec {
-  int channels = 4;
+  int channels = ntrk::kMaxChannels;
   int instruments = 4;
   int note_max = 96;
   uint8_t type = (uint8_t) ntrk::InstrumentType::kPcm8;
@@ -5539,7 +5529,6 @@ test_round_trip_property() {
       (uint8_t) ntrk::InstrumentType::kWaveBuiltin,
       (uint8_t) ntrk::InstrumentType::kSynth,
   };
-  const int channels[3] = {1, 4, 16};
   const uint8_t extra[4] = {0u, ntrk::kInstrumentEnvelope, ntrk::kInstrumentFilter,
                             (uint8_t) (ntrk::kInstrumentEnvelope |
                                        ntrk::kInstrumentFilter)};
@@ -5549,13 +5538,11 @@ test_round_trip_property() {
   int cases = 0;
 
   for (int t = 0; t < 5; ++t)
-    for (int c = 0; c < 3; ++c)
-      for (int nm = 0; nm < 2; ++nm)
-        for (int fx = 0; fx < 2; ++fx)
-          for (int e = 0; e < 4; ++e) {
+    for (int nm = 0; nm < 2; ++nm)
+      for (int fx = 0; fx < 2; ++fx)
+        for (int e = 0; e < 4; ++e) {
             RtSpec s;
             s.type = types[t];
-            s.channels = channels[c];
             s.note_max = nm == 0 ? 36 : ntrk::kMaxNote;
             s.note = nm == 0 ? 25u : 60u;
             s.fx = fx != 0;
@@ -5658,43 +5645,41 @@ test_round_trip_property() {
   }
 
   // The plainest shape the grid above cannot reach: three octaves, PCM8, no
-  // plane and no blocks, at three widths and three table sizes. That is what
-  // every imported `.mod` is, so it is worth sweeping on its own rather than
-  // trusting the fully-loaded cases to cover it.
-  const int plain_channels[3] = {1, 4, 8};
+  // plane and no blocks, at three table sizes. Every module is sixteen
+  // channels now, so that used to be a second dimension here (three widths,
+  // an imported `.mod`'s narrowest common shapes) and is not any more --
+  // there is only the one width.
   const int plain_instruments[3] = {1, 4, 32};
-  for (int c = 0; c < 3; ++c)
-    for (int n = 0; n < 3; ++n) {
-      RtSpec s;
-      s.channels = plain_channels[c];
-      s.instruments = plain_instruments[n];
-      s.note_max = 36;
-      ++cases;
+  for (int n = 0; n < 3; ++n) {
+    RtSpec s;
+    s.instruments = plain_instruments[n];
+    s.note_max = 36;
+    ++cases;
 
-      ntrk::Module a;
-      rt_build(&a, s);
-      size_t wrote = 0;
-      if (!ntrk::module_save(&a, g_saved, sizeof g_saved, &wrote)) {
-        saved = 0;
-        continue;
-      }
-      ntrk::Module b;
-      if (!ntrk::module_load(&b, g_saved, wrote)) {
-        reloaded = 0;
-        continue;
-      }
-      if (!rt_same(a, b))
-        fields = 0;
-      else if (!rt_same_render(&a, &b))
-        audio = 0;
+    ntrk::Module a;
+    rt_build(&a, s);
+    size_t wrote = 0;
+    if (!ntrk::module_save(&a, g_saved, sizeof g_saved, &wrote)) {
+      saved = 0;
+      continue;
     }
+    ntrk::Module b;
+    if (!ntrk::module_load(&b, g_saved, wrote)) {
+      reloaded = 0;
+      continue;
+    }
+    if (!rt_same(a, b))
+      fields = 0;
+    else if (!rt_same_render(&a, &b))
+      audio = 0;
+  }
 
   // Literal rather than derived, because this is the tripwire on a loop that
   // silently stopped iterating -- a count computed from the same bounds the
-  // loops use would agree with a broken loop. The geometry sweep contributes
-  // `kMaxFxColumns * (3 + 4 * 2)`: three macro counts at no meta lanes, two at
-  // each of the four meta widths. It was 295 at four columns.
-  CHECK(cases == 339);
+  // loops use would agree with a broken loop. It was 355 before every module
+  // was pinned to sixteen channels, which collapsed the plain-shape sweep's
+  // channel dimension (three widths) down to one.
+  CHECK(cases == 189);
   CHECK(saved);
   CHECK(reloaded);
   CHECK(fields);
@@ -5707,7 +5692,6 @@ test_round_trip_property() {
   for (int k = 0; k < 6; ++k) {
     Spec s;
     if (k == 1) {
-      s.channels = 8;
       s.rows = 64;
     } else if (k == 2) {
       s.rows = 16;
@@ -5723,7 +5707,6 @@ test_round_trip_property() {
       s.speed = 31;
       s.bpm = 32;
     } else if (k == 5) {
-      s.channels = 3;
       s.rows = 1;
       s.orders = 2;
       s.patterns = 2;
@@ -6012,7 +5995,6 @@ test_module_param_table() {
   }
 
   RtSpec s;
-  s.channels = 4;
   size_t need = 0;
 
   // A restart names an entry of THIS order list, so its ceiling follows the
@@ -6043,7 +6025,7 @@ test_module_param_table() {
     CHECK(!ntrk::module_save(&m, NULL, 0, &need));                             \
   } while (0)
 
-  MOD_REFUSED(m.channels = 0);
+  MOD_REFUSED(m.channels = ntrk::kMaxChannels - 1);
   MOD_REFUSED(m.channels = ntrk::kMaxChannels + 1);
   MOD_REFUSED(m.rows = 0);
   MOD_REFUSED(m.rows = ntrk::kMaxRows + 1);
@@ -6265,7 +6247,6 @@ test_instrument_param_clamps() {
   for (int t = 0; t < 5; ++t) {
     RtSpec s;
     s.type = types[t];
-    s.channels = 1;
     ntrk::Module m;
     rt_build(&m, s);
     ntrk::Instrument &ins = m.instruments[0];
@@ -6301,7 +6282,6 @@ test_instrument_param_clamps() {
   // bound with it. Ticking the box has to carry the cutoff into range, or the
   // module plays all afternoon and refuses to save.
   RtSpec fs;
-  fs.channels = 1;
   ntrk::Module f;
   rt_build(&f, fs);
   ntrk::Instrument &fi = f.instruments[0];
@@ -6353,7 +6333,6 @@ test_instrument_param_enforced() {
   // so no value it can hold is out of range and there is nothing to refuse.
   // That is the property, not an omission.
   RtSpec s;
-  s.channels = 1;
   size_t need = 0;
 
 #define REFUSED(setup)                                                         \
@@ -6412,7 +6391,6 @@ test_instrument_param_round_trip() {
   for (int t = 0; t < 5; ++t) {
     RtSpec s;
     s.type = types[t];
-    s.channels = 1;
     ntrk::Module a;
     rt_build(&a, s);
     ntrk::Instrument &ins = a.instruments[0];
@@ -6454,7 +6432,6 @@ test_names() {
   printf("instrument names round-trip, and are optional\n");
 
   Spec s;
-  s.channels = 2;
   s.rows = 8;
   s.patterns = 1;
   s.orders = 1;
@@ -6552,7 +6529,6 @@ test_skip() {
   printf("skipping frames leaves the player where rendering them would\n");
 
   Spec s;
-  s.channels = 2;
   s.rows = 8;
   s.orders = 4;
   s.patterns = 4;
@@ -6662,7 +6638,6 @@ test_loop_range() {
   // Four orders, each its own pattern with its own note, so where the player is
   // is audible in the bytes rather than only visible in a field.
   Spec s;
-  s.channels = 1;
   s.rows = 4;
   s.orders = 4;
   s.patterns = 4;
@@ -6755,7 +6730,6 @@ test_tune() {
   printf("the grid division round-trips, and is critical only when it swings\n");
 
   Spec s;
-  s.channels = 1;
   s.rows = 8;
   s.orders = 1;
   s.patterns = 1;
