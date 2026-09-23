@@ -315,6 +315,12 @@ struct Instrument {
   uint8_t bits = 8;               // derived from `type`, never read from a file
   uint8_t flags = 0;
   int8_t transpose = 0;           // a whole signed byte; see InsParam::kTranspose
+  // The SAMPLE's own tuning, in eighths of a semitone: what a recording's rate
+  // means, apart from any transpose somebody plays it at. Applied to the step
+  // and never to the period (`instrument_tune_ratio`), so every note-space rule
+  // -- `note_max`, arpeggio, portamento, glissando -- is untouched by it. Carried
+  // in ITUN; 0 on everything a v2 file without that block describes.
+  int16_t tune = 0;
   uint16_t env_attack_ms = 0;
   uint16_t env_decay_ms = 0;
   uint16_t env_release_ms = 0;
@@ -728,6 +734,10 @@ module_lanes(const Module *m) {
 
 struct Channel {
   int instrument = 0;        // 0 none
+  // `instrument_tune_ratio` of the instrument above, cached where the
+  // instrument is set so the per-block step needs no module. Exactly 1.0 for a
+  // tune of 0, which is what keeps every untuned file bit-identical.
+  double tune_ratio = 1.0;
   // **Double rather than int, and it costs v1 nothing.** Above the period table
   // a note is 3.53 rather than 4, where one integer unit is most of a semitone;
   // below it every value is an integer no larger than 856 and every operation

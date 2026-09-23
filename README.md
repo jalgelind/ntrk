@@ -685,6 +685,14 @@ flags marks it **critical**: an id the reader does not know is skipped when
 optional and refuses the file when critical, which is how this reader stays
 honest against one written by a later version.
 
+**`0x000C` ITUN is an instrument's own tuning**, apart from its transpose: one
+`i16` per instrument, in eighths of a semitone (±1024) — what a recording's
+sample rate means. It multiplies the playback STEP (`instrument_tune_ratio`,
+through the same pitch law a transpose uses) and never touches the period, so
+`note_max`, arpeggio, portamento and glissando stay in note space. Written only
+when some tune is non-zero, and then critical: skipped, it would play every
+imported sample out of tune.
+
 **MIXR carries what the effect plane cannot say.** Every level, pan, filter and
 slot *parameter* is an FXPL command and has always been saved as automation; a
 slot's *kind* is deliberately not one — a row that swapped a shaper for a reverb

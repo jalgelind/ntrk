@@ -832,7 +832,7 @@ const int kInstrumentBytes = 32;
 const int kDirectoryEntryBytes = 12;
 const int kMaxBlocks = 32;
 
-// Block ids. FXPL, NAME, SYNP, MACR, MIXR and TUNE are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
+// Block ids. FXPL, NAME, SYNP, MACR, MIXR, TUNE, SLIC, SMUT and ITUN are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
 // stays spent rather than reused so a file written against the older sketch
 // cannot be misread as something else. An id this reader does not know is
 // skipped when the file says it is optional and refused when it says it is
@@ -845,6 +845,12 @@ const uint16_t kBlockMacr = 0x0004;
 const uint16_t kBlockMixr = 0x0005;
 const uint16_t kBlockSlic = 0x000A;
 const uint16_t kBlockSmut = 0x000B;
+// ITUN: one `i16 LE` per instrument, in instrument order -- `Instrument::tune`.
+// Written only when some tune is non-zero, and then critical: a reader that
+// skipped it would play every imported sample out of tune with nothing to point
+// at.
+const uint16_t kBlockItun = 0x000C;
+const int kMaxTune = 1024;                 // +-128 semitones, in eighths
 const uint16_t kBlockCritical = 0x0001;   // a directory entry's flags, bit 0
 
 // SMUT: `u16 order_count`, `u16 channels`, then one `u16 LE` per order position
@@ -1025,6 +1031,8 @@ module_load(Module *module, const uint8_t *data, size_t size) {
   size_t tune_bytes = 0;
   const uint8_t *smut = nullptr;
   size_t smut_bytes = 0;
+  const uint8_t *itun = nullptr;
+  size_t itun_bytes = 0;
   const uint8_t *macr = nullptr;
   size_t macr_bytes = 0;
   const uint8_t *slic = nullptr;
@@ -1106,6 +1114,10 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // than a second copy of the parse made here.
       synp = data + offset;
       synp_bytes = (size_t) bytes;
+    } else if (id == kBlockItun) {
+      // Judged against the instrument count, parsed below -- NAME's reason.
+      itun = data + offset;
+      itun_bytes = (size_t) bytes;
     } else if (id == kBlockSmut) {
       // Judged against `order_count` and `channels`, which the header has
       // already given -- but so has every other block's check been deferred to
@@ -1350,6 +1362,20 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       module->slot_mute[i] = bits;
       if (bits != 0u)
         module->has_slot_mute = true;
+    }
+  }
+
+  // ITUN, once the instrument table has said how many instruments there are.
+  // Exact like every block, and bounded: a tune past +-128 semitones is a file
+  // that has gone wrong, not a recording.
+  if (itun != nullptr) {
+    if (itun_bytes != (size_t) module->instrument_count * 2u)
+      return false;
+    for (int i = 0; i < module->instrument_count; ++i) {
+      const int16_t t = (int16_t) read_u16(itun + (size_t) i * 2u);
+      if (t < -kMaxTune || t > kMaxTune)
+        return false;
+      module->instruments[i].tune = t;
     }
   }
 
@@ -1619,6 +1645,8 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     // open -- which is what happened to `transpose`.
     if (!instrument_fields_valid(ins))
       return false;
+    if (ins.tune < -kMaxTune || ins.tune > kMaxTune)   // what the loader refuses
+      return false;
 
     if (ins.type == (uint8_t) InstrumentType::kSynth) {
       // A synth's sample fields are written and read back like anything else --
@@ -1711,10 +1739,18 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     if (module->slot_mute[i] != 0u)
       want_smut = true;
 
+  // Only when some instrument is tuned: an ITUN of zeros would make every file
+  // refuse to open in a reader that does not know the id, to say nothing.
+  bool want_itun = false;
+  for (int i = 0; i < module->instrument_count && !want_itun; ++i)
+    if (module->instruments[i].tune != 0)
+      want_itun = true;
+
   const int block_count = (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
                           (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
                           (want_macr ? 1 : 0) + (want_mixr ? 1 : 0) +
-                          (want_slic ? 1 : 0) + (want_smut ? 1 : 0);
+                          (want_slic ? 1 : 0) + (want_smut ? 1 : 0) +
+                          (want_itun ? 1 : 0);
   const size_t directory_bytes =
       (size_t) block_count * (size_t) kDirectoryEntryBytes;
   // Lanes rather than channels, and the four-byte prefix that says how many.
@@ -1752,10 +1788,12 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const size_t smut_bytes =
       want_smut ? (size_t) kSmutHeaderBytes + (size_t) module->order_count * 2u
                 : 0u;
+  const size_t itun_bytes =
+      want_itun ? (size_t) module->instrument_count * 2u : 0u;
   const size_t total = (size_t) kHeaderBytes + order_bytes + instrument_bytes +
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
                        tune_bytes + name_bytes + synp_bytes + macr_bytes +
-                       mixr_bytes + slic_bytes + smut_bytes;
+                       mixr_bytes + slic_bytes + smut_bytes + itun_bytes;
 
   *written = total;
   if (out == nullptr)
@@ -1895,6 +1933,20 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     write_u16(out + at + 4, (uint16_t) module->swing);
     write_u16(out + at + 6, 0u);
     at += (size_t) kTuneBytes;
+  }
+
+  if (want_itun) {
+    // **Critical, always**: written only when some tune is non-zero, and a tune
+    // is by definition something that changes what is heard.
+    write_u16(out + entry + 0, kBlockItun);
+    write_u16(out + entry + 2, (uint16_t) kBlockCritical);
+    write_u32(out + entry + 4, (uint32_t) at);
+    write_u32(out + entry + 8, (uint32_t) itun_bytes);
+    entry += (size_t) kDirectoryEntryBytes;
+    for (int i = 0; i < module->instrument_count; ++i) {
+      write_u16(out + at, (uint16_t) module->instruments[i].tune);
+      at += 2u;
+    }
   }
 
   if (want_smut) {
@@ -2292,6 +2344,20 @@ period_for(int note, int finetune) {
   return period * kFinetune[(finetune & 15)];
 }
 
+// The step multiplier an instrument's own tuning asks for, through the SAME
+// pitch law a transpose and a finetune use (`period_for`), so a tune of +240
+// means exactly what a transpose of +30 meant. Exactly 1.0 at a tune of 0, so an
+// untuned instrument steps bit-for-bit as before.
+inline double
+instrument_tune_ratio(const Instrument &ins) {
+  if (ins.tune == 0)
+    return 1.0;
+  const int t = (int) ins.tune;
+  const int semis = t >= 0 ? t / 8 : -((-t + 7) / 8);   // floor, for negatives too
+  const int eighths = t - semis * 8;                     // 0..7
+  return period_for(1, 0) / period_for(1 + semis, eighths);
+}
+
 inline void
 channel_set_step(Channel *ch, double sample_rate) {
   if (ch->period <= 0.0) {
@@ -2299,7 +2365,7 @@ channel_set_step(Channel *ch, double sample_rate) {
     return;
   }
   const double rate = kAmigaClock / (2.0 * ch->period);
-  ch->step = rate / sample_rate;
+  ch->step = rate / sample_rate * ch->tune_ratio;
 }
 
 // Clamped to the module's own range rather than to ProTracker's two literals.
@@ -2670,6 +2736,7 @@ player_preview(Player *player, int channel, int note, int instrument,
   const Instrument &ins = m->instruments[instrument - 1];
   Channel *ch = &player->channels[channel];
   ch->instrument = instrument;
+  ch->tune_ratio = instrument_tune_ratio(ins);
   ch->finetune = ins.finetune;
   ch->volume = (float) ins.volume;
   ch->trem_offset = 0.f;
@@ -2803,6 +2870,7 @@ player_row(Player *player, double sample_rate) {
 
     if (n.instrument > 0 && n.instrument <= m->instrument_count) {
       ch->instrument = n.instrument;
+      ch->tune_ratio = instrument_tune_ratio(m->instruments[n.instrument - 1]);
       ch->volume = (float) m->instruments[n.instrument - 1].volume;
       ch->finetune = m->instruments[n.instrument - 1].finetune;
     }
@@ -3368,7 +3436,7 @@ instrument_note_step(const Instrument &ins, int note, int note_max,
   const double period = period_for(shifted, ins.finetune);
   if (period <= 0.0)
     return 0.0;
-  return (kAmigaClock / (2.0 * period)) / sample_rate;
+  return (kAmigaClock / (2.0 * period)) / sample_rate * instrument_tune_ratio(ins);
 }
 
 // One channel's contribution, and the sample walk that goes with it.

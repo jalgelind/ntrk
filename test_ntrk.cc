@@ -1610,6 +1610,87 @@ set_slices(ntrk::Instrument *ins, const uint32_t *frames, int count) {
 }
 
 static void
+test_itun_block() {
+  printf("an instrument's own tuning steps, round-trips, and costs untuned files nothing\n");
+
+  Spec s;
+  s.sample_len = 256;
+  build(s);
+  ntrk::Module a;
+  CHECK(ntrk::module_load(&a, g_bytes, g_size));
+  CHECK(a.instruments[0].tune == 0);
+
+  // **No tune, no block, not one byte moved** -- the gate that lets ITUN exist.
+  size_t plain = 0;
+  CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &plain));
+  CHECK(plain == g_size);
+  CHECK(memcmp(g_saved, g_bytes, plain) == 0);
+
+  // The step. An octave of tune is exactly an octave; +240 eighths is what a
+  // transpose of +30 meant, through the same pitch law.
+  ntrk::Instrument ins = a.instruments[0];
+  const double base = ntrk::instrument_note_step(ins, 13, 96, 48000.0);
+  ins.tune = 96;
+  CHECK(ntrk::instrument_note_step(ins, 13, 96, 48000.0) == 2.0 * base);
+  ins.tune = 240;
+  ntrk::Instrument tr = a.instruments[0];
+  tr.transpose = 30;
+  const double via_tune = ntrk::instrument_note_step(ins, 13, 96, 48000.0);
+  const double via_transpose = ntrk::instrument_note_step(tr, 13, 96, 48000.0);
+  CHECK(fabs(via_tune / via_transpose - 1.0) < 1e-12);
+  // **The note ceiling limits the NOTE, not the tuning.** A transpose of +30 in
+  // a 36-note module saturated every key from 7 up; a tune of +240 does not.
+  CHECK(fabs(ntrk::instrument_note_step(ins, 25, 36, 48000.0) /
+             ntrk::instrument_note_step(ins, 13, 36, 48000.0) - 2.0) < 1e-12);
+  ins.tune = -9;                                     // floor division, below zero
+  CHECK(ntrk::instrument_tune_ratio(ins) < 1.0);
+  CHECK(ntrk::instrument_tune_ratio(ins) > 0.88);
+
+  // A playing channel steps by the same ratio: set where the instrument is set.
+  {
+    ntrk::Module t = a;
+    ntrk::Player p0, p1;
+    ntrk::player_start(&p0, &a);
+    t.instruments[0].tune = 96;
+    ntrk::player_start(&p1, &t);
+    CHECK(ntrk::player_preview(&p0, 0, 13, 1, 48000.0));
+    CHECK(ntrk::player_preview(&p1, 0, 13, 1, 48000.0));
+    CHECK(p0.channels[0].step > 0.0);
+    CHECK(p1.channels[0].step == 2.0 * p0.channels[0].step);
+  }
+
+  // Round trip.
+  a.instruments[0].tune = 240;
+  size_t n = 0;
+  CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &n));
+  CHECK(n == g_size + (size_t) ntrk::kDirectoryEntryBytes +
+                 (size_t) a.instrument_count * 2u);
+  ntrk::Module b;
+  CHECK(ntrk::module_load(&b, g_saved, n));
+  CHECK(b.instruments[0].tune == 240);
+
+  // **Critical**: a reader that does not know the id refuses the file rather
+  // than playing every import out of tune. Stood in for by renaming the entry to
+  // an id nothing knows, flags untouched.
+  size_t at = 0;
+  for (size_t i = 0; i + 12 <= n; ++i)
+    if (g_saved[i] == 0x0C && g_saved[i + 1] == 0 && g_saved[i + 2] == 1 &&
+        g_saved[i + 3] == 0 &&
+        g_saved[i + 8] == (uint8_t) (a.instrument_count * 2) && g_saved[i + 9] == 0) {
+      at = i;
+      break;
+    }
+  CHECK(at != 0);
+  g_saved[at] = 0x1F;
+  ntrk::Module c;
+  CHECK(!ntrk::module_load(&c, g_saved, n));
+
+  // What the loader refuses, the saver refuses.
+  a.instruments[0].tune = (int16_t) (ntrk::kMaxTune + 1);
+  CHECK(!ntrk::module_save(&a, g_saved, sizeof g_saved, &n));
+}
+
+static void
 test_slic_block() {
   printf("a slice table round-trips, and a module without one is unchanged\n");
 
@@ -6937,6 +7018,7 @@ main(void) {
   test_module_param_table();
 
   test_slic_block();
+  test_itun_block();
   test_slic_refusals();
   test_slc_effect();
   test_slc_display();
