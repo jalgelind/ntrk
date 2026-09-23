@@ -6292,6 +6292,55 @@ test_instrument_param_clamps() {
   ntrk::instrument_param_set(&fi, (int) ntrk::InsParam::kFilter, 1);
   CHECK(fi.filter_cutoff_hz >= 20u);
   CHECK(ntrk::module_save(&f, NULL, 0, &need));      // and still fine with it set
+  // ...and into range at the OPEN end. 20 Hz on the default lowpass is a closed
+  // filter: ticking the box silenced the voice.
+  CHECK(fi.filter_cutoff_hz == 20000u);
+  ntrk::instrument_param_set(&fi, (int) ntrk::InsParam::kFilter, 0);
+  fi.filter_cutoff_hz = 0u;
+  ntrk::instrument_param_set(&fi, (int) ntrk::InsParam::kFilterType, 1);  // highpass
+  ntrk::instrument_param_set(&fi, (int) ntrk::InsParam::kFilter, 1);
+  CHECK(fi.filter_cutoff_hz == 20u);                 // a highpass is open at the bottom
+  // A cutoff somebody set is theirs: switching the filter on keeps it.
+  ntrk::instrument_param_set(&fi, (int) ntrk::InsParam::kFilter, 0);
+  fi.filter_cutoff_hz = 800u;
+  ntrk::instrument_param_set(&fi, (int) ntrk::InsParam::kFilter, 1);
+  CHECK(fi.filter_cutoff_hz == 800u);
+
+  // The envelope's version of the same trap: every stage of an instrument that
+  // never had one is zero, and a sustain of 0 holds the note at silence. The
+  // proof is the render -- switched on untouched, it must sound as it did off.
+  {
+    ntrk::Module e;
+    rt_build(&e, fs);
+    ntrk::Instrument &ei = e.instruments[0];
+    ei.flags = (uint8_t) (ei.flags & ~ntrk::kInstrumentEnvelope);
+    ei.env_attack_ms = ei.env_decay_ms = ei.env_release_ms = 0u;
+    ei.env_sustain = 0u;
+    const auto render = [&](double *out) {
+      ntrk::Player p;
+      ntrk::player_start(&p, &e);
+      for (int i = 0; i < 2048; ++i) out[i] = 0.0;
+      ntrk::render_add(&p, out, 1024, 2, 48000.f);
+    };
+    static double off[2048], on[2048];
+    render(off);
+    ntrk::instrument_param_set(&ei, (int) ntrk::InsParam::kEnvelope, 1);
+    CHECK(ei.env_sustain == 64u);
+    render(on);
+    double worst = 0.0, loud = 0.0;
+    for (int i = 0; i < 2048; ++i) {
+      worst = fmax(worst, fabs(on[i] - off[i]));
+      loud = fmax(loud, fabs(off[i]));
+    }
+    CHECK(loud > 0.01);                                // the control: it sounds at all
+    CHECK(worst < 1e-9);                               // and switched on, unchanged
+    // A shaped envelope is left exactly as it is.
+    ntrk::instrument_param_set(&ei, (int) ntrk::InsParam::kEnvelope, 0);
+    ei.env_sustain = 0u;
+    ei.env_decay_ms = 40u;
+    ntrk::instrument_param_set(&ei, (int) ntrk::InsParam::kEnvelope, 1);
+    CHECK(ei.env_sustain == 0u);                       // a pluck stays a pluck
+  }
 
   // A one-frame loop is what the loader turns into a one-shot, so the setter
   // does it here rather than letting it come back as something else.

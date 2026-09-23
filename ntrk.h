@@ -509,6 +509,14 @@ instrument_param_set(Instrument *ins, int id, int value) {
     case InsParam::kEnvelope:
       ins->flags = (uint8_t) (v != 0 ? (ins->flags | kInstrumentEnvelope)
                                      : (ins->flags & ~kInstrumentEnvelope));
+      // **Switching a stage on changes nothing until it is shaped.** An
+      // instrument that never had an envelope carries zero in every stage, and
+      // a sustain of 0 holds the note at silence: ticking the box muted it. A
+      // full sustain with instant stages is the envelope that is not there. Any
+      // stage already shaped is left exactly as it is.
+      if (v != 0 && ins->env_attack_ms == 0u && ins->env_decay_ms == 0u &&
+          ins->env_release_ms == 0u && ins->env_sustain == 0u)
+        ins->env_sustain = 64u;
       break;
     case InsParam::kAttackMs:  ins->env_attack_ms = (uint16_t) v; break;
     case InsParam::kDecayMs:   ins->env_decay_ms = (uint16_t) v; break;
@@ -521,9 +529,15 @@ instrument_param_set(Instrument *ins, int id, int value) {
         // apply a moment ago, and the value sitting there is 0 on every
         // instrument that never had one. Without this, ticking the box authors
         // a module that plays and will not save.
-        if (ins->filter_cutoff_hz < 20u)
-          ins->filter_cutoff_hz = 20u;
-        else if (ins->filter_cutoff_hz > 20000u)
+        //
+        // **Into range at the OPEN end, not the nearest one.** 20 Hz is the
+        // nearest, and on the default lowpass it is a closed filter: ticking
+        // the box silenced the voice, with nothing on screen but a cutoff at
+        // the end of its travel. Open is 20 Hz only for a highpass.
+        if (ins->filter_cutoff_hz < 20u) {
+          const int mode = (ins->flags & kInstrumentFilterType) >> 2;
+          ins->filter_cutoff_hz = mode == 1 ? 20u : 20000u;
+        } else if (ins->filter_cutoff_hz > 20000u)
           ins->filter_cutoff_hz = 20000u;
       } else {
         ins->flags = (uint8_t) (ins->flags & ~kInstrumentFilter);
