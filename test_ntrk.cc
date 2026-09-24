@@ -2308,6 +2308,25 @@ test_offset_display() {
   CHECK(strstr(d, "1/256") != NULL);
   CHECK(strstr(d, "ortamento") == NULL);
 
+  // Knowing the instrument, it says the one that applies.
+  ntrk::Instrument plain;
+  plain.length = 1024;
+  ntrk::note_fx_describe_for(&plain, ntrk::kFxOffset, 0x80u, d, sizeof d);
+  CHECK(strcmp(d, "Start at 8/16") == 0);
+  const uint32_t fr[2] = {0u, 512u};
+  ntrk::Instrument sliced;
+  sliced.length = 1024;
+  set_slices(&sliced, fr, 2);
+  ntrk::note_fx_describe_for(&sliced, ntrk::kFxOffset, 0x01u, d, sizeof d);
+  CHECK(strcmp(d, "Play slice 1") == 0);
+  ntrk::note_fx_describe_for(nullptr, ntrk::kFxOffset, 0x80u, d, sizeof d);
+  CHECK(strstr(d, "if sliced") != NULL);
+  // Any other command is `note_fx_describe`'s sentence, instrument or not.
+  char d2[96];
+  ntrk::note_fx_describe(0x0Cu, 0x20u, d2, sizeof d2);
+  ntrk::note_fx_describe_for(&sliced, 0x0Cu, 0x20u, d, sizeof d);
+  CHECK(strcmp(d, d2) == 0);
+
   int count = 0;
   const ntrk::CmdInfo *table = ntrk::note_fx_table(&count);
   CHECK(count == 34);

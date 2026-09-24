@@ -4277,6 +4277,22 @@ note_fx_mnemonic(uint8_t effect, uint8_t param, char out[4]) {
 }
 
 
+// `S`'s fraction in words. A sixteenth is said as one -- the reason 256 is the
+// divisor.
+inline void
+offset_fraction_text(TextOut *t, uint8_t param) {
+  text_add(t, "Start at ");
+  if (param == 0) {
+    text_add(t, "the top");
+  } else if ((param & 15u) == 0u) {
+    text_int(t, (long) (param >> 4));
+    text_add(t, "/16");
+  } else {
+    text_int(t, (long) param);
+    text_add(t, "/256");
+  }
+}
+
 // ProTracker's own effect column, `Note::effect` and `Note::param`.
 //
 // A speed or depth of zero is reported as "unchanged" rather than as a zero,
@@ -4300,19 +4316,9 @@ note_fx_describe(uint8_t effect, uint8_t param, char *out, size_t cap) {
     return t.len;
   }
   // **Both readings**, because which one applies is the instrument's and this
-  // sees only the cell. A sixteenth is said as one -- the reason 256 is the
-  // divisor.
+  // sees only the cell. `note_fx_describe_for` says the one that applies.
   if (effect == kFxOffset) {
-    text_add(&t, "Start at ");
-    if (param == 0) {
-      text_add(&t, "the top");
-    } else if ((param & 15u) == 0u) {
-      text_int(&t, (long) (param >> 4));
-      text_add(&t, "/16");
-    } else {
-      text_int(&t, (long) param);
-      text_add(&t, "/256");
-    }
+    offset_fraction_text(&t, param);
     text_add(&t, " (slice ");
     text_int(&t, (long) param);
     text_add(&t, " if sliced)");
@@ -4420,6 +4426,22 @@ note_fx_describe(uint8_t effect, uint8_t param, char *out, size_t cap) {
       text_add(&t, "Unknown effect");
       break;
   }
+  return t.len;
+}
+
+// The same, knowing the instrument the note plays -- which is what `S` needs to
+// say ONE thing: a slice on a sliced instrument, a fraction on anything else.
+// Null means not known, and is `note_fx_describe`'s both-readings sentence.
+inline size_t
+note_fx_describe_for(const Instrument *ins, uint8_t effect, uint8_t param,
+                     char *out, size_t cap) {
+  if (effect != kFxOffset || ins == nullptr)
+    return note_fx_describe(effect, param, out, cap);
+  if (ins->slice_count > 0)
+    return note_fx_describe(kFxSlice, param, out, cap);
+  TextOut t;
+  text_init(&t, out, cap);
+  offset_fraction_text(&t, param);
   return t.len;
 }
 
