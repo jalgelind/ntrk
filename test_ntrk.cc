@@ -2278,9 +2278,19 @@ test_offset_display() {
   printf("S names, describes and renders as itself, sixteenths as sixteenths\n");
   char m[4];
   ntrk::note_fx_mnemonic(ntrk::kFxOffset, 0x80u, m);
-  CHECK(strcmp(m, "OFS") == 0);
-  ntrk::note_fx_mnemonic(0x01u, 0x80u, m);
-  CHECK(strcmp(m, "PTU") == 0 || strcmp(m, "POU") == 0 || m[0] != 'O');  // not OFS
+  CHECK(strcmp(m, "SOF") == 0);
+  ntrk::note_fx_mnemonic(0x09u, 0x80u, m);
+  CHECK(strcmp(m, "OFS") == 0);         // 9xx keeps its own
+  // One row per mnemonic AND name across the table -- two identical rows are a
+  // completion list that cannot say which it is offering.
+  {
+    int n = 0;
+    const ntrk::CmdInfo *tab = ntrk::note_fx_table(&n);
+    for (int i = 0; i < n; ++i)
+      for (int j = i + 1; j < n; ++j)
+        CHECK(!(strcmp(tab[i].mnemonic, tab[j].mnemonic) == 0 &&
+                strcmp(tab[i].name, tab[j].name) == 0));
+  }
 
   char r[16];
   ntrk::note_fx_repr(ntrk::kFxOffset, 0x80u, r, sizeof r);

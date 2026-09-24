@@ -918,7 +918,8 @@ const uint8_t kFxSlice = 0x10;
 // `xx`, exactly `SLC`; on one without, it starts `xx/256` of the way in, so
 // every sixteenth is a round hex value (`S80` half, `S40` a quarter). **No
 // memory**, as `SLC`: a fraction means something on its own, and `S00` is the
-// top. Unlike `9xx`, whose `xx * 256` frames reach 1.48 s at 44.1 kHz, this
+// top. Named `SOF`: `OFS` "Sample offset" is `9xx`'s, and the completion list
+// keeps a row per mnemonic and name. Unlike `9xx`, whose `xx * 256` frames reach 1.48 s at 44.1 kHz, this
 // reaches every sample whatever its length. Written with EFXS (see there).
 const uint8_t kFxOffset = 0x11;
 // The highest note effect this reader plays. EFXS names one above it -> refused.
@@ -4223,7 +4224,7 @@ note_fx_table(int *count) {
       {0xEF, "IVL", "Invert loop (no-op)", ParamShape::Unused, 0, nullptr},
       // Past the nibble. See `kFxSlice`.
       {0x10, "SLC", "Play slice", ParamShape::Continuous, 0, nullptr},
-      {0x11, "OFS", "Sample offset", ParamShape::Continuous, 0, nullptr},
+      {0x11, "SOF", "Offset by fraction or slice", ParamShape::Continuous, 0, nullptr},
   };
   if (count != nullptr)
     *count = 34;

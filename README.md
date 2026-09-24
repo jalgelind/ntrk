@@ -854,7 +854,7 @@ cannot collide with a ProTracker digit:
 
 - `Gxx` (`0x10`, `SLC`) — start at slice `xx` of the instrument's SLIC table,
   exact to the frame. No memory: `G00` is slice 0.
-- `Sxx` (`0x11`, `OFS`) — Renoise's sample offset: slice `xx` on a sliced
+- `Sxx` (`0x11`, `SOF`) — Renoise's sample offset: slice `xx` on a sliced
   instrument, else `xx/256` of the way in, so every sixteenth is a round value
   (`S40` a quarter, `S80` half). No memory. Unlike `9xx`, whose `xx × 256`
   frames stop at 1.48 s at 44.1 kHz, it reaches the whole of any sample.
