@@ -914,8 +914,10 @@ const int kSlicOffsetBytes = 4;
 // describes as *Arpeggio*, and renders as `005`, colliding with arpeggio.
 const uint8_t kFxSlice = 0x10;
 
-// `S` -- Renoise's sample offset. On an instrument with a SLIC table it is slice
-// `xx`, exactly `SLC`; on one without, it starts `xx/256` of the way in, so
+// `S` -- Renoise's sample offset. On an instrument with a SLIC table, `S00` is
+// the whole sample from its top and `Sxx` is slice `xx - 1` -- Renoise's
+// numbering, where the root plays the sample and the slices count from one; on
+// one without, it starts `xx/256` of the way in, so
 // every sixteenth is a round hex value (`S80` half, `S40` a quarter). **No
 // memory**, as `SLC`: a fraction means something on its own, and `S00` is the
 // top. Named `SOF`: `OFS` "Sample offset" is `9xx`'s, and the completion list
@@ -1582,10 +1584,6 @@ slice_offset(const Instrument &ins, int index) {
   return read_u32(ins.slices + (size_t) index * (size_t) kSlicOffsetBytes);
 }
 
-// Where `S xx` starts on `ins`: the SLC frame when it is sliced, else `xx/256`
-// of its length, rounded down. **One place for both halves**, so `S` on a
-// sliced instrument cannot drift from `SLC` -- it IS `slice_offset`. Always
-// inside the sample: `xx/256 < 1`.
 // The fraction alone: `xx/256` of `length` frames, rounded down. An editor's
 // snap asks this, so a boundary snapped to an `S` tick is the frame `S` plays.
 inline uint32_t
@@ -1593,10 +1591,23 @@ offset_fraction_frame(uint32_t length, uint8_t param) {
   return (uint32_t) (((uint64_t) length * (uint64_t) param) >> 8);
 }
 
+// The slice `S xx` plays on a sliced instrument, or -1 for `S00` -- the whole
+// sample. **One answer**, read by the start, the stop and the sentence alike.
+inline int
+offset_slice_index(uint8_t param) {
+  return (int) param - 1;
+}
+
+// Where `S xx` starts on `ins`: on a sliced one frame 0 for `S00` (the true
+// top, even where the first boundary is not) and slice `xx - 1`'s frame after
+// -- `slice_offset`, so it cannot drift from `SLC`; else `xx/256` of its length,
+// rounded down. Always inside the sample: `xx/256 < 1`.
 inline uint32_t
 offset_frame(const Instrument &ins, uint8_t param) {
-  if (ins.slice_count > 0)
-    return slice_offset(ins, (int) param);
+  if (ins.slice_count > 0) {
+    const int k = offset_slice_index(param);
+    return k < 0 ? 0u : slice_offset(ins, k);
+  }
   return offset_fraction_frame(ins.length, param);
 }
 
@@ -3058,10 +3069,13 @@ player_row(Player *player, double sample_rate) {
         channel_trigger(m, ch, n.note, start, sample_rate);
         // Slice stop: the boundary after the one it started at. Past the table
         // `slice_offset` says 0, which is "plays on" -- the last slice runs out.
+        // `S00` is the whole sample and has no boundary to stop at.
         if ((effect == kFxSlice || effect == kFxOffset) && ch->instrument > 0) {
           const Instrument &ins = m->instruments[ch->instrument - 1];
-          if ((ins.flags & kInstrumentSliceStop) != 0u && ins.slice_count > 0)
-            ch->stop_frame = slice_offset(ins, (int) param + 1);
+          const int k = effect == kFxSlice ? (int) param : offset_slice_index(param);
+          if ((ins.flags & kInstrumentSliceStop) != 0u && ins.slice_count > 0 &&
+              k >= 0)
+            ch->stop_frame = slice_offset(ins, k + 1);
         }
       }
     }
@@ -4326,9 +4340,13 @@ note_fx_describe(uint8_t effect, uint8_t param, char *out, size_t cap) {
   // sees only the cell. `note_fx_describe_for` says the one that applies.
   if (effect == kFxOffset) {
     offset_fraction_text(&t, param);
-    text_add(&t, " (slice ");
-    text_int(&t, (long) param);
-    text_add(&t, " if sliced)");
+    if (param == 0) {
+      text_add(&t, " (the whole sample if sliced)");
+    } else {
+      text_add(&t, " (slice ");
+      text_int(&t, (long) offset_slice_index(param));
+      text_add(&t, " if sliced)");
+    }
     return t.len;
   }
 
@@ -4444,8 +4462,15 @@ note_fx_describe_for(const Instrument *ins, uint8_t effect, uint8_t param,
                      char *out, size_t cap) {
   if (effect != kFxOffset || ins == nullptr)
     return note_fx_describe(effect, param, out, cap);
-  if (ins->slice_count > 0)
-    return note_fx_describe(kFxSlice, param, out, cap);
+  if (ins->slice_count > 0) {
+    const int k = offset_slice_index(param);
+    if (k >= 0)
+      return note_fx_describe(kFxSlice, (uint8_t) k, out, cap);
+    TextOut w;
+    text_init(&w, out, cap);
+    text_add(&w, "Play the whole sample");
+    return w.len;
+  }
   TextOut t;
   text_init(&t, out, cap);
   offset_fraction_text(&t, param);

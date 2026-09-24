@@ -2185,12 +2185,16 @@ test_offset_command() {
     ins.length = 212952;
     CHECK(ntrk::offset_frame(ins, 0x80) == 106476u);
 
-    // Sliced, it is SLC -- the same frame, from the same function.
+    // Sliced, Renoise's numbering: S00 the whole sample from frame 0 -- the true
+    // top, not the first boundary -- and S01 slice 0, from `slice_offset`.
     const uint32_t frames[3] = {1u, 4097u, 9001u};
     set_slices(&ins, frames, 3);
-    CHECK(ntrk::offset_frame(ins, 2) == 9001u);
-    CHECK(ntrk::offset_frame(ins, 2) == ntrk::slice_offset(ins, 2));
-    CHECK(ntrk::offset_frame(ins, 0x80) == 0u);      // past the table: the top
+    CHECK(ntrk::offset_frame(ins, 0) == 0u);
+    CHECK(ntrk::offset_frame(ins, 1) == 1u);         // slice 0
+    CHECK(ntrk::offset_frame(ins, 3) == 9001u);      // slice 2
+    CHECK(ntrk::offset_frame(ins, 3) == ntrk::slice_offset(ins, 2));
+    CHECK(ntrk::offset_frame(ins, 4) == 0u);         // past the table: the top
+    CHECK(ntrk::offset_frame(ins, 0x80) == 0u);
   }
 
   // ---- through `player_row`: `S80` on a 20000-frame one-shot -----------------
@@ -2301,7 +2305,7 @@ test_offset_display() {
   char d[96];
   ntrk::note_fx_describe(ntrk::kFxOffset, 0x80u, d, sizeof d);
   CHECK(strstr(d, "8/16") != NULL);
-  CHECK(strstr(d, "slice 128") != NULL);
+  CHECK(strstr(d, "slice 127") != NULL);         // S80 is slice 0x7F
   ntrk::note_fx_describe(ntrk::kFxOffset, 0x00u, d, sizeof d);
   CHECK(strstr(d, "the top") != NULL);
   ntrk::note_fx_describe(ntrk::kFxOffset, 0x01u, d, sizeof d);
@@ -2317,8 +2321,10 @@ test_offset_display() {
   ntrk::Instrument sliced;
   sliced.length = 1024;
   set_slices(&sliced, fr, 2);
-  ntrk::note_fx_describe_for(&sliced, ntrk::kFxOffset, 0x01u, d, sizeof d);
-  CHECK(strcmp(d, "Play slice 1") == 0);
+  ntrk::note_fx_describe_for(&sliced, ntrk::kFxOffset, 0x02u, d, sizeof d);
+  CHECK(strcmp(d, "Play slice 1") == 0);           // S02 is slice 1
+  ntrk::note_fx_describe_for(&sliced, ntrk::kFxOffset, 0x00u, d, sizeof d);
+  CHECK(strcmp(d, "Play the whole sample") == 0);
   ntrk::note_fx_describe_for(nullptr, ntrk::kFxOffset, 0x80u, d, sizeof d);
   CHECK(strstr(d, "if sliced") != NULL);
   // Any other command is `note_fx_describe`'s sentence, instrument or not.
@@ -2395,9 +2401,12 @@ test_slice_stop() {
   // SLC 01 stops at boundary 2...
   CHECK(!plays_past(on, on_n, cell, ntrk::kFxSlice, 1u, &stop, 9000u));
   CHECK(stop == 9000u);
-  // ...and S on a sliced instrument is SLC, stop included.
-  CHECK(!plays_past(on, on_n, cell, ntrk::kFxOffset, 1u, &stop, 9000u));
+  // ...and S02 is slice 1 -- SLC 01 -- stop included.
+  CHECK(!plays_past(on, on_n, cell, ntrk::kFxOffset, 2u, &stop, 9000u));
   CHECK(stop == 9000u);
+  // S00 is the whole sample: no boundary to stop at.
+  CHECK(plays_past(on, on_n, cell, ntrk::kFxOffset, 0u, &stop, 9000u));
+  CHECK(stop == 0u);
   // The last slice has no next boundary: it runs out.
   CHECK(plays_past(on, on_n, cell, ntrk::kFxSlice, 2u, &stop, 12000u));
   CHECK(stop == 0u);
