@@ -1556,7 +1556,8 @@ test_v2_refusals() {
   CHECK(!ntrk::module_load(&m, g_bytes, g_size));   // no such instrument type
 
   build_v2(s);
-  g_bytes[v2_entry_at(s, 0) + 19] = 0x10u;
+  // 0x10 was the example until slice stop took it; 0x20 is still reserved.
+  g_bytes[v2_entry_at(s, 0) + 19] = 0x20u;
   CHECK(!ntrk::module_load(&m, g_bytes, g_size));   // reserved instrument flags
 
   build_v2(s);
@@ -2154,6 +2155,236 @@ test_slc_effect() {
   }
 }
 
+// Finds this file's EFXS directory entry: id, flags, then a size of two.
+static size_t
+efxs_entry(const uint8_t *b, size_t n) {
+  for (size_t i = 0; i + 12 <= n; ++i)
+    if (ntrk::read_u16(b + i) == ntrk::kBlockEfxs &&
+        ntrk::read_u32(b + i + 8) == (uint32_t) ntrk::kEfxsBytes)
+      return i;
+  return (size_t) -1;
+}
+
+static void
+test_offset_command() {
+  printf("S starts xx/256 of the way in, or at slice xx on a sliced sample\n");
+
+  // **Absolute anchors**, not a round trip: the fraction of a 1024-frame sample
+  // is a number anyone can check by hand.
+  {
+    ntrk::Instrument ins;
+    ins.length = 1024;
+    CHECK(ntrk::offset_frame(ins, 0x00) == 0u);
+    CHECK(ntrk::offset_frame(ins, 0x01) == 4u);
+    CHECK(ntrk::offset_frame(ins, 0x10) == 64u);     // a sixteenth
+    CHECK(ntrk::offset_frame(ins, 0x40) == 256u);
+    CHECK(ntrk::offset_frame(ins, 0x80) == 512u);
+    CHECK(ntrk::offset_frame(ins, 0xFF) == 1020u);   // never past the end
+    // Past `9FF`'s reach: half of a 212,952-frame sample is 106,476, where
+    // `9xx` stops at 65,280.
+    ins.length = 212952;
+    CHECK(ntrk::offset_frame(ins, 0x80) == 106476u);
+
+    // Sliced, it is SLC -- the same frame, from the same function.
+    const uint32_t frames[3] = {1u, 4097u, 9001u};
+    set_slices(&ins, frames, 3);
+    CHECK(ntrk::offset_frame(ins, 2) == 9001u);
+    CHECK(ntrk::offset_frame(ins, 2) == ntrk::slice_offset(ins, 2));
+    CHECK(ntrk::offset_frame(ins, 0x80) == 0u);      // past the table: the top
+  }
+
+  // ---- through `player_row`: `S80` on a 20000-frame one-shot -----------------
+  Spec s;
+  s.rows = 4;
+  s.sample_len = 20000;
+  s.loop_len = 0;
+  build(s, false);
+  const size_t c0 = cell_at(s, 0, 0);
+  g_bytes[c0 + 0] = 25u;
+  g_bytes[c0 + 1] = 1u;
+  g_bytes[c0 + 2] = ntrk::kFxOffset;
+  g_bytes[c0 + 3] = 0x80u;
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+  const double half = first_channel_pos(&m, 0, 0, 1);
+  {
+    // No memory: `ch->offset`, which `900` repeats, is untouched.
+    ntrk::Player p;
+    ntrk::player_start(&p, &m);
+    static double buf[200000];
+    const int n = (int) (ntrk::frames_per_tick(&p, 48000.0) * (double) m.speed);
+    for (int i = 0; i < n * 2; ++i) buf[i] = 0.0;
+    ntrk::render_add(&p, buf, n, 2, 48000.f);
+    CHECK(p.channels[0].offset == 0u);
+  }
+  // Negative control, and the difference that is the command: no `S`, the same
+  // render ends 10000 frames earlier.
+  g_bytes[c0 + 2] = 0u;
+  g_bytes[c0 + 3] = 0u;
+  ntrk::Module plain;
+  CHECK(ntrk::module_load(&plain, g_bytes, g_size));
+  const double top = first_channel_pos(&plain, 0, 0, 1);
+  CHECK(fabs((half - top) - 10000.0) < 1e-3);
+
+  // ---- EFXS: an older reader refuses rather than plays from the top ----------
+  g_bytes[c0 + 2] = ntrk::kFxOffset;
+  g_bytes[c0 + 3] = 0x40u;
+  ntrk::Module with;
+  CHECK(ntrk::module_load(&with, g_bytes, g_size));
+  size_t need = 0;
+  CHECK(ntrk::module_save(&with, g_saved, sizeof g_saved, &need));
+  size_t e = efxs_entry(g_saved, need);
+  CHECK(e != (size_t) -1);
+  CHECK(ntrk::read_u16(g_saved + e + 2) == ntrk::kBlockCritical);
+  CHECK(g_saved[ntrk::read_u32(g_saved + e + 4)] == ntrk::kFxOffset);
+  ntrk::Module back;
+  CHECK(ntrk::module_load(&back, g_saved, need));
+
+  static uint8_t probe[1 << 16];
+  // A reader that does not know EFXS: the same entry under an id it has never
+  // seen. Critical -> refused.
+  memcpy(probe, g_saved, need);
+  ntrk::write_u16(probe + e, 0x00FEu);
+  CHECK(!ntrk::module_load(&back, probe, need));
+  // ...the negative control: were the block optional, it would load and play
+  // the `S` note from frame 0 -- the silent failure the block exists to stop.
+  ntrk::write_u16(probe + e + 2, 0u);
+  CHECK(ntrk::module_load(&back, probe, need));
+  // A command newer than this reader plays, named by a later writer: refused.
+  memcpy(probe, g_saved, need);
+  probe[ntrk::read_u32(probe + e + 4)] = (uint8_t) (ntrk::kFxLast + 1);
+  CHECK(!ntrk::module_load(&back, probe, need));
+
+  // Only when used: without `S`, and with only `SLC`, no block.
+  g_bytes[c0 + 2] = ntrk::kFxSlice;
+  ntrk::Module slc;
+  CHECK(ntrk::module_load(&slc, g_bytes, g_size));
+  size_t need2 = 0;
+  CHECK(ntrk::module_save(&slc, g_saved, sizeof g_saved, &need2));
+  CHECK(efxs_entry(g_saved, need2) == (size_t) -1);
+  CHECK(need2 + 12u + (size_t) ntrk::kEfxsBytes == need);
+  // A junk byte past every command is not named: this writer does not know it,
+  // and naming it would write a file this reader refuses.
+  g_bytes[c0 + 2] = 0x7Fu;
+  ntrk::Module junk;
+  CHECK(ntrk::module_load(&junk, g_bytes, g_size));
+  CHECK(ntrk::module_save(&junk, g_saved, sizeof g_saved, &need2));
+  CHECK(efxs_entry(g_saved, need2) == (size_t) -1);
+  CHECK(ntrk::module_load(&back, g_saved, need2));
+}
+
+static void
+test_offset_display() {
+  printf("S names, describes and renders as itself, sixteenths as sixteenths\n");
+  char m[4];
+  ntrk::note_fx_mnemonic(ntrk::kFxOffset, 0x80u, m);
+  CHECK(strcmp(m, "OFS") == 0);
+  ntrk::note_fx_mnemonic(0x01u, 0x80u, m);
+  CHECK(strcmp(m, "PTU") == 0 || strcmp(m, "POU") == 0 || m[0] != 'O');  // not OFS
+
+  char r[16];
+  ntrk::note_fx_repr(ntrk::kFxOffset, 0x80u, r, sizeof r);
+  CHECK(strcmp(r, "S80") == 0);
+  ntrk::note_fx_repr(0x01u, 0x80u, r, sizeof r);
+  CHECK(strcmp(r, "180") == 0);         // portamento, which it would have masked to
+
+  char d[96];
+  ntrk::note_fx_describe(ntrk::kFxOffset, 0x80u, d, sizeof d);
+  CHECK(strstr(d, "8/16") != NULL);
+  CHECK(strstr(d, "slice 128") != NULL);
+  ntrk::note_fx_describe(ntrk::kFxOffset, 0x00u, d, sizeof d);
+  CHECK(strstr(d, "the top") != NULL);
+  ntrk::note_fx_describe(ntrk::kFxOffset, 0x01u, d, sizeof d);
+  CHECK(strstr(d, "1/256") != NULL);
+  CHECK(strstr(d, "ortamento") == NULL);
+
+  int count = 0;
+  const ntrk::CmdInfo *table = ntrk::note_fx_table(&count);
+  CHECK(count == 34);
+  CHECK(table[33].cmd == ntrk::kFxOffset);
+  CHECK(ntrk::note_fx_index(ntrk::kFxOffset, 0u) == 33);
+}
+
+// Where a render of one row leaves the SLC/S note on channel 0, and whether it
+// plays on through `probe` frames.
+static bool
+plays_past(const uint8_t *file, size_t n, size_t cell, uint8_t effect,
+           uint8_t param, uint32_t *stop, uint32_t probe) {
+  static uint8_t buf[1 << 16];
+  memcpy(buf, file, n);
+  buf[cell + 0] = 25u;
+  buf[cell + 1] = 1u;
+  buf[cell + 2] = effect;
+  buf[cell + 3] = param;
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, buf, n));
+  ntrk::Player p;
+  ntrk::player_start(&p, &m);
+  static double out[4096];
+  for (int i = 0; i < 4096; ++i) out[i] = 0.0;
+  ntrk::render_add(&p, out, 64, 2, 48000.f);   // row 0 triggers
+  ntrk::Channel *ch = &p.channels[0];
+  *stop = ch->stop_frame;
+  // Straight to just before the probe, then walk across it: the walker is the
+  // one place a voice decides it has ended.
+  ch->pos = (double) probe - 0.5;
+  for (int i = 0; i < 64 && ch->pos < (double) probe + 2.0; ++i)
+    ntrk::channel_sample(ch, m.instruments[0]);
+  return ch->playing;
+}
+
+static void
+test_slice_stop() {
+  printf("slice stop ends a slice at the next boundary; without it, plays on\n");
+  Spec s;
+  s.rows = 4;
+  s.sample_len = 20000;
+  s.loop_len = 0;
+  build(s, false);
+  ntrk::Module a;
+  CHECK(ntrk::module_load(&a, g_bytes, g_size));
+  const uint32_t frames[3] = {0u, 4000u, 9000u};
+  set_slices(&a.instruments[0], frames, 3);
+  // Absent without a table, Live with one -- an editor shows it only then.
+  CHECK(ntrk::instrument_param_state(&a.instruments[0],
+                                     (int) ntrk::InsParam::kSliceStop) ==
+        ntrk::ParamState::Live);
+  const size_t cell = cell_at(s, 0, 0);
+
+  size_t off_n = 0;
+  static uint8_t off[1 << 16];
+  CHECK(ntrk::module_save(&a, off, sizeof off, &off_n));
+
+  ntrk::instrument_param_set(&a.instruments[0], (int) ntrk::InsParam::kSliceStop, 1);
+  CHECK(ntrk::instrument_param_get(&a.instruments[0],
+                                   (int) ntrk::InsParam::kSliceStop) == 1);
+  size_t on_n = 0;
+  static uint8_t on[1 << 16];
+  CHECK(ntrk::module_save(&a, on, sizeof on, &on_n));
+
+  uint32_t stop = 0;
+  // SLC 01 stops at boundary 2...
+  CHECK(!plays_past(on, on_n, cell, ntrk::kFxSlice, 1u, &stop, 9000u));
+  CHECK(stop == 9000u);
+  // ...and S on a sliced instrument is SLC, stop included.
+  CHECK(!plays_past(on, on_n, cell, ntrk::kFxOffset, 1u, &stop, 9000u));
+  CHECK(stop == 9000u);
+  // The last slice has no next boundary: it runs out.
+  CHECK(plays_past(on, on_n, cell, ntrk::kFxSlice, 2u, &stop, 12000u));
+  CHECK(stop == 0u);
+  // A plain note ignores the flag.
+  CHECK(plays_past(on, on_n, cell, 0u, 0u, &stop, 9000u));
+  CHECK(stop == 0u);
+  // The negative control: the same SLC 01 without the flag plays on.
+  CHECK(plays_past(off, off_n, cell, ntrk::kFxSlice, 1u, &stop, 9000u));
+  CHECK(stop == 0u);
+
+  // An unsliced instrument has no row for it.
+  ntrk::Instrument bare;
+  CHECK(ntrk::instrument_param_state(&bare, (int) ntrk::InsParam::kSliceStop) ==
+        ntrk::ParamState::Absent);
+}
+
 static void
 test_slc_display() {
   printf("SLC names, describes and renders as itself, not as an arpeggio\n");
@@ -2186,7 +2417,7 @@ test_slc_display() {
   // The table is one longer, and the new row is the command it says it is.
   int count = 0;
   const ntrk::CmdInfo *table = ntrk::note_fx_table(&count);
-  CHECK(count == 33);
+  CHECK(count == 34);
   CHECK(table[32].cmd == ntrk::kFxSlice);
   CHECK(strcmp(table[32].mnemonic, "SLC") == 0);
   CHECK(ntrk::note_fx_index(ntrk::kFxSlice, 0u) == 32);
@@ -7022,6 +7253,9 @@ main(void) {
   test_slic_refusals();
   test_slc_effect();
   test_slc_display();
+  test_offset_command();
+  test_offset_display();
+  test_slice_stop();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

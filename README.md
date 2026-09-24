@@ -658,7 +658,9 @@ release in ms, `u8` sustain (0..64), `i8` transpose (-48..48), `u16` filter
 cutoff in Hz, `u8` filter resonance, `u8` built-in wave index. An imported `.mod`
 leaves everything from `type` on at zero, which is PCM8 with no envelope, no
 filter and no transpose — so every feature is a flag test rather than a test of
-what kind of module this is.
+what kind of module this is. Flags: `0x01` envelope, `0x02` filter, `0x0c` filter
+type, `0x10` slice stop (a note started at a slice stops at the next boundary);
+`0xe0` is reserved and refused.
 
 **The ADSR applies to a SYNTH instrument like any other**, because it lives one
 layer above the voice: `channel_gain_apply` runs it over whatever
@@ -692,6 +694,13 @@ through the same pitch law a transpose uses) and never touches the period, so
 `note_max`, arpeggio, portamento and glissando stay in note space. Written only
 when some tune is non-zero, and then critical: skipped, it would play every
 imported sample out of tune.
+
+**`0x000D` EFXS says which note commands past the nibble the patterns use**:
+`u8` the highest one, `u8` reserved zero. The loader does not bound a cell's
+effect byte, so a reader that predates a command would play every note carrying
+it from the top; written critical exactly when such a command (today `S`) is
+used, it makes that reader refuse the file instead. `SLC` needs none — SLIC
+already protects it.
 
 **MIXR carries what the effect plane cannot say.** Every level, pan, filter and
 slot *parameter* is an FXPL command and has always been saved as automation; a
@@ -839,6 +848,16 @@ And the extended set: `E1x`/`E2x` fine portamento, `E3x` glissando, `E4x`
 vibrato waveform, `E5x` finetune, `E6x` pattern loop, `E7x` tremolo waveform,
 `E8x` coarse panning, `E9x` retrigger, `EAx`/`EBx` fine volume slide, `ECx` note
 cut, `EDx` note delay, `EEx` pattern delay.
+
+Past the nibble, in the one-byte effect field and drawn with a letter so they
+cannot collide with a ProTracker digit:
+
+- `Gxx` (`0x10`, `SLC`) — start at slice `xx` of the instrument's SLIC table,
+  exact to the frame. No memory: `G00` is slice 0.
+- `Sxx` (`0x11`, `OFS`) — Renoise's sample offset: slice `xx` on a sliced
+  instrument, else `xx/256` of the way in, so every sixteenth is a round value
+  (`S40` a quarter, `S80` half). No memory. Unlike `9xx`, whose `xx × 256`
+  frames stop at 1.48 s at 44.1 kHz, it reaches the whole of any sample.
 
 **Not implemented**, and skipped rather than approximated — a tune that uses one
 plays without it, which is an audible gap rather than a wrong note:

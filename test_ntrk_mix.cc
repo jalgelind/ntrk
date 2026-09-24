@@ -3136,10 +3136,10 @@ test_command_enumeration() {
                                       mix::Lane::PlaneChannel,
                                       mix::Lane::PlaneMeta};
 
-  // Sixteen base effects, the sixteen `E` holds and `SLC` past the nibble; the
-  // mixer range, the player's two and this channel's insert; every global
-  // slot's eight parameters, set and slid.
-  CHECK(mix::command_count(mix::Lane::NoteEffect) == 33);
+  // Sixteen base effects, the sixteen `E` holds and `SLC` and `S` past the
+  // nibble; the mixer range, the player's two and this channel's insert; every
+  // global slot's eight parameters, set and slid.
+  CHECK(mix::command_count(mix::Lane::NoteEffect) == 34);
   CHECK(mix::command_count(mix::Lane::PlaneChannel) == 19 + 16);
   CHECK(mix::command_count(mix::Lane::PlaneMeta) == 80);
 
@@ -3231,11 +3231,12 @@ test_command_enumeration() {
   // **A byte a lane does not carry is refused**, which is how a cell is
   // validated as well as offered.
   mix::CommandInfo ci;
-  // 0x10 was a byte this lane did not carry until `SLC` took it, so the
-  // negative control moves up rather than being dropped: 0x11 is the next one
-  // past the nibble that nothing claims, and the point of the case is that a
-  // byte outside the set is refused rather than clamped into it.
-  CHECK(!mix::command_lookup(mix::Lane::NoteEffect, 0x11u, &g_mixer, &ci));
+  // `SLC` took 0x10 and `S` 0x11, so the negative control moves up rather than
+  // being dropped: 0x12 is the next one past the nibble that nothing claims,
+  // and the point of the case is that a byte outside the set is refused rather
+  // than clamped into it.
+  CHECK(!mix::command_lookup(mix::Lane::NoteEffect, 0x12u, &g_mixer, &ci));
+  CHECK(mix::command_lookup(mix::Lane::NoteEffect, 0x11u, &g_mixer, &ci));
   CHECK(!mix::command_lookup(mix::Lane::NoteEffect, 0xF0u, &g_mixer, &ci));
   // ...and `SLC` itself is carried, which is the other half of the same claim.
   CHECK(mix::command_lookup(mix::Lane::NoteEffect, 0x10u, &g_mixer, &ci));

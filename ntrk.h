@@ -134,6 +134,7 @@ enum class InsParam {
   kSynthVoice, kSynthTune, kSynthDecay, kSynthSweep, kSynthTone,
   kSynthNoise, kSynthNoiseDecay, kSynthDrive, kSynthCutoff, kSynthReso,
   kSynthEnvMod, kSynthAccent, kSynthDist, kSynthDistMix, kSynthWave,
+  kSliceStop,
   kCount
 };
 
@@ -258,6 +259,7 @@ instrument_param_table(int *count) {
       {"synth dist mix", ParamShape::Continuous, 0, 255, 0, nullptr, "synth"},
       {"synth wave", ParamShape::Choice, 0, kSynthWaveCount - 1,
        kSynthWaveCount, kSynthWaves, "synth"},
+      {"slice stop", ParamShape::Choice, 0, 1, 2, kOffOn, "slices"},
   };
   static_assert(sizeof(kTable) / sizeof(*kTable) == (size_t) InsParam::kCount,
                 "the table and InsParam are one list");
@@ -377,6 +379,11 @@ instrument_param_state(const Instrument *ins, int id) {
       return ParamState::Inert;
     return ParamState::Live;
   }
+  // A flag only a slice-started note reads: nothing to stop at without a table.
+  if (p == InsParam::kSliceStop)
+    return ins->slice_count > 0 && type != (uint8_t) InstrumentType::kSynth
+               ? ParamState::Live
+               : ParamState::Absent;
   if (p >= InsParam::kSynthVoice) {
     if (type != (uint8_t) InstrumentType::kSynth)
       return ParamState::Absent;
@@ -451,6 +458,8 @@ instrument_param_get(const Instrument *ins, int id) {
     case InsParam::kSynthDist:  return (int) ins->synth_dist;
     case InsParam::kSynthDistMix: return (int) ins->synth_dist_mix;
     case InsParam::kSynthWave:  return (int) ins->synth_wave;
+    case InsParam::kSliceStop:
+      return (ins->flags & kInstrumentSliceStop) != 0u ? 1 : 0;
     case InsParam::kCount:      break;
   }
   return 0;
@@ -571,6 +580,10 @@ instrument_param_set(Instrument *ins, int id, int value) {
     case InsParam::kSynthDist:  ins->synth_dist = (uint8_t) v; break;
     case InsParam::kSynthDistMix: ins->synth_dist_mix = (uint8_t) v; break;
     case InsParam::kSynthWave:  ins->synth_wave = (uint8_t) v; break;
+    case InsParam::kSliceStop:
+      ins->flags = (uint8_t) (v != 0 ? (ins->flags | kInstrumentSliceStop)
+                                     : (ins->flags & ~kInstrumentSliceStop));
+      break;
     case InsParam::kCount:      break;
   }
 }
@@ -832,7 +845,7 @@ const int kInstrumentBytes = 32;
 const int kDirectoryEntryBytes = 12;
 const int kMaxBlocks = 32;
 
-// Block ids. FXPL, NAME, SYNP, MACR, MIXR, TUNE, SLIC, SMUT and ITUN are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
+// Block ids. FXPL, NAME, SYNP, MACR, MIXR, TUNE, SLIC, SMUT, ITUN and EFXS are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
 // stays spent rather than reused so a file written against the older sketch
 // cannot be misread as something else. An id this reader does not know is
 // skipped when the file says it is optional and refused when it says it is
@@ -851,6 +864,13 @@ const uint16_t kBlockSmut = 0x000B;
 // at.
 const uint16_t kBlockItun = 0x000C;
 const int kMaxTune = 1024;                 // +-128 semitones, in eighths
+// EFXS: `u8` the highest note effect past the nibble the patterns use, `u8`
+// reserved zero. **The loader does not bound `Note::effect`**, so a reader that
+// predates a command would silently play every note carrying it from the top;
+// this block, written critical exactly when such a command is used, makes that
+// reader refuse the file instead. `SLC` needs none -- SLIC already protects it.
+const uint16_t kBlockEfxs = 0x000D;
+const int kEfxsBytes = 2;
 const uint16_t kBlockCritical = 0x0001;   // a directory entry's flags, bit 0
 
 // SMUT: `u16 order_count`, `u16 channels`, then one `u16 LE` per order position
@@ -893,6 +913,16 @@ const int kSlicOffsetBytes = 4;
 // `note_fx_describe` and `note_fx_repr` -- or `SLC 05` prints as `ARP`,
 // describes as *Arpeggio*, and renders as `005`, colliding with arpeggio.
 const uint8_t kFxSlice = 0x10;
+
+// `S` -- Renoise's sample offset. On an instrument with a SLIC table it is slice
+// `xx`, exactly `SLC`; on one without, it starts `xx/256` of the way in, so
+// every sixteenth is a round hex value (`S80` half, `S40` a quarter). **No
+// memory**, as `SLC`: a fraction means something on its own, and `S00` is the
+// top. Unlike `9xx`, whose `xx * 256` frames reach 1.48 s at 44.1 kHz, this
+// reaches every sample whatever its length. Written with EFXS (see there).
+const uint8_t kFxOffset = 0x11;
+// The highest note effect this reader plays. EFXS names one above it -> refused.
+const uint8_t kFxLast = kFxOffset;
 
 // The FXPL payload's geometry prefix: `u16 fx_columns`, `u16 meta_columns`,
 // then the cells. In the payload rather than in the header because the header
@@ -1114,6 +1144,13 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // than a second copy of the parse made here.
       synp = data + offset;
       synp_bytes = (size_t) bytes;
+    } else if (id == kBlockEfxs) {
+      // Needs nothing parsed below, so judged here: exact, reserved zero, and
+      // naming no command past the ones this reader plays -- that last is the
+      // block's whole purpose.
+      if (bytes != (uint32_t) kEfxsBytes || data[offset + 1] != 0u ||
+          data[offset] > kFxLast)
+        return false;
     } else if (id == kBlockItun) {
       // Judged against the instrument count, parsed below -- NAME's reason.
       itun = data + offset;
@@ -1276,8 +1313,8 @@ module_load(Module *module, const uint8_t *data, size_t size) {
     ins.filter_res = e[30];
     ins.wave_index = e[31];
 
-    if ((ins.flags & 0xf0u) != 0u)      // reserved, so they stay free to mean
-      return false;                     // something in a later version
+    if ((ins.flags & kInstrumentReserved) != 0u)   // free to mean something
+      return false;                                // in a later version
     // Every per-field bound, from the table `module_save` also walks. The
     // conditional ones come with it: a cutoff is checked only behind its bit, a
     // wave index only on a built-in shape, a loop only when there is one.
@@ -1544,6 +1581,17 @@ slice_offset(const Instrument &ins, int index) {
   return read_u32(ins.slices + (size_t) index * (size_t) kSlicOffsetBytes);
 }
 
+// Where `S xx` starts on `ins`: the SLC frame when it is sliced, else `xx/256`
+// of its length, rounded down. **One place for both halves**, so `S` on a
+// sliced instrument cannot drift from `SLC` -- it IS `slice_offset`. Always
+// inside the sample: `xx/256 < 1`.
+inline uint32_t
+offset_frame(const Instrument &ins, uint8_t param) {
+  if (ins.slice_count > 0)
+    return slice_offset(ins, (int) param);
+  return (uint32_t) (((uint64_t) ins.length * (uint64_t) param) >> 8);
+}
+
 // The mirror of module_load: the same blocks, in the same order, refusing
 // exactly what the loader refuses -- so a file this writes is a file that
 // loads, and `tests` checks that as a round trip rather than by reading both.
@@ -1637,7 +1685,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     // nothing behind it is a writer bug, not a file that has gone wrong.
     if (ins.length > 0 && ins.data == nullptr)
       return false;
-    if ((ins.flags & 0xf0u) != 0u)   // reserved, exactly as the loader has it
+    if ((ins.flags & kInstrumentReserved) != 0u)   // exactly as the loader has it
       return false;
     // **The same table the loader walks, so a file this writes is a file that
     // loads.** These were the loader's checks written out a second time, and a
@@ -1746,11 +1794,23 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     if (module->instruments[i].tune != 0)
       want_itun = true;
 
+  // Only when a note uses a command past `SLC` -- see `kBlockEfxs`. The highest
+  // one it names is the highest KNOWN one used: a byte past `kFxLast` is not a
+  // command this writer knows (it masks, as it always has), and naming it would
+  // write a file this reader then refuses.
+  uint8_t efxs_high = 0u;
+  for (size_t i = 0; i < cells; ++i) {
+    const uint8_t e = module->patterns[i].effect;
+    if (e > kFxSlice && e <= kFxLast && e > efxs_high)
+      efxs_high = e;
+  }
+  const bool want_efxs = efxs_high != 0u;
+
   const int block_count = (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
                           (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
                           (want_macr ? 1 : 0) + (want_mixr ? 1 : 0) +
                           (want_slic ? 1 : 0) + (want_smut ? 1 : 0) +
-                          (want_itun ? 1 : 0);
+                          (want_itun ? 1 : 0) + (want_efxs ? 1 : 0);
   const size_t directory_bytes =
       (size_t) block_count * (size_t) kDirectoryEntryBytes;
   // Lanes rather than channels, and the four-byte prefix that says how many.
@@ -1790,10 +1850,12 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
                 : 0u;
   const size_t itun_bytes =
       want_itun ? (size_t) module->instrument_count * 2u : 0u;
+  const size_t efxs_bytes = want_efxs ? (size_t) kEfxsBytes : 0u;
   const size_t total = (size_t) kHeaderBytes + order_bytes + instrument_bytes +
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
                        tune_bytes + name_bytes + synp_bytes + macr_bytes +
-                       mixr_bytes + slic_bytes + smut_bytes + itun_bytes;
+                       mixr_bytes + slic_bytes + smut_bytes + itun_bytes +
+                       efxs_bytes;
 
   *written = total;
   if (out == nullptr)
@@ -1933,6 +1995,18 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     write_u16(out + at + 4, (uint16_t) module->swing);
     write_u16(out + at + 6, 0u);
     at += (size_t) kTuneBytes;
+  }
+
+  if (want_efxs) {
+    // **Critical, always**: its only job is to make an older reader refuse.
+    write_u16(out + entry + 0, kBlockEfxs);
+    write_u16(out + entry + 2, (uint16_t) kBlockCritical);
+    write_u32(out + entry + 4, (uint32_t) at);
+    write_u32(out + entry + 8, (uint32_t) efxs_bytes);
+    entry += (size_t) kDirectoryEntryBytes;
+    out[at + 0] = efxs_high;
+    out[at + 1] = 0u;
+    at += (size_t) kEfxsBytes;
   }
 
   if (want_itun) {
@@ -2663,6 +2737,7 @@ channel_trigger(const Module *m, Channel *ch, int note, double start_frame,
   // taking a frame keeps both facts here, where taking a slice INDEX would need
   // a second position computation and a second copy of that check.
   ch->pos = start_frame;
+  ch->stop_frame = 0u;
 
   // Bit 2 of the waveform selector means the wave keeps running across a new
   // note instead of restarting, which is the difference between a vibrato that
@@ -2966,8 +3041,20 @@ player_row(Player *player, double sample_rate) {
           // at all. This fails audibly rather than inaudibly.
           start = (double) slice_offset(m->instruments[ch->instrument - 1],
                                         (int) param);
+        } else if (effect == kFxOffset && ch->instrument > 0) {
+          // `SLC`'s rules -- no memory, `ch->offset` untouched -- over a
+          // fraction when the instrument has no table. See `kFxOffset`.
+          start = (double) offset_frame(m->instruments[ch->instrument - 1],
+                                        param);
         }
         channel_trigger(m, ch, n.note, start, sample_rate);
+        // Slice stop: the boundary after the one it started at. Past the table
+        // `slice_offset` says 0, which is "plays on" -- the last slice runs out.
+        if ((effect == kFxSlice || effect == kFxOffset) && ch->instrument > 0) {
+          const Instrument &ins = m->instruments[ch->instrument - 1];
+          if ((ins.flags & kInstrumentSliceStop) != 0u && ins.slice_count > 0)
+            ch->stop_frame = slice_offset(ins, (int) param + 1);
+        }
       }
     }
 
@@ -3490,7 +3577,11 @@ channel_sample(Channel *ch, const Instrument &ins) {
     return 0.f;
 
   const uint32_t index = (uint32_t) ch->pos;
-  if (index >= ins.length) {
+  // ponytail: slice stop is a hard stop at the boundary, as a one-shot's end
+  // is. A click on a boundary placed mid-waveform is the ceiling; the upgrade
+  // is a few-ms fade before `stop_frame`.
+  if (index >= ins.length ||
+      (ch->stop_frame != 0u && index >= ch->stop_frame)) {
     ch->playing = false;
     return 0.f;
   }
@@ -3911,6 +4002,8 @@ note_fx_repr(uint8_t effect, uint8_t param, char *out, size_t cap) {
   text_init(&t, out, cap);
   if (effect == kFxSlice)
     text_char(&t, 'G');
+  else if (effect == kFxOffset)
+    text_char(&t, 'S');                  // Renoise's letter for it
   else
     text_hex(&t, effect & 15u, 1);
   text_hex(&t, param, 2);
@@ -4092,7 +4185,7 @@ note_fx_table(int *count) {
       "sine", "ramp", "square", "random",
       "sine, no retrigger", "ramp, no retrigger",
       "square, no retrigger", "random, no retrigger"};
-  static const CmdInfo kTable[33] = {
+  static const CmdInfo kTable[34] = {
       {0x00, "ARP", "Arpeggio", ParamShape::SplitNibble, 0, nullptr},
       {0x01, "PTU", "Portamento up", ParamShape::Continuous, 0, nullptr},
       {0x02, "PTD", "Portamento down", ParamShape::Continuous, 0, nullptr},
@@ -4130,9 +4223,10 @@ note_fx_table(int *count) {
       {0xEF, "IVL", "Invert loop (no-op)", ParamShape::Unused, 0, nullptr},
       // Past the nibble. See `kFxSlice`.
       {0x10, "SLC", "Play slice", ParamShape::Continuous, 0, nullptr},
+      {0x11, "OFS", "Sample offset", ParamShape::Continuous, 0, nullptr},
   };
   if (count != nullptr)
-    *count = 33;
+    *count = 34;
   return kTable;
 }
 
@@ -4153,6 +4247,8 @@ inline int
 note_fx_index(uint8_t effect, uint8_t param) {
   if (effect == kFxSlice)
     return 32;
+  if (effect == kFxOffset)
+    return 33;
   return (effect & 15u) == 0xEu ? 16 + (int) ((param >> 4) & 15u)
                                 : (int) (effect & 15u);
 }
@@ -4200,6 +4296,25 @@ note_fx_describe(uint8_t effect, uint8_t param, char *out, size_t cap) {
   if (effect == kFxSlice) {
     text_add(&t, "Play slice ");
     text_int(&t, (long) param);
+    return t.len;
+  }
+  // **Both readings**, because which one applies is the instrument's and this
+  // sees only the cell. A sixteenth is said as one -- the reason 256 is the
+  // divisor.
+  if (effect == kFxOffset) {
+    text_add(&t, "Start at ");
+    if (param == 0) {
+      text_add(&t, "the top");
+    } else if ((param & 15u) == 0u) {
+      text_int(&t, (long) (param >> 4));
+      text_add(&t, "/16");
+    } else {
+      text_int(&t, (long) param);
+      text_add(&t, "/256");
+    }
+    text_add(&t, " (slice ");
+    text_int(&t, (long) param);
+    text_add(&t, " if sliced)");
     return t.len;
   }
 

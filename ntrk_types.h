@@ -218,11 +218,16 @@ enum class InstrumentType : uint8_t {
   kSynth = 4,
 };
 
-// Instrument `flags`, bit 0 upward. The top nibble is reserved and a file that
-// sets any of it is refused, so those bits stay free to mean something.
+// Instrument `flags`, bit 0 upward. The bits in `kInstrumentReserved` are
+// refused by the loader and the writer, so they stay free to mean something --
+// and a reader older than a bit refuses a file that sets it.
 const uint8_t kInstrumentEnvelope = 0x01;
 const uint8_t kInstrumentFilter = 0x02;
 const uint8_t kInstrumentFilterType = 0x0c;
+// Renoise's slice stop: a note started at a slice (`SLC`, or `S` on a sliced
+// instrument) stops at the next boundary instead of playing on through it.
+const uint8_t kInstrumentSliceStop = 0x10;
+const uint8_t kInstrumentReserved = 0xe0;
 
 // Where a channel's volume envelope has got to. **`EnvStage::kOff` is the
 // absence of a stage rather than one of them**: an instrument with the envelope
@@ -747,6 +752,9 @@ struct Channel {
   double target_period = 0.0;  // where tone portamento is heading
   float volume = 0.f;        // 0..64
   double pos = 0.0;          // sample position, frames
+  // Where a slice-started note stops (slice stop); 0 plays on. Set after the
+  // trigger, which clears it, so every other way a note starts plays on.
+  uint32_t stop_frame = 0;
   double step = 0.0;         // frames per output frame
   bool playing = false;
 
