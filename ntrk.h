@@ -1586,11 +1586,18 @@ slice_offset(const Instrument &ins, int index) {
 // of its length, rounded down. **One place for both halves**, so `S` on a
 // sliced instrument cannot drift from `SLC` -- it IS `slice_offset`. Always
 // inside the sample: `xx/256 < 1`.
+// The fraction alone: `xx/256` of `length` frames, rounded down. An editor's
+// snap asks this, so a boundary snapped to an `S` tick is the frame `S` plays.
+inline uint32_t
+offset_fraction_frame(uint32_t length, uint8_t param) {
+  return (uint32_t) (((uint64_t) length * (uint64_t) param) >> 8);
+}
+
 inline uint32_t
 offset_frame(const Instrument &ins, uint8_t param) {
   if (ins.slice_count > 0)
     return slice_offset(ins, (int) param);
-  return (uint32_t) (((uint64_t) ins.length * (uint64_t) param) >> 8);
+  return offset_fraction_frame(ins.length, param);
 }
 
 // The mirror of module_load: the same blocks, in the same order, refusing
