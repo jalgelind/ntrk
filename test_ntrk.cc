@@ -2423,6 +2423,263 @@ test_slice_stop() {
         ntrk::ParamState::Absent);
 }
 
+// One tick at a time, straight through `player_tick` -- the state after each is exactly what
+// the command left, with no render in between to smear it.
+static void
+ticks(ntrk::Player *p, int n) {
+  for (int i = 0; i < n; ++i)
+    ntrk::player_tick(p, 48000.0);
+}
+
+// A fresh module from `s` and the cells already set, started.
+static void
+start_on(ntrk::Module *m, ntrk::Player *p) {
+  CHECK(ntrk::module_load(m, g_bytes, g_size));
+  ntrk::player_start(p, m);
+}
+
+static bool
+on_a_semitone(double period) {
+  for (int n = ntrk::kMinNote; n <= 36; ++n)
+    if (fabs(period - (double) ntrk::period_for(n, 0)) < 1e-9)
+      return true;
+  return false;
+}
+
+static void
+test_protracker_commands() {
+  printf("every ProTracker command does what it says, tick by tick\n");
+  const double p25 = (double) ntrk::period_for(25, 0);
+  Spec s;
+  s.rows = 16;
+  s.orders = 4;
+  s.sample_len = 4096;
+  s.loop_len = 4096;
+
+  // 1xx / 2xx: nothing on tick 0, the speed on every later tick, and 0 repeats it.
+  {
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0x1, 0x02);
+    set_cell(s, 1, 0, 0u, 0u, 0x1, 0x00);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    ticks(&p, 1);
+    CHECK(p.channels[0].period == p25);
+    ticks(&p, 5);
+    CHECK(p.channels[0].period == p25 - 10.0);            // 5 ticks x 2
+    ticks(&p, 6);
+    CHECK(p.channels[0].period == p25 - 20.0);            // 100: the memory
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0x2, 0x03);
+    start_on(&m, &p);
+    ticks(&p, 6);
+    CHECK(p.channels[0].period == p25 + 15.0);
+  }
+  // E1x / E2x: once, on tick 0, and not again.
+  {
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xE, 0x13);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    ticks(&p, 1);
+    CHECK(p.channels[0].period == p25 - 3.0);
+    ticks(&p, 5);
+    CHECK(p.channels[0].period == p25 - 3.0);
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xE, 0x24);
+    start_on(&m, &p);
+    ticks(&p, 6);
+    CHECK(p.channels[0].period == p25 + 4.0);
+  }
+  // Cxx: the level, clamped at 64.
+  {
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xC, 0x20);
+    set_cell(s, 1, 0, 0u, 0u, 0xC, 0x50);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    ticks(&p, 1);
+    CHECK(p.channels[0].volume == 32.f);
+    ticks(&p, 6);
+    CHECK(p.channels[0].volume == 64.f);
+  }
+  // 5xy / 6xy: the volume slide half, on every tick after 0, beside the other effect.
+  // EBx: once, down.
+  {
+    const uint8_t both[2] = {0x5, 0x6};
+    for (uint8_t fx : both) {
+      build(s, false);
+      set_cell(s, 0, 0, 25u, 1u, 0xC, 0x20);
+      set_cell(s, 1, 0, 0u, 0u, fx, 0x20);                // up 2 a tick
+      ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+      ticks(&p, 12);
+      CHECK(p.channels[0].volume == 42.f);                // 32 + 5 x 2
+    }
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xC, 0x20);
+    set_cell(s, 1, 0, 0u, 0u, 0xE, 0xB4);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    ticks(&p, 7);
+    CHECK(p.channels[0].volume == 28.f);
+    ticks(&p, 5);
+    CHECK(p.channels[0].volume == 28.f);                  // once
+  }
+  // 4xy vibrato: moves the period about the note, never the note itself, within its depth.
+  // E4x picks the shape: a square swings a single distance, a sine several.
+  {
+    const auto distances = [&](uint8_t wave) {
+      build(s, false);
+      set_cell(s, 0, 0, 25u, 1u, 0xE, (uint8_t) (0x40 | wave));
+      set_cell(s, 1, 0, 0u, 0u, 0x4, 0x48);
+      ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+      ticks(&p, 6);
+      double seen[8];
+      int n = 0;
+      bool moved = false;
+      for (int t = 0; t < 6; ++t) {
+        ticks(&p, 1);
+        const double d = fabs(p.channels[0].period - p.channels[0].base_period);
+        CHECK(p.channels[0].base_period == p25);
+        CHECK(d <= 16.0);                                   // 255 x 8 / 128
+        if (d > 0.0) moved = true;
+        if (t == 0) continue;                               // tick 0 does not vibrate
+        bool dup = false;
+        for (int i = 0; i < n; ++i) if (seen[i] == d) dup = true;
+        if (!dup) seen[n++] = d;
+      }
+      CHECK(moved);
+      return n;
+    };
+    CHECK(distances(2) == 1);                               // square
+    CHECK(distances(0) > 1);                                // sine
+  }
+  // E7x: the same choice for tremolo.
+  {
+    const auto distances = [&](uint8_t wave) {
+      build(s, false);
+      set_cell(s, 0, 0, 25u, 1u, 0xE, (uint8_t) (0x70 | wave));
+      set_cell(s, 1, 0, 0u, 0u, 0x7, 0x48);
+      ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+      ticks(&p, 7);
+      float seen[8];
+      int n = 0;
+      for (int t = 0; t < 5; ++t) {
+        ticks(&p, 1);
+        const float d = fabsf(p.channels[0].trem_offset);
+        bool dup = false;
+        for (int i = 0; i < n; ++i) if (seen[i] == d) dup = true;
+        if (!dup) seen[n++] = d;
+      }
+      return n;
+    };
+    CHECK(distances(2) == 1);
+    CHECK(distances(0) > 1);
+  }
+  // E5x: the note starts at that finetune's period.
+  {
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xE, 0x57);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    ticks(&p, 1);
+    CHECK(p.channels[0].period == (double) ntrk::period_for(25, 7));
+    CHECK(p.channels[0].period != p25);
+  }
+  // E3x: glissando rounds a tone portamento's sounding period to whole semitones.
+  {
+    const auto always_on_a_note = [&](bool gliss) {
+      build(s, false);
+      set_cell(s, 0, 0, 13u, 1u, 0xE, gliss ? 0x31 : 0x30);
+      set_cell(s, 1, 0, 25u, 0u, 0x3, 0x10);
+      ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+      ticks(&p, 6);
+      bool all = true;
+      for (int t = 0; t < 6; ++t) {
+        ticks(&p, 1);
+        if (!on_a_semitone(p.channels[0].period)) all = false;
+      }
+      return all;
+    };
+    CHECK(always_on_a_note(true));
+    CHECK(!always_on_a_note(false));                        // the control
+  }
+  // E9x: retrigger every x ticks -- the position goes back to the top then, and not between.
+  {
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xE, 0x93);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    ticks(&p, 1);
+    p.channels[0].pos = 100.0;
+    ticks(&p, 2);                                           // ticks 1, 2
+    CHECK(p.channels[0].pos == 100.0);
+    ticks(&p, 1);                                           // tick 3
+    CHECK(p.channels[0].pos == 0.0);
+  }
+  // Bxx, Dxx: where the next row comes from. Dxx's parameter is DECIMAL.
+  {
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xB, 0x02);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    ticks(&p, 6);
+    CHECK(p.order == 2);
+    CHECK(p.row == 0);
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xD, 0x12);
+    start_on(&m, &p);
+    ticks(&p, 6);
+    CHECK(p.order == 1);
+    CHECK(p.row == 12);                                     // 0x12 is row twelve
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xD, 0x20);                 // past the pattern: its top
+    start_on(&m, &p);
+    ticks(&p, 6);
+    CHECK(p.order == 1);
+    CHECK(p.row == 0);
+  }
+  // Fxx: under 32 the speed, from 32 the tempo, and 0 changes nothing.
+  {
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xF, 0x03);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    ticks(&p, 3);
+    CHECK(p.row == 1);                                      // the row lasted three ticks
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xF, 0x80);
+    start_on(&m, &p);
+    ticks(&p, 1);
+    CHECK(p.bpm == 128);
+    CHECK(p.speed == 6);
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xF, 0x00);
+    start_on(&m, &p);
+    ticks(&p, 1);
+    CHECK(p.speed == 6);
+    CHECK(p.bpm == 125);
+  }
+  // E6x: E60 marks the row, E6x plays back to it x more times.
+  {
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0, 0);
+    set_cell(s, 1, 0, 0u, 0u, 0xE, 0x60);
+    set_cell(s, 3, 0, 0u, 0u, 0xE, 0x62);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    int rows[12];
+    for (int i = 0; i < 12; ++i) {
+      rows[i] = p.row;
+      ticks(&p, 6);
+    }
+    const int want[12] = {0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 4, 5};
+    for (int i = 0; i < 12; ++i)
+      CHECK(rows[i] == want[i]);
+  }
+  // EEx: the row lasts x more rows' worth of ticks.
+  {
+    build(s, false);
+    set_cell(s, 0, 0, 25u, 1u, 0xE, 0xE2);
+    ntrk::Module m; ntrk::Player p; start_on(&m, &p);
+    ticks(&p, 17);
+    CHECK(p.row == 0);
+    ticks(&p, 1);
+    CHECK(p.row == 1);                                      // 6 x (1 + 2) = 18
+  }
+}
+
 static void
 test_slc_display() {
   printf("SLC names, describes and renders as itself, not as an arpeggio\n");
@@ -7294,6 +7551,7 @@ main(void) {
   test_offset_command();
   test_offset_display();
   test_slice_stop();
+  test_protracker_commands();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
