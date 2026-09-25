@@ -379,6 +379,13 @@ instrument_param_state(const Instrument *ins, int id) {
       return ParamState::Inert;
     return ParamState::Live;
   }
+  // The envelope's four stages with the envelope off: stored and round-tripped, read by
+  // nothing until the bit is set -- Inert exactly, as a synth's unread bytes are. (The cutoff
+  // is Absent instead because it is not even range-checked behind its bit; these are.)
+  if ((p == InsParam::kAttackMs || p == InsParam::kDecayMs || p == InsParam::kSustain ||
+       p == InsParam::kReleaseMs) &&
+      (ins->flags & kInstrumentEnvelope) == 0u)
+    return ParamState::Inert;
   // A flag only a slice-started note reads: nothing to stop at without a table.
   if (p == InsParam::kSliceStop)
     return ins->slice_count > 0 && type != (uint8_t) InstrumentType::kSynth

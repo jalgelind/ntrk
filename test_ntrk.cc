@@ -2682,6 +2682,23 @@ test_protracker_commands() {
 
 
 static void
+test_envelope_inert_while_off() {
+  printf("the envelope's stages are Inert while it is off, Live once it is on\n");
+  ntrk::Instrument ins;
+  ins.type = (uint8_t) ntrk::InstrumentType::kPcm8;
+  const int stages[4] = {(int) ntrk::InsParam::kAttackMs, (int) ntrk::InsParam::kDecayMs,
+                         (int) ntrk::InsParam::kSustain, (int) ntrk::InsParam::kReleaseMs};
+  for (int id : stages)
+    CHECK(ntrk::instrument_param_state(&ins, id) == ntrk::ParamState::Inert);
+  // The switch itself is always Live -- it is how the stages come back.
+  CHECK(ntrk::instrument_param_state(&ins, (int) ntrk::InsParam::kEnvelope) ==
+        ntrk::ParamState::Live);
+  ntrk::instrument_param_set(&ins, (int) ntrk::InsParam::kEnvelope, 1);
+  for (int id : stages)
+    CHECK(ntrk::instrument_param_state(&ins, id) == ntrk::ParamState::Live);
+}
+
+static void
 test_slc_display() {
   printf("SLC names, describes and renders as itself, not as an arpeggio\n");
 
@@ -7588,6 +7605,7 @@ main(void) {
   test_slice_stop();
   test_protracker_commands();
   test_synth_voice_defaults();
+  test_envelope_inert_while_off();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
