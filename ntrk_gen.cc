@@ -171,16 +171,9 @@ build_instruments(ntrk::Module *m) {
   ntrk::Instrument *bass = &m->instruments[kInsBass - 1];
   bass->type = (uint8_t) ntrk::InstrumentType::kSynth;
   bass->volume = 52;
-  bass->synth_voice = (uint8_t) ntrk::SynthVoice::kBass;
-  bass->synth_cutoff = 60;
-  bass->synth_reso = 205;
-  bass->synth_env_mod = 160;
-  bass->synth_decay = 90;
-  bass->synth_accent = 200;     // depth: what the plane's 0x30 scales
-  bass->synth_drive = 70;
-  bass->synth_dist = 2;         // tape, so the shaper is not the default kind
-  bass->synth_dist_mix = 110;
-  bass->synth_wave = 0;         // saw
+  // The voice's own defaults: accent 200 is the depth the plane's 0x30 scales, and the
+  // shaper is tape, so it is not the default kind.
+  ntrk::synth_voice_defaults(bass, ntrk::SynthVoice::kBass);
   // The gate: a synth voice takes the instrument ADSR like any other, and this
   // is the shape a 303 line uses it in — no attack, no decay, full sustain, so
   // a held note is untouched and only a `^^^` changes anything.
@@ -194,22 +187,12 @@ build_instruments(ntrk::Module *m) {
   ntrk::Instrument *kick = &m->instruments[kInsKick - 1];
   kick->type = (uint8_t) ntrk::InstrumentType::kSynth;
   kick->volume = 56;
-  kick->synth_voice = (uint8_t) ntrk::SynthVoice::kKick;
-  kick->synth_tune = 110;
-  kick->synth_decay = 170;
-  kick->synth_sweep = 120;
-  kick->synth_tone = 100;
-  kick->synth_noise = 25;
-  kick->synth_noise_decay = 25;
-  kick->synth_drive = 70;
+  ntrk::synth_voice_defaults(kick, ntrk::SynthVoice::kKick);
 
   ntrk::Instrument *hat = &m->instruments[kInsHat - 1];
   hat->type = (uint8_t) ntrk::InstrumentType::kSynth;
   hat->volume = 30;
-  hat->synth_voice = (uint8_t) ntrk::SynthVoice::kHihat;
-  hat->synth_tone = 140;
-  hat->synth_noise_decay = 30;
-  hat->synth_drive = 40;
+  ntrk::synth_voice_defaults(hat, ntrk::SynthVoice::kHihat);
 
   // 4 — a built-in wavetable with a volume envelope. The cycle is regenerated
   // at load and stores nothing in the blob, which is its own path through both

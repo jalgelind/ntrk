@@ -193,6 +193,46 @@ const SynthVoiceSpec kSynthVoiceSpecs[kSynthDrumCount] = {
     {   0.f, 1100.f, 0.50f, 0.000f, 0.000f, 0.030f, 0.400f, 0u, 3u },  // clap
 };
 
+// Where a voice's own bytes start: audible, and each voice's character rather than a knob at
+// zero. **One writer**: an editor that switches an instrument to a voice seeds it here, and
+// the demo tune (`ntrk_gen.cc`) builds its voices from it -- so a fresh kick and the demo's
+// kick are the same drum. Every synth byte is set, the ones this voice does not read to zero,
+// so nothing of the previous voice is left reading as this one's.
+inline void
+synth_voice_defaults(Instrument *ins, SynthVoice voice) {
+  if (ins == nullptr)
+    return;
+  ins->synth_voice = (uint8_t) voice;
+  ins->synth_tune = 0; ins->synth_decay = 0; ins->synth_sweep = 0; ins->synth_tone = 0;
+  ins->synth_noise = 0; ins->synth_noise_decay = 0; ins->synth_drive = 0;
+  ins->synth_cutoff = 0; ins->synth_reso = 0; ins->synth_env_mod = 0; ins->synth_accent = 0;
+  ins->synth_dist = 0; ins->synth_dist_mix = 0; ins->synth_wave = 0;
+  switch (voice) {
+    case SynthVoice::kKick:
+      ins->synth_tune = 110; ins->synth_decay = 170; ins->synth_sweep = 120;
+      ins->synth_tone = 100; ins->synth_noise = 25; ins->synth_noise_decay = 25;
+      ins->synth_drive = 70;
+      break;
+    case SynthVoice::kSnare:
+      ins->synth_tune = 128; ins->synth_decay = 90; ins->synth_sweep = 60;
+      ins->synth_tone = 140; ins->synth_noise = 150; ins->synth_noise_decay = 70;
+      ins->synth_drive = 40;
+      break;
+    case SynthVoice::kHihat:
+      ins->synth_tone = 140; ins->synth_noise_decay = 30; ins->synth_drive = 40;
+      break;
+    case SynthVoice::kClap:
+      ins->synth_tone = 128; ins->synth_noise_decay = 50; ins->synth_drive = 40;
+      break;
+    case SynthVoice::kBass:
+      // Enough resonance and env mod that the ladder is doing the work, and tape on the end.
+      ins->synth_cutoff = 60; ins->synth_reso = 205; ins->synth_env_mod = 160;
+      ins->synth_decay = 90; ins->synth_accent = 200; ins->synth_drive = 70;
+      ins->synth_dist = 2; ins->synth_dist_mix = 110; ins->synth_wave = 0;
+      break;
+  }
+}
+
 // A one-pole decay coefficient for a time constant in seconds. **Exponential by
 // iteration rather than by `exp`**: this header has no libm, and a repeated
 // multiply is exactly an exponential. The ceiling keeps the pole strictly

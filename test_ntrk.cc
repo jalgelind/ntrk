@@ -2680,6 +2680,7 @@ test_protracker_commands() {
   }
 }
 
+
 static void
 test_slc_display() {
   printf("SLC names, describes and renders as itself, not as an arpeggio\n");
@@ -3794,6 +3795,40 @@ test_synth_refusals() {
   put_u32(syn_dir_at() + 16, (uint32_t) syn_synp_at());
   put_u32(syn_dir_at() + 20, (uint32_t) (kSynSynths * (int) kSynRecordBytes));
   CHECK(!ntrk::module_load(&m, g_bytes, g_size));
+}
+
+static void
+test_synth_voice_defaults() {
+  printf("a voice's defaults sound at once, and set every synth byte\n");
+  for (int v = 0; v < 5; ++v) {
+    syn_defaults();
+    SpecSyn s;
+    s.note_instrument = 1;
+    build_syn(s);
+    ntrk::Module m;
+    CHECK(ntrk::module_load(&m, g_bytes, g_size));
+    ntrk::Instrument &ins = m.instruments[0];
+    ins.synth_cutoff = 99;                    // a stray byte from some previous voice
+    ntrk::synth_voice_defaults(&ins, (ntrk::SynthVoice) v);
+    CHECK(ins.synth_voice == (uint8_t) v);
+    if (v != (int) ntrk::SynthVoice::kBass)
+      CHECK(ins.synth_cutoff == 0u);          // not this voice's: cleared, never carried
+    ntrk::Player p;
+    ntrk::player_start(&p, &m);
+    render_at(&p, 4000, kSynRate);
+    CHECK(all_finite(4000));
+    CHECK(peak_between(0, 4000) > 0.02);      // audible within the first 90 ms
+  }
+  // The negative control: the same kick with every byte at zero, which is what a type switch
+  // left before -- still the path the test takes, so the check above is not vacuous.
+  syn_defaults();
+  SpecSyn s;
+  build_syn(s);
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+  ntrk::synth_voice_defaults(&m.instruments[0], ntrk::SynthVoice::kKick);
+  CHECK(m.instruments[0].synth_tune == 110u);
+  CHECK(m.instruments[0].synth_decay == 170u);
 }
 
 static void
@@ -7552,6 +7587,7 @@ main(void) {
   test_offset_display();
   test_slice_stop();
   test_protracker_commands();
+  test_synth_voice_defaults();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
