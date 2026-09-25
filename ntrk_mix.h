@@ -764,6 +764,17 @@ void config_set_width(uint8_t *block, float v);
 // The only default that depends on where a slot sits rather than on what is in it.
 float fx_param_default(FxKind kind, int param, bool wet);
 
+// A slot parameter's value in its own units, for an editor: a delay time and a predelay in
+// ms, a filter cutoff in Hz (or `off` at 0), a choice by its name, a reverb's decay, LF
+// damping and diffusion `auto` at 0 (which is what `slot_apply_params` does with a zero),
+// everything else a percentage. **Here and not in an editor**, because the scaling constants
+// live here -- a copy of `kSlotDelayMaxSeconds` in an app is the one that goes stale.
+size_t fx_param_value_text(FxKind kind, int param, float v, char *out, size_t cap);
+
+// A linear gain -- a send, a return, the master -- in dB, one decimal: `0.0 dB` at unity,
+// `-inf dB` at zero.
+size_t level_text(float gain, char *out, size_t cap);
+
 // How many values a parameter really has, or 0 when it is continuous.
 //
 // **Three of them are not knobs.** A shaper's Kind picks one of four curves, a filter's Mode

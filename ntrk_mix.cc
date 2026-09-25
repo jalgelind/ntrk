@@ -1648,6 +1648,75 @@ fx_param_choice_name(FxKind kind, int param, int i) {
   return offOn[i];
 }
 
+// One decimal, signed where negative -- text_fixed2's sibling for dB.
+static void
+text_fixed1(TextOut *t, double v) {
+  long tenths = (long) std::lround(v * 10.0);
+  if (tenths < 0) {
+    text_char(t, '-');
+    tenths = -tenths;
+  }
+  text_int(t, tenths / 10);
+  text_char(t, '.');
+  text_char(t, (char) ('0' + (int) (tenths % 10)));
+}
+
+size_t
+fx_param_value_text(FxKind kind, int param, float v, char *out, size_t cap) {
+  TextOut t;
+  text_init(&t, out, cap);
+  const int n = fx_param_choice_count(kind, param);
+  if (n > 0) {
+    const char *name = fx_param_choice_name(kind, param, slot_choice(v, n));
+    text_add(&t, name != nullptr ? name : "");
+    return t.len;
+  }
+  if (kind == FxKind::kFilter && param == 1) {
+    if (v <= 0.f) {
+      text_add(&t, "off");               // `slot_filter_on`: a cutoff of zero is off
+      return t.len;
+    }
+    const float hz = fxpl_to_cutoff(v * 255.f);
+    if (hz >= 1000.f) {
+      text_fixed1(&t, hz / 1000.0);
+      text_add(&t, " kHz");
+    } else {
+      text_int(&t, (long) std::lround(hz));
+      text_add(&t, " Hz");
+    }
+    return t.len;
+  }
+  if ((kind == FxKind::kDelay && param == 0) || (kind == FxKind::kReverb && param == 2)) {
+    const float seconds = kind == FxKind::kDelay ? kSlotDelayMaxSeconds : kSlotPredelayMaxSeconds;
+    text_int(&t, (long) std::lround(double(v) * seconds * 1000.0));
+    text_add(&t, " ms");
+    return t.len;
+  }
+  if (kind == FxKind::kReverb && param >= 5 && v <= 0.f) {
+    text_add(&t, "auto");                // derived from the size, `reverb_derived`
+    return t.len;
+  }
+  text_int(&t, (long) std::lround(double(v) * 100.0));
+  text_char(&t, '%');
+  return t.len;
+}
+
+size_t
+level_text(float gain, char *out, size_t cap) {
+  TextOut t;
+  text_init(&t, out, cap);
+  if (!(gain > 0.f)) {
+    text_add(&t, "-inf dB");
+    return t.len;
+  }
+  const double db = 20.0 * std::log10((double) gain);
+  if (db > 0.05)
+    text_char(&t, '+');
+  text_fixed1(&t, std::fabs(db) < 0.05 ? 0.0 : db);
+  text_add(&t, " dB");
+  return t.len;
+}
+
 float
 fx_param_default(FxKind kind, int param, bool wet) {
   if (param < 0 || param >= kMixrSlotParams)

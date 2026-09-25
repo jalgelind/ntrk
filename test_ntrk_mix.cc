@@ -3127,6 +3127,37 @@ test_shaper_dry() {
 // ---------------------------------------------------------------------------
 
 static void
+test_value_text() {
+  printf("a slot parameter and a level read in their own units\n");
+  char b[32];
+  // Absolute anchors, from the constants the text reads.
+  mix::fx_param_value_text(mix::FxKind::kDelay, 0, 0.25f, b, sizeof b);
+  CHECK(strcmp(b, "500 ms") == 0);                     // 0.25 x 2 s
+  mix::fx_param_value_text(mix::FxKind::kReverb, 2, 0.4f, b, sizeof b);
+  CHECK(strcmp(b, "100 ms") == 0);                     // 0.4 x 0.25 s
+  mix::fx_param_value_text(mix::FxKind::kDelay, 1, 0.35f, b, sizeof b);
+  CHECK(strcmp(b, "35%") == 0);
+  mix::fx_param_value_text(mix::FxKind::kFilter, 1, 0.f, b, sizeof b);
+  CHECK(strcmp(b, "off") == 0);
+  mix::fx_param_value_text(mix::FxKind::kFilter, 1, 1.f, b, sizeof b);
+  CHECK(strcmp(b, "20.0 kHz") == 0);                   // the table's top
+  mix::fx_param_value_text(mix::FxKind::kFilter, 0, 0.99f, b, sizeof b);
+  CHECK(strcmp(b, "bandpass") == 0);                   // a choice, by name
+  mix::fx_param_value_text(mix::FxKind::kReverb, 5, 0.f, b, sizeof b);
+  CHECK(strcmp(b, "auto") == 0);
+  mix::fx_param_value_text(mix::FxKind::kReverb, 5, 0.5f, b, sizeof b);
+  CHECK(strcmp(b, "50%") == 0);
+  mix::level_text(1.f, b, sizeof b);
+  CHECK(strcmp(b, "0.0 dB") == 0);
+  mix::level_text(0.f, b, sizeof b);
+  CHECK(strcmp(b, "-inf dB") == 0);
+  mix::level_text(0.5f, b, sizeof b);
+  CHECK(strcmp(b, "-6.0 dB") == 0);
+  mix::level_text(2.f, b, sizeof b);
+  CHECK(strcmp(b, "+6.0 dB") == 0);
+}
+
+static void
 test_command_enumeration() {
   printf("every command in every lane enumerates, round-trips and renders "
          "bounded\n");
@@ -4163,6 +4194,7 @@ main(void) {
   test_reverb_slot_late_knobs();
   test_shaper_dry();
   test_command_enumeration();
+  test_value_text();
   test_slot_mute_reaches_the_mixer();
   test_mixr_round_trip();
   test_mixr_send_levels();
