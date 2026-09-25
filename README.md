@@ -858,6 +858,9 @@ cannot collide with a ProTracker digit:
   is the whole sample and `Sxx` slice `xx - 1`, else `xx/256` of the way in, so every sixteenth is a round value
   (`S40` a quarter, `S80` half). No memory. Unlike `9xx`, whose `xx × 256`
   frames stop at 1.48 s at 44.1 kHz, it reaches the whole of any sample.
+- `Hxx` (`0x12`, `SLO`) — start at slice `xx`, like `SLC`, and play on past its
+  boundary whatever the instrument's slice stop says: slice stop is per
+  instrument, this is the per-note way from a slice to the end.
 
 **Not implemented**, and skipped rather than approximated — a tune that uses one
 plays without it, which is an audible gap rather than a wrong note:

@@ -2335,7 +2335,7 @@ test_offset_display() {
 
   int count = 0;
   const ntrk::CmdInfo *table = ntrk::note_fx_table(&count);
-  CHECK(count == 34);
+  CHECK(count == 35);
   CHECK(table[33].cmd == ntrk::kFxOffset);
   CHECK(ntrk::note_fx_index(ntrk::kFxOffset, 0u) == 33);
 }
@@ -2699,6 +2699,49 @@ test_envelope_inert_while_off() {
 }
 
 static void
+test_slice_on() {
+  printf("H plays from a slice on, whatever the instrument's slice stop says\n");
+  Spec s;
+  s.rows = 4;
+  s.sample_len = 20000;
+  s.loop_len = 0;
+  build(s, false);
+  ntrk::Module a;
+  CHECK(ntrk::module_load(&a, g_bytes, g_size));
+  const uint32_t frames[3] = {0u, 4000u, 9000u};
+  set_slices(&a.instruments[0], frames, 3);
+  ntrk::instrument_param_set(&a.instruments[0], (int) ntrk::InsParam::kSliceStop, 1);
+  static uint8_t on[1 << 16];
+  size_t n = 0;
+  CHECK(ntrk::module_save(&a, on, sizeof on, &n));
+  const size_t cell = cell_at(s, 0, 0);
+  uint32_t stop = 0;
+  // Slice stop is ON: SLC 01 ends at 9000 -- and H01 starts at the same frame and plays on.
+  CHECK(!plays_past(on, n, cell, ntrk::kFxSlice, 1u, &stop, 9000u));
+  CHECK(plays_past(on, n, cell, ntrk::kFxSliceOn, 1u, &stop, 9000u));
+  CHECK(stop == 0u);
+  // Its start is SLC's, exactly.
+  static uint8_t buf[1 << 16];
+  memcpy(buf, on, n);
+  buf[cell + 0] = 25u; buf[cell + 1] = 1u; buf[cell + 2] = ntrk::kFxSliceOn; buf[cell + 3] = 1u;
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, buf, n));
+  ntrk::Player p;
+  ntrk::player_start(&p, &m);
+  ntrk::player_tick(&p, 48000.0);
+  CHECK(p.channels[0].pos == 4000.0);
+  // Named, drawn and described as itself.
+  char r[8], d[64];
+  ntrk::note_fx_repr(ntrk::kFxSliceOn, 0x02u, r, sizeof r);
+  CHECK(strcmp(r, "H02") == 0);
+  ntrk::note_fx_describe(ntrk::kFxSliceOn, 0x02u, d, sizeof d);
+  CHECK(strcmp(d, "Play from slice 2 on") == 0);
+  // A file using it carries EFXS -- an older reader refuses rather than stops at the boundary.
+  CHECK(ntrk::module_save(&m, g_saved, sizeof g_saved, &n));
+  CHECK(efxs_entry(g_saved, n) != (size_t) -1);
+}
+
+static void
 test_slc_display() {
   printf("SLC names, describes and renders as itself, not as an arpeggio\n");
 
@@ -2730,7 +2773,7 @@ test_slc_display() {
   // The table is one longer, and the new row is the command it says it is.
   int count = 0;
   const ntrk::CmdInfo *table = ntrk::note_fx_table(&count);
-  CHECK(count == 34);
+  CHECK(count == 35);
   CHECK(table[32].cmd == ntrk::kFxSlice);
   CHECK(strcmp(table[32].mnemonic, "SLC") == 0);
   CHECK(ntrk::note_fx_index(ntrk::kFxSlice, 0u) == 32);
@@ -7603,6 +7646,7 @@ main(void) {
   test_offset_command();
   test_offset_display();
   test_slice_stop();
+  test_slice_on();
   test_protracker_commands();
   test_synth_voice_defaults();
   test_envelope_inert_while_off();

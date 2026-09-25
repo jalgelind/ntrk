@@ -931,8 +931,12 @@ const uint8_t kFxSlice = 0x10;
 // keeps a row per mnemonic and name. Unlike `9xx`, whose `xx * 256` frames reach 1.48 s at 44.1 kHz, this
 // reaches every sample whatever its length. Written with EFXS (see there).
 const uint8_t kFxOffset = 0x11;
+// `H` -- slice `xx` and PLAY ON: `SLC`'s start, never its instrument's slice stop. The
+// per-note answer to "from this slice to the end", where slice stop is per instrument. Also
+// past the nibble, so also covered by EFXS.
+const uint8_t kFxSliceOn = 0x12;
 // The highest note effect this reader plays. EFXS names one above it -> refused.
-const uint8_t kFxLast = kFxOffset;
+const uint8_t kFxLast = kFxSliceOn;
 
 // The FXPL payload's geometry prefix: `u16 fx_columns`, `u16 meta_columns`,
 // then the cells. In the payload rather than in the header because the header
@@ -3067,6 +3071,9 @@ player_row(Player *player, double sample_rate) {
           // at all. This fails audibly rather than inaudibly.
           start = (double) slice_offset(m->instruments[ch->instrument - 1],
                                         (int) param);
+        } else if (effect == kFxSliceOn && ch->instrument > 0) {
+          // `SLC`'s frame, and deliberately no stop below: that is the command.
+          start = (double) slice_offset(m->instruments[ch->instrument - 1], (int) param);
         } else if (effect == kFxOffset && ch->instrument > 0) {
           // `SLC`'s rules -- no memory, `ch->offset` untouched -- over a
           // fraction when the instrument has no table. See `kFxOffset`.
@@ -4033,6 +4040,8 @@ note_fx_repr(uint8_t effect, uint8_t param, char *out, size_t cap) {
     text_char(&t, 'G');
   else if (effect == kFxOffset)
     text_char(&t, 'S');                  // Renoise's letter for it
+  else if (effect == kFxSliceOn)
+    text_char(&t, 'H');
   else
     text_hex(&t, effect & 15u, 1);
   text_hex(&t, param, 2);
@@ -4214,7 +4223,7 @@ note_fx_table(int *count) {
       "sine", "ramp", "square", "random",
       "sine, no retrigger", "ramp, no retrigger",
       "square, no retrigger", "random, no retrigger"};
-  static const CmdInfo kTable[34] = {
+  static const CmdInfo kTable[35] = {
       {0x00, "ARP", "Arpeggio", ParamShape::SplitNibble, 0, nullptr},
       {0x01, "PTU", "Portamento up", ParamShape::Continuous, 0, nullptr},
       {0x02, "PTD", "Portamento down", ParamShape::Continuous, 0, nullptr},
@@ -4253,9 +4262,10 @@ note_fx_table(int *count) {
       // Past the nibble. See `kFxSlice`.
       {0x10, "SLC", "Play slice", ParamShape::Continuous, 0, nullptr},
       {0x11, "SOF", "Offset by fraction or slice", ParamShape::Continuous, 0, nullptr},
+      {0x12, "SLO", "Play from slice on", ParamShape::Continuous, 0, nullptr},
   };
   if (count != nullptr)
-    *count = 34;
+    *count = 35;
   return kTable;
 }
 
@@ -4278,6 +4288,8 @@ note_fx_index(uint8_t effect, uint8_t param) {
     return 32;
   if (effect == kFxOffset)
     return 33;
+  if (effect == kFxSliceOn)
+    return 34;
   return (effect & 15u) == 0xEu ? 16 + (int) ((param >> 4) & 15u)
                                 : (int) (effect & 15u);
 }
@@ -4341,6 +4353,12 @@ note_fx_describe(uint8_t effect, uint8_t param, char *out, size_t cap) {
   if (effect == kFxSlice) {
     text_add(&t, "Play slice ");
     text_int(&t, (long) param);
+    return t.len;
+  }
+  if (effect == kFxSliceOn) {
+    text_add(&t, "Play from slice ");
+    text_int(&t, (long) param);
+    text_add(&t, " on");
     return t.len;
   }
   // **Both readings**, because which one applies is the instrument's and this
