@@ -2906,6 +2906,66 @@ test_routing() {
   strip_clear();
 }
 
+// A stereo sample through the mixer: equal channels are the mono sample bit for bit through the
+// instrument filter, the insert, the fader, a tap and a Bus -- every stage the strip has.
+static void
+test_stereo_voice_through_the_mixer() {
+  printf("a stereo voice with equal channels mixes bit-identical to the mono one\n");
+  const size_t bytes = sizeof(double) * (size_t) (kTickFrames * 6) * 2u;
+  static int8_t mono[kBuiltinWaveFrames], st[kBuiltinWaveFrames * 2];
+  const int8_t *w = builtin_wave(1);
+  for (int i = 0; i < kBuiltinWaveFrames; ++i) {
+    mono[i] = w[i];
+    st[i * 2] = st[i * 2 + 1] = w[i];
+  }
+
+  const auto setup = [&](bool stereo_sample) {
+    mac_build(1, 1);
+    Instrument &ins = g_mac.instruments[0];
+    ins.type = (uint8_t) InstrumentType::kPcm8;
+    ins.bits = 8u;
+    ins.data = stereo_sample ? st : mono;
+    ins.flags = (uint8_t) (kInstrumentFilter | (stereo_sample ? kInstrumentStereo : 0u));
+    ins.filter_cutoff_hz = 2000u;
+    ins.filter_res = 100u;
+    slot_clear();
+    strip_clear();
+    g_mixer.insert[0].param[0] = 0.5f;                               // a limiter that works
+    mix::slot_set_kind(&g_mixer.insert[0], mix::FxKind::kLimiter);
+    g_mixer.channel_volume[1] = 0.7f;
+    mix::slot_set_kind(&g_mixer.send[0], mix::FxKind::kFilter);      // off: the tap itself
+    g_mixer.send_level[2][0] = 0.5f;
+    g_mixer.send_mode[3] = mix::SendMode::kBus;
+    g_mixer.channel_output[3] = 4u;
+  };
+  setup(false);
+  slot_render(6, g_a);
+  setup(true);
+  slot_render(6, g_b);
+  CHECK(memcmp(g_a, g_b, bytes) == 0);
+  CHECK(peak_of(g_a, kTickFrames * 12) > 0.0);
+  CHECK(g_mixer.insert[0].lim_gain < 1.f);
+
+  // Opposite channels, centred: the two sides stay apart through the strip.
+  for (int i = 0; i < kBuiltinWaveFrames; ++i)
+    st[i * 2 + 1] = (int8_t) (st[i * 2] == -128 ? 127 : -st[i * 2]);
+  setup(true);
+  g_mac.instruments[0].flags = kInstrumentStereo;                    // no filter, plain
+  mix::slot_set_kind(&g_mixer.insert[0], mix::FxKind::kNone);
+  for (int c = 0; c < kMacChannels; ++c)
+    g_mixer.channel_pan[c] = 128u;
+  slot_render(6, g_b);
+  long apart = 0;
+  for (int i = 0; i < kTickFrames * 12; i += 2)
+    if (g_b[i] != g_b[i + 1])
+      ++apart;
+  CHECK(apart > kTickFrames);
+
+  mix::slot_set_kind(&g_mixer.insert[0], mix::FxKind::kNone);
+  slot_clear();
+  strip_clear();
+}
+
 // The widened macro target range, which is the same numbering as the set
 // commands and needed no second accumulator: `Slot::param` already persists
 // across ticks the way `fxpl_val` does.
@@ -4701,6 +4761,7 @@ main(void) {
   test_channel_strip();
   test_send_modes_and_stereo_taps();
   test_routing();
+  test_stereo_voice_through_the_mixer();
   test_slot_macro_targets();
   test_slot_resync_restores_the_configuration();
   test_slot_apply_skips_and_fires();

@@ -581,6 +581,7 @@ mixer_reset(Mixer *mx) {
     slot_revert(&mx->insert[c]);
     slot_set_kind(&mx->insert[c], mx->insert[c].kind);
     fx::svf_reset(&mx->voice_filter[c]);
+    fx::svf_reset(&mx->voice_filter_r[c]);
     mx->voice_pos[c] = 0.0;
     mx->voice_age[c] = 0u;
   }
@@ -1741,11 +1742,24 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       // trigger — and a voice triggered inside `player_run_begin` above is
       // playing by construction and renders the whole of the run that triggered
       // it, so the stored value is at least one.
-      if (ch->pos != mx->voice_pos[c] || ch->synth_age != mx->voice_age[c])
+      if (ch->pos != mx->voice_pos[c] || ch->synth_age != mx->voice_age[c]) {
         fx::svf_reset(&mx->voice_filter[c]);
+        fx::svf_reset(&mx->voice_filter_r[c]);
+      }
 
-      for (int i = 0; i < run; ++i)
-        v[i] = channel_sample(ch, ins);
+      // **A stereo sample runs the strip in stereo, decided per run**: a channel's instrument
+      // changes only on a trigger, and a run never crosses a tick. `vr` IS `v` for a mono voice,
+      // so everything below reads the right side through it and a mono voice does exactly the
+      // arithmetic it always did.
+      const bool st = (ins.flags & kInstrumentStereo) != 0u;
+      float *vr = st ? mx->voice_r : v;
+      if (st) {
+        for (int i = 0; i < run; ++i)
+          channel_sample2(ch, ins, &v[i], &vr[i]);
+      } else {
+        for (int i = 0; i < run; ++i)
+          v[i] = channel_sample(ch, ins);
+      }
       mx->voice_pos[c] = ch->pos;
       mx->voice_age[c] = ch->synth_age;
 
@@ -1779,6 +1793,15 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
         }
         for (int i = 0; i < run; ++i)
           v[i] = voice_filter_sample(f, type, v[i]);
+        if (st) {
+          fx::Svf *fr = &mx->voice_filter_r[c];
+          fr->a1 = f->a1;                // the same coefficients, the right side's own state
+          fr->a2 = f->a2;
+          fr->a3 = f->a3;
+          fr->k = f->k;
+          for (int i = 0; i < run; ++i)
+            vr[i] = voice_filter_sample(fr, type, vr[i]);
+        }
       }
 
       // Sampled even when muted, because channel_sample is what advances the
@@ -1791,16 +1814,27 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       if (channel_silent(m, player, c))
         continue;
 
-      slot_process_mono(&mx->insert[c], v, run, frate);
+      if (st)
+        slot_process_stereo(&mx->insert[c], v, vr, run, frate);
+      else
+        slot_process_mono(&mx->insert[c], v, run, frate);
 
       // **The fader, after the insert and before everything that leaves the strip** -- the send
       // taps and the pan both -- so a track pulled down takes its reverb with it. Branched at
       // unity, which is every channel of every file before v3: `x * 1.f` is exact, but a branch
       // is also no work.
       const float vol = mx->channel_volume[c];
-      if (vol != 1.f)
+      if (vol != 1.f) {
         for (int i = 0; i < run; ++i)
           v[i] *= vol;
+        if (st)
+          for (int i = 0; i < run; ++i)
+            vr[i] *= vol;
+      }
+      // A mono caller gets a stereo voice's mid, as `render_add` gives it.
+      if (st && !stereo)
+        for (int i = 0; i < run; ++i)
+          v[i] = vr[i] = (v[i] + vr[i]) * 0.5f;
 
       // **The taps are stereo and after the pan**, so a channel panned left reaches the reverb
       // on the left. At centre both gains are exactly 1.f and `x * 1.f` is exact, so a centred
@@ -1818,7 +1852,7 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
         const float gl = gain_l[c], gr = gain_r[c];
         for (int i = 0; i < run; ++i) {
           bus_l[i] += v[i] * gl * level;
-          bus_r[i] += v[i] * gr * level;
+          bus_r[i] += vr[i] * gr * level;
         }
       }
 
@@ -1834,7 +1868,7 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       }
       for (int i = 0; i < run; ++i) {
         out_l[i] += v[i] * gain_l[c];
-        out_r[i] += v[i] * gain_r[c];
+        out_r[i] += vr[i] * gain_r[c];
       }
     }
 

@@ -526,6 +526,8 @@ struct Mixer {
   // filter flag, which is what keeps a module that asks for nothing bit for bit
   // the unfiltered path.
   fx::Svf voice_filter[kMaxChannels];
+  // The right side's filter, for a channel playing a stereo sample; untouched otherwise.
+  fx::Svf voice_filter_r[kMaxChannels];
 
   // Where each channel's sample position and synth age were left at the end of
   // the last run, which is how a note trigger is spotted from out here. Two,
@@ -656,6 +658,7 @@ struct Mixer {
   // gets 512 KB on macOS and every one of these is written before it is read
   // within a run, so none of them needs clearing between calls.
   float voice[kMaxChannels][kMaxBlock];
+  float voice_r[kMaxBlock];         // a stereo voice's right side, one channel at a time
   float send_bus[kSends][2][kMaxBlock];
   float mix_l[kMaxBlock];
   float mix_r[kMaxBlock];
