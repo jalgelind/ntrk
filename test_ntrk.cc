@@ -2883,6 +2883,58 @@ test_stereo_sample_flag() {
   CHECK(!ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
 }
 
+// The player on a stereo sample: equal channels are the mono sample bit for bit (loops and
+// all), and opposite channels cancel in a mono output.
+static void
+test_stereo_sample_player() {
+  printf("a stereo sample with equal channels plays bit-identical to the mono one\n");
+
+  static double mono[4096 * 2], st[4096 * 2];
+  static int8_t pcm2[32 * 2];
+  const int frames = 4096;                     // many loops of the 32-frame sample
+
+  Spec s;
+  build(s);
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+  ntrk::Player p;
+  ntrk::player_start(&p, &m);
+  render(&p, frames);
+  memcpy(mono, g_buffer, sizeof mono);
+  CHECK(peak_between(0, frames) > 0.0);
+
+  const ntrk::Instrument ins0 = m.instruments[0];
+  for (int i = 0; i < 32; ++i)
+    pcm2[i * 2] = pcm2[i * 2 + 1] = ins0.data[i];
+  m.instruments[0].flags = (uint8_t) (m.instruments[0].flags | ntrk::kInstrumentStereo);
+  m.instruments[0].data = pcm2;
+  ntrk::player_start(&p, &m);
+  render(&p, frames);
+  memcpy(st, g_buffer, sizeof st);
+  CHECK(memcmp(mono, st, sizeof mono) == 0);
+
+  // L = -R: nothing in a mono output, and the two sides apart in a stereo one.
+  for (int i = 0; i < 32; ++i)
+    pcm2[i * 2 + 1] = (int8_t) (pcm2[i * 2] == -128 ? 127 : -pcm2[i * 2]);
+  ntrk::player_start(&p, &m);
+  for (int i = 0; i < frames; ++i)
+    g_buffer[i] = 0.0;
+  ntrk::render_add(&p, g_buffer, frames, 1, 48000.f);
+  double worst = 0.0;
+  for (int i = 0; i < frames; ++i)
+    worst = g_buffer[i] > worst ? g_buffer[i] : (-g_buffer[i] > worst ? -g_buffer[i] : worst);
+  CHECK(worst == 0.0);
+  ntrk::player_start(&p, &m);
+  p.separation = 0.f;                          // centred: the sides are the sample's own
+  render(&p, frames);
+  long apart = 0;
+  for (int i = 0; i < frames * 2; i += 2)
+    if (g_buffer[i] != 0.0 && g_buffer[i] == -g_buffer[i + 1])
+      ++apart;
+  CHECK(apart > frames / 4);
+  m.instruments[0] = ins0;
+}
+
 static void
 test_v2_save_round_trip() {
   printf("a module round trips, and any other version is refused\n");
@@ -7677,6 +7729,7 @@ main(void) {
   test_render_hashes();
   test_mixr_block();
   test_stereo_sample_flag();
+  test_stereo_sample_player();
   test_instrument_param_shape();
   test_instrument_param_group();
   test_instrument_param_clamps();

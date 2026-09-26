@@ -3494,8 +3494,42 @@ player_tick(Player *player, double sample_rate) {
 // down by 256 rather than widening the mixer is what keeps the 8-bit path
 // literally the arithmetic it has always been — and 256 is a power of two, so
 // the 16-bit path loses nothing to it either.
+// Both sides of a frame. A mono sample answers the same value twice, so a caller that wants
+// stereo never has to ask which kind it has.
+inline void
+instrument_frame2(const Instrument &ins, uint32_t frame, float *l, float *r) {
+  if ((ins.flags & kInstrumentStereo) == 0u) {
+    float v;
+    if (ins.bits == 16) {
+      const uint8_t *d = (const uint8_t *) (const void *) ins.data;
+      v = (float) (int16_t) read_u16(d + (size_t) frame * 2u) * (1.f / 256.f);
+    } else {
+      v = (float) ins.data[frame];
+    }
+    *l = v;
+    *r = v;
+    return;
+  }
+  if (ins.bits == 16) {
+    const uint8_t *d = (const uint8_t *) (const void *) ins.data + (size_t) frame * 4u;
+    *l = (float) (int16_t) read_u16(d) * (1.f / 256.f);
+    *r = (float) (int16_t) read_u16(d + 2) * (1.f / 256.f);
+    return;
+  }
+  *l = (float) ins.data[(size_t) frame * 2u];
+  *r = (float) ins.data[(size_t) frame * 2u + 1u];
+}
+
+// One frame, one value. **A stereo sample answers its mid**, so every reader that wants one
+// number -- the mono renderer, an editor's waveform, a slice detector -- is right for both kinds
+// without a second path. The mono branch is the arithmetic it always was, bit for bit.
 inline float
 instrument_frame(const Instrument &ins, uint32_t frame) {
+  if ((ins.flags & kInstrumentStereo) != 0u) {
+    float l, r;
+    instrument_frame2(ins, frame, &l, &r);
+    return (l + r) * 0.5f;
+  }
   if (ins.bits == 16) {
     const uint8_t *d = (const uint8_t *) (const void *) ins.data;
     return (float) (int16_t) read_u16(d + (size_t) frame * 2u) * (1.f / 256.f);
@@ -3530,6 +3564,28 @@ instrument_frame_at(const Instrument &ins, double pos) {
   const float a = instrument_frame(ins, index);
   const float b = instrument_frame(ins, next_index);
   return (float) ((double) a + ((double) b - (double) a) * frac);
+}
+
+// `instrument_frame_at` for both sides: the same neighbours, the same blend, per side.
+inline void
+instrument_frame_at2(const Instrument &ins, double pos, float *l, float *r) {
+  *l = 0.f;
+  *r = 0.f;
+  if (ins.data == nullptr || ins.length == 0 || pos < 0.0)
+    return;
+  const uint32_t index = (uint32_t) pos;
+  if (index >= ins.length)
+    return;
+  const uint32_t next_index =
+      (index + 1u < ins.length)
+          ? index + 1u
+          : (ins.loop_len > 0 ? ins.loop_start : index);
+  const double frac = pos - (double) index;
+  float al, ar, bl, br;
+  instrument_frame2(ins, index, &al, &ar);
+  instrument_frame2(ins, next_index, &bl, &br);
+  *l = (float) ((double) al + ((double) bl - (double) al) * frac);
+  *r = (float) ((double) ar + ((double) br - (double) ar) * frac);
 }
 
 // The step a note plays an instrument at, with no channel to hold it.
@@ -3597,6 +3653,57 @@ channel_gain_apply(Channel *ch, const Instrument &ins, float s) {
   const float level = ch->env_level;
   env_advance(ch, ins);
   return out * level;
+}
+
+// `channel_gain_apply` for both sides: the same arithmetic per side, and ONE `env_advance`,
+// because the envelope is the voice's and a frame is one step of it.
+inline void
+channel_gain_apply2(Channel *ch, const Instrument &ins, float *l, float *r) {
+  float volume = ch->volume + ch->trem_offset;
+  if (volume < 0.f)
+    volume = 0.f;
+  if (volume > 64.f)
+    volume = 64.f;
+  *l = *l * (1.f / 128.f) * (volume * (1.f / 64.f));
+  *r = *r * (1.f / 128.f) * (volume * (1.f / 64.f));
+  if (ch->env_stage == EnvStage::kOff)
+    return;
+  const float level = ch->env_level;
+  env_advance(ch, ins);
+  *l *= level;
+  *r *= level;
+}
+
+inline float channel_sample(Channel *ch, const Instrument &ins);
+
+// **One voice, both sides**, for a stereo sample. The position walk is `channel_sample`'s,
+// line for line -- the two must stop, loop and slice-stop on the same frame -- and a sample that
+// is not stereo takes `channel_sample` itself, so a mono voice has one implementation.
+inline void
+channel_sample2(Channel *ch, const Instrument &ins, float *l, float *r) {
+  if ((ins.flags & kInstrumentStereo) == 0u || ins.type == (uint8_t) InstrumentType::kSynth) {
+    *l = *r = channel_sample(ch, ins);
+    return;
+  }
+  *l = *r = 0.f;
+  if (!ch->playing || ins.data == nullptr || ins.length == 0)
+    return;
+  const uint32_t index = (uint32_t) ch->pos;
+  if (index >= ins.length ||
+      (ch->stop_frame != 0u && index >= ch->stop_frame)) {
+    ch->playing = false;
+    return;
+  }
+  instrument_frame_at2(ins, ch->pos, l, r);
+  ch->pos += ch->step;
+  if (ins.loop_len > 0) {
+    const double loop_end = (double) (ins.loop_start + ins.loop_len);
+    while (ch->pos >= loop_end)
+      ch->pos -= (double) ins.loop_len;
+  } else if (ch->pos >= (double) ins.length) {
+    ch->playing = false;
+  }
+  channel_gain_apply2(ch, ins, l, r);
 }
 
 inline float
@@ -3863,8 +3970,22 @@ render_add(Player *player, double *buffer, int frames, int channels,
       Channel *ch = &player->channels[c];
       if (ch->instrument <= 0)
         continue;
+      const Instrument &ins = m->instruments[ch->instrument - 1];
+      // **A stereo sample, balanced**: its left side through the left gain, its right through
+      // the right -- the balance law above is exactly that. Into a mono output, its mid.
+      if ((ins.flags & kInstrumentStereo) != 0u) {
+        float sl, sr;
+        channel_sample2(ch, ins, &sl, &sr);
+        if (channel_silent(m, player, c))
+          continue;
+        if (!stereo)
+          sl = sr = (sl + sr) * 0.5f;
+        left += sl * gain_l[c];
+        right += sr * gain_r[c];
+        continue;
+      }
       // Sampled even when muted, and then dropped. See Player::muted.
-      const float s = channel_sample(ch, m->instruments[ch->instrument - 1]);
+      const float s = channel_sample(ch, ins);
       // **`channel_silent`, not a test written here.** It answers for both the
       // listener's mute and the tune's, and it is asked from the mixer's own
       // render loop too -- one rule, one implementation.
