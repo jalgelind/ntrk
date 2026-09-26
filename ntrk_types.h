@@ -462,7 +462,10 @@ const int kFxplValueCount = 8;
 //
 //   u16 version (2)   u16 slots   u16 master gain   u16 width
 //   then per slot: u8 kind, u8 reserved, u16 param[8]
-//   then, at v2 only: u8 send_level[kMaxChannels][kMixrSends], u8 return_level[kMixrSlots]
+//   then, at v2 and later: u8 send_level[kMaxChannels][kMixrSends], u8 return_level[kMixrSlots]
+//   then, at v3 only: master FX 2 and 3 (a slot record each), u16 channel volume (Q12) per
+//   channel, u8 channel pan per channel, a slot record per channel (its insert), u8 channel
+//   output per channel, u8 send output per send, u8 send mode per send
 //
 // Gain and width are Q12 -- 4096 is unity -- which reaches 16 with a resolution
 // of 0.00024, far finer than a fader moves. A parameter is normalised 0..1 over
@@ -479,10 +482,24 @@ const int kFxplValueCount = 8;
 // whose levels are ALL zero is written back as v1, so a file that does not use the
 // feature round-trips byte-identical and an older reader keeps it -- the same policy
 // TUNE and SMUT follow, for the same reason.
-const int kMixrVersion = 2;
+//
+// **Version 3 appends the channel strip, two more master slots, and routing.** Appended, never
+// inserted, so every v2 offset keeps its meaning and no accessor needs a second copy of the
+// layout. Every new byte's zero is the behaviour a v2 file had -- no master FX 2/3, the
+// player's own pan layout, no insert, every output to the master, every send a Send -- except
+// the channel volume, which is Q12 like every other gain here and is filled with unity on the
+// way in, as the returns are. The writer chooses the narrowest version (`mix_version_needed`).
+const int kMixrVersion = 3;        // what `Module::mix` always holds in memory
+const int kMixrVersion2 = 2;       // before the channel strip; still read, written when enough
 const int kMixrVersion1 = 1;       // before the send levels; still read, never written new
-const int kMixrSlots = 5;          // the four sends, then the master
+// **The buses**: the four sends, then the master. The header's slot table, and what an editor's
+// bus picker and the mixer's meters count. Unchanged by v3 -- the loader checks it exactly.
+const int kMixrSlots = 5;
 const int kMixrSends = kMixrSlots - 1;
+// **The effect slots**: 0..3 the sends, 4..6 master FX 1..3. Slot 4 is the header's slot 4, so an
+// index that meant the master before v3 means master FX 1 now.
+const int kMixrMasterSlots = 3;
+const int kMixrFxSlots = kMixrSends + kMixrMasterSlots;
 const int kMixrSlotParams = 8;
 const int kMixrSlotBytes = 2 + kMixrSlotParams * 2;
 const int kMixrHeaderBytes = 8;
@@ -504,16 +521,37 @@ const int kMixrSendLevelBytes = kMaxChannels * kMixrSends;
 // output IS the mix, so scaling it here would be a second master gain. It stays in the layout
 // so a slot index means the same thing in every table.
 const int kMixrReturnBytes = kMixrSlots;
-const int kMixrBytes = kMixrBytesV1 + kMixrSendLevelBytes + kMixrReturnBytes;
+const int kMixrBytesV2 = kMixrBytesV1 + kMixrSendLevelBytes + kMixrReturnBytes;
+// The v3 tail, region by region. `kMixrV3*` is where each starts.
+const int kMixrV3MasterSlots = kMixrBytesV2;                     // master FX 2, 3
+const int kMixrV3Volume = kMixrV3MasterSlots + (kMixrMasterSlots - 1) * kMixrSlotBytes;
+const int kMixrV3Pan = kMixrV3Volume + kMaxChannels * 2;         // 0 = the player's layout
+const int kMixrV3Insert = kMixrV3Pan + kMaxChannels;
+const int kMixrV3Output = kMixrV3Insert + kMaxChannels * kMixrSlotBytes;  // 0 master, n send n
+const int kMixrV3SendOutput = kMixrV3Output + kMaxChannels;      // 0 master, n > own send n
+const int kMixrV3SendMode = kMixrV3SendOutput + kMixrSends;      // 0 Send, 1 Bus
+const int kMixrBytes = kMixrV3SendMode + kMixrSends;
+static_assert(kMixrBytesV2 == 167 && kMixrBytes == 563, "MIXR v2/v3 sizes are file format");
 const int kMixrQUnit = 4096;       // Q12: what 1.0 is stored as
 
 // **The mixer is no longer optional, so every `Module` needs a block even when
-// no file supplied one.** This is that block: version 2, every slot `kNone`,
+// no file supplied one.** This is that block: version 3, every slot `kNone`,
 // every param zero, master gain and width at unity (`kMixrQUnit`), every send
-// level zero, every return level at unity (255). It is `config_init`'s own
+// level zero, every return level at unity (255), every channel volume at unity
+// and everything else of v3 at its zero. It is `config_init`'s own
 // bytes, written here instead, because `Module`'s constructor (below) is the
 // end that cannot see `ntrk_mix.h` — the same reason the layout comment above
 // lives in this file rather than that one.
+// The v3 bytes whose default is not zero: each channel's volume, Q12 unity. **One writer**, read
+// by `mix_default` and by the loader's up-convert of a v1/v2 block.
+inline void
+mix_fill_v3_defaults(uint8_t block[kMixrBytes]) {
+  for (int c = 0; c < kMaxChannels; ++c) {
+    block[kMixrV3Volume + c * 2 + 0] = (uint8_t) (kMixrQUnit & 0xFF);
+    block[kMixrV3Volume + c * 2 + 1] = (uint8_t) (kMixrQUnit >> 8);
+  }
+}
+
 inline void
 mix_default(uint8_t block[kMixrBytes]) {
   for (int i = 0; i < kMixrBytes; ++i)
@@ -530,6 +568,7 @@ mix_default(uint8_t block[kMixrBytes]) {
   const int returnOffset = kMixrBytesV1 + kMixrSendLevelBytes;
   for (int s = 0; s < kMixrReturnBytes; ++s)
     block[returnOffset + s] = 255;            // return level, unity
+  mix_fill_v3_defaults(block);
 }
 
 // Whether a block is exactly `mix_default`'s bytes — the writer's test for
@@ -546,6 +585,32 @@ mix_is_default(const uint8_t block[kMixrBytes]) {
   return true;
 }
 
+
+// The narrowest `MIXR` version that says what `block` means -- the writer's one decision. v3 when
+// any v3 byte differs from the default block's; else v2 when any send level is non-zero (the
+// returns ride along in v2: a v1 file meant unity returns, and a v2 block is what can say
+// otherwise -- so a non-unity return also needs v2); else v1.
+inline int
+mix_version_needed(const uint8_t block[kMixrBytes]) {
+  uint8_t d[kMixrBytes];
+  mix_default(d);
+  for (int i = kMixrBytesV2; i < kMixrBytes; ++i)
+    if (block[i] != d[i])
+      return kMixrVersion;
+  for (int i = kMixrBytesV1; i < kMixrBytesV2; ++i)
+    if (block[i] != d[i])
+      return kMixrVersion2;
+  return kMixrVersion1;
+}
+
+// The length of a `MIXR` block at `version`, or 0 for a version this reader does not know.
+inline int
+mix_bytes_for(int version) {
+  return version == kMixrVersion1 ? kMixrBytesV1
+       : version == kMixrVersion2 ? kMixrBytesV2
+       : version == kMixrVersion  ? kMixrBytes
+                                  : 0;
+}
 
 // A macro's `flags`. Everything above bit 0 is reserved and a file that sets
 // any of it is refused, so those bits stay free to mean something.

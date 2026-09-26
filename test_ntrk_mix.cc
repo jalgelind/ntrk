@@ -3637,6 +3637,71 @@ test_mixr_send_levels() {
   CHECK(mix::config_send_level(m.mix, 2, 2) == 1.f);
 }
 
+// MIXR v3: the narrowest version is written, and a v1/v2 block comes up with unity volumes.
+static void
+test_mixr_v3_versions() {
+  printf("MIXR v3 is written only for v3 state, and older blocks come up at unity volume\n");
+
+  uint8_t b[kMixrBytes];
+  mix_default(b);
+  CHECK(mix_version_needed(b) == kMixrVersion1);
+  b[kMixrBytesV1 + 5] = 10;                                  // one send level
+  CHECK(mix_version_needed(b) == kMixrVersion2);
+  b[kMixrBytesV1 + 5] = 0;
+  b[kMixrBytesV1 + kMixrSendLevelBytes + 1] = 100;           // one return, not unity
+  CHECK(mix_version_needed(b) == kMixrVersion2);
+  b[kMixrBytesV1 + kMixrSendLevelBytes + 1] = 255;
+  b[kMixrV3Pan + 3] = 128;                                   // one channel pan
+  CHECK(mix_version_needed(b) == kMixrVersion);
+  b[kMixrV3Pan + 3] = 0;                                     // the negative control
+  CHECK(mix_version_needed(b) == kMixrVersion1);
+  CHECK(mix_bytes_for(kMixrVersion) == kMixrBytes && mix_bytes_for(4) == 0);
+
+  // A v2 file: its channels come back at unity volume, and it stays v2 through a save.
+  build();
+  Module m;
+  CHECK(module_load(&m, g_bytes, g_size));
+  m.mix[kMixrBytesV1 + 1] = 200;                             // a send level: v2
+  size_t n = 0;
+  CHECK(module_save(&m, g_saved, sizeof g_saved, &n));
+  CHECK(n == g_size + (size_t) kDirectoryEntryBytes + (size_t) kMixrBytesV2);
+  Module back;
+  CHECK(module_load(&back, g_saved, n));
+  CHECK(read_u16(back.mix + kMixrV3Volume + 2 * 7) == (uint16_t) kMixrQUnit);
+  CHECK(memcmp(back.mix, m.mix, kMixrBytes) == 0);
+
+  // A v3 file round-trips, and one byte short of the v3 length is refused whole.
+  m.mix[kMixrV3Pan + 0] = 1;                                 // hard left, explicit
+  CHECK(module_save(&m, g_saved, sizeof g_saved, &n));
+  CHECK(n == g_size + (size_t) kDirectoryEntryBytes + (size_t) kMixrBytes);
+  CHECK(module_load(&back, g_saved, n));
+  CHECK(memcmp(back.mix, m.mix, kMixrBytes) == 0);
+  const size_t at = n - (size_t) kMixrBytes;                 // MIXR is the file's tail
+  CHECK(read_u16(g_saved + at) == (uint16_t) kMixrVersion);
+  // Rewrite the directory's length for the block, one short.
+  bool patched = false;
+  for (size_t e = 0; e + 12 <= at && !patched; ++e)
+    if (read_u16(g_saved + e) == kBlockMixr && read_u32(g_saved + e + 4) == (uint32_t) at &&
+        read_u32(g_saved + e + 8) == (uint32_t) kMixrBytes) {
+      write_u32(g_saved + e + 8, (uint32_t) kMixrBytes - 1u);
+      patched = true;
+    }
+  CHECK(patched);
+  CHECK(!module_load(&back, g_saved, n - 1));
+
+  // The mixer refuses a tail it cannot build: a send routed to a LOWER send, a bad mode.
+  uint8_t bad[kMixrBytes];
+  mix_default(bad);
+  bad[kMixrV3SendOutput + 2] = 1;                            // S3 -> S1: backwards
+  mix::Mixer *mx = new mix::Mixer;
+  CHECK(!mix::mixer_config_read(mx, bad));
+  bad[kMixrV3SendOutput + 2] = 4;                            // S3 -> S4: fine
+  CHECK(mix::mixer_config_read(mx, bad));
+  bad[kMixrV3SendMode + 0] = 2;
+  CHECK(!mix::mixer_config_read(mx, bad));
+  delete mx;
+}
+
 // The file's half: which version is written, and what an old one means coming back.
 static void
 test_mixr_version_follows_the_levels() {
@@ -4282,6 +4347,7 @@ main(void) {
   test_send_return_level();
   test_slot_peaks();
   test_mixr_version_follows_the_levels();
+  test_mixr_v3_versions();
   test_mixr_refuses_an_unknown_kind();
   test_mixr_writes_the_setting_not_the_slide();
   test_config_slot_kind_reads_without_a_mixer();

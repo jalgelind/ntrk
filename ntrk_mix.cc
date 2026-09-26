@@ -637,6 +637,23 @@ config_readable(const uint8_t *block) {
   for (int i = 0; i < kMixrSlots; ++i)
     if (block[kMixrHeaderBytes + i * kMixrSlotBytes] > (uint8_t) FxKind::kLimiter)
       return false;
+  // The v3 tail: every kind this build has, every output naming the master or a send, a send's
+  // output only ever a HIGHER send (the ordering is the whole cycle check), and a mode that is
+  // Send or Bus. A block that breaks one is a mixer the player cannot build, refused whole.
+  for (int i = 0; i < kMixrMasterSlots - 1; ++i)
+    if (block[kMixrV3MasterSlots + i * kMixrSlotBytes] > (uint8_t) FxKind::kLimiter)
+      return false;
+  for (int c = 0; c < kMaxChannels; ++c) {
+    if (block[kMixrV3Insert + c * kMixrSlotBytes] > (uint8_t) FxKind::kLimiter ||
+        block[kMixrV3Output + c] > (uint8_t) kSends)
+      return false;
+  }
+  for (int s = 0; s < kSends; ++s) {
+    const uint8_t out = block[kMixrV3SendOutput + s];
+    if ((out != 0u && (int) out <= s + 1) || out > (uint8_t) kSends ||
+        block[kMixrV3SendMode + s] > 1u)
+      return false;
+  }
   return true;
 }
 
@@ -794,17 +811,12 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
   if (mx == nullptr || block == nullptr)
     return false;
   const uint8_t *p = block;
-  if (ntrk::read_u16(p) != (uint16_t) kMixrVersion ||
-      ntrk::read_u16(p + 2) != (uint16_t) kMixrSlots)
-    return false;
-
-  // **Every kind is checked before anything is written.** A block naming an
+  // **Everything is checked before anything is written.** A block naming an
   // effect this build does not have is refused whole rather than applied as far
   // as it parsed -- half a mixer is a tune that plays, sounds wrong, and says
-  // nothing about why.
-  for (int i = 0; i < kMixrSlots; ++i)
-    if (p[kMixrHeaderBytes + i * kMixrSlotBytes] > (uint8_t) FxKind::kLimiter)
-      return false;
+  // nothing about why. `config_readable` is the one answer to "would this load".
+  if (!config_readable(p))
+    return false;
 
   mx->master_gain = (float) ntrk::read_u16(p + 4) / (float) kMixrQUnit;
   mx->width = (float) ntrk::read_u16(p + 6) / (float) kMixrQUnit;
@@ -838,6 +850,7 @@ mixer_config_write(const Mixer *mx, uint8_t *block) {
   uint8_t *p = block;
   for (int k = 0; k < kMixrBytes; ++k)
     p[k] = 0u;
+  mix_fill_v3_defaults(p);
   ntrk::write_u16(p + 0, (uint16_t) kMixrVersion);
   ntrk::write_u16(p + 2, (uint16_t) kMixrSlots);
   ntrk::write_u16(p + 4, mixr_q12(mx->master_gain));
