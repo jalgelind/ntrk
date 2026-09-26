@@ -3604,7 +3604,26 @@ test_command_enumeration() {
   // global slot's eight parameters, set and slid.
   CHECK(mix::command_count(mix::Lane::NoteEffect) == 35);
   CHECK(mix::command_count(mix::Lane::PlaneChannel) == 19 + 16);
-  CHECK(mix::command_count(mix::Lane::PlaneMeta) == 80);
+  CHECK(mix::command_count(mix::Lane::PlaneMeta) == 112);   // 7 global slots x 8 x set/slide
+  // Master FX 2 and 3 (ids 6, 7) are offered on a meta lane; the insert (id 5) is not.
+  {
+    bool six = false, seven = false, five = false;
+    for (int i = 0; i < mix::command_count(mix::Lane::PlaneMeta); ++i) {
+      mix::CommandInfo ci;
+      if (!mix::command_at(mix::Lane::PlaneMeta, i, nullptr, &ci, -1))
+        continue;
+      int slot = -1, param = -1;
+      bool slide = false;
+      if (!mix::fxpl_slot_decode(ci.cmd, &slot, &param, &slide))
+        continue;
+      six = six || slot == mix::kSlotMaster2;
+      seven = seven || slot == mix::kSlotMaster3;
+      five = five || slot == mix::kSlotInsert;
+    }
+    CHECK(six);
+    CHECK(seven);
+    CHECK(!five);
+  }
 
   bool ok = true;
   int choices = 0;

@@ -2580,9 +2580,14 @@ fxpl_describe(const Mixer *mx, const Module *m, int channel, FxCell cell,
 // -- Enumerating commands
 // ----------------------------------------------------------------------------
 
-// Global slots are 0..kSlotMaster, so a meta lane carries eight parameters for
-// each of them, set and slide. Written from the constants rather than as 80.
-static const int kMetaSetCount = (kSlotMaster + 1) * 8;
+// A meta lane carries eight parameters for every global slot, set and slide: the sends, then
+// master FX 1..3. **Not a contiguous id range** -- id 5 is the insert between master FX 1 and 2
+// -- so the ids are listed in the order they are offered, and each is checked against
+// `slot_is_global` below, which stays the one answer to "is this a global slot".
+static const int kMetaSlotIds[kMixrFxSlots] = {kSlotSend + 0, kSlotSend + 1, kSlotSend + 2,
+                                               kSlotSend + 3, kSlotMaster,   kSlotMaster2,
+                                               kSlotMaster3};
+static const int kMetaSetCount = kMixrFxSlots * 8;
 
 static bool
 command_from_row(Lane lane, const CmdInfo &row, CommandInfo *out) {
@@ -2701,8 +2706,11 @@ command_at(Lane lane, int index, const Mixer *mx, CommandInfo *out,
   // Meta: every global slot's eight sets in slot order, then its eight slides.
   const bool slide = index >= kMetaSetCount;
   const int k = slide ? index - kMetaSetCount : index;
+  const int id = kMetaSlotIds[k / 8];
+  if (!slot_is_global(id))
+    return false;
   return command_slot_fill(lane,
-                           (uint8_t) ((slide ? kFxplSlotSlide : kFxplSlotSet) + k),
+                           (uint8_t) ((slide ? kFxplSlotSlide : kFxplSlotSet) + id * 8 + k % 8),
                            mx, out, channel);
 }
 
