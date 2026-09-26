@@ -659,8 +659,11 @@ cutoff in Hz, `u8` filter resonance, `u8` built-in wave index. An imported `.mod
 leaves everything from `type` on at zero, which is PCM8 with no envelope, no
 filter and no transpose — so every feature is a flag test rather than a test of
 what kind of module this is. Flags: `0x01` envelope, `0x02` filter, `0x0c` filter
-type, `0x10` slice stop (a note started at a slice stops at the next boundary);
-`0xe0` is reserved and refused.
+type, `0x10` slice stop (a note started at a slice stops at the next boundary),
+`0x20` stereo (the sample interleaves L and R; `length` still counts frames, and
+only a PCM type may set it); `0xc0` is reserved and refused. **A reader older than
+the stereo bit refuses the file** — its reserved mask was `0xe0` — which is the
+right failure for a sample it would otherwise play as mono at the wrong stride.
 
 **The ADSR applies to a SYNTH instrument like any other**, because it lives one
 layer above the voice: `channel_gain_apply` runs it over whatever
@@ -706,11 +709,24 @@ already protects it.
 slot *parameter* is an FXPL command and has always been saved as automation; a
 slot's *kind* is deliberately not one — a row that swapped a shaper for a reverb
 would point the tank at memory the caller laid out for something else — and the
-stereo width has no command at all. So the block is 98 fixed bytes: `u16`
+stereo width has no command at all. Version 1 is 98 fixed bytes: `u16`
 version, `u16` slots (5), `u16` master gain and `u16` width in Q12, then per
-slot a `u8` kind, a reserved byte and eight `u16` parameters normalised 0..1.
-The five slots are the four sends and then the master; inserts are per channel
-and are not in it.
+slot a `u8` kind, a reserved byte and eight `u16` parameters normalised 0..1 —
+the four sends and then master FX 1. **Version 2** (167 bytes) appends a `u8`
+level per channel per send and a `u8` return per slot. **Version 3** (563 bytes)
+appends master FX 2 and 3 (a slot record each), then per channel a `u16` Q12
+volume, a `u8` pan (0 is the player's own LRRL layout), an insert slot record and
+a `u8` output (0 the master, *n* a send in Bus mode), then per send a `u8` output
+(0 the master, or a higher send) and a `u8` mode (0 Send, 1 Bus). Each version
+only appends, so every earlier offset keeps its meaning, and a writer uses the
+narrowest version that says the module: an untouched file keeps its bytes.
+
+**A reader older than a version refuses that block whole** — the version and the
+length are checked exactly — and, the block being optional, plays the tune with
+no mixer at all rather than half of one. A partial read (the v2 sends but not the
+routing) would run a Bus as an effect send: a grouped channel would skip its group's
+effect and fader, and a Bus holding an effect would return it as a wet send — a
+mix nobody made.
 
 It is **optional**, and `ntrk.h` never reads a byte of it — a mixer's
 configuration is not something a replayer can act on, so the format's own layer
