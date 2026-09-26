@@ -1339,7 +1339,7 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       return false;
 
     ins.bits = instrument_bits_for(ins.type);
-    const size_t bps = (size_t) (ins.bits / 8u);
+    const size_t bps = (size_t) instrument_frame_bytes(ins);
 
     // `length * bps` is a multiply that can wrap on a 32-bit size_t; the
     // division cannot, and for integers the two say the same thing.
@@ -1737,8 +1737,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     }
     if (ins.type == (uint8_t) InstrumentType::kWaveBuiltin)
       continue;         // generated at load, so it stores nothing at all
-    const bool wide = ins.type == (uint8_t) InstrumentType::kPcm16;
-    blob_bytes += (size_t) ins.length * (size_t) (wide ? 2u : 1u);
+    blob_bytes += instrument_blob_bytes(ins);
   }
 
   // The two fields the loader will check on the way back in. Everything else in
@@ -1929,8 +1928,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
       write_u32(e + 4, ins.length);
       write_u32(e + 8, ins.loop_start);
       write_u32(e + 12, ins.loop_len);
-      const bool wide = ins.type == (uint8_t) InstrumentType::kPcm16;
-      offset += ins.length * (uint32_t) (wide ? 2u : 1u);
+      offset += (uint32_t) instrument_blob_bytes(ins);
     }
     e[16] = ins.volume;
     e[17] = (uint8_t) ins.finetune;
@@ -1969,8 +1967,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     if (ins.type == (uint8_t) InstrumentType::kWaveBuiltin)
       continue;
     const uint8_t *d = (const uint8_t *) (const void *) ins.data;
-    const bool wide = ins.type == (uint8_t) InstrumentType::kPcm16;
-    const size_t n = (size_t) ins.length * (size_t) (wide ? 2u : 1u);
+    const size_t n = instrument_blob_bytes(ins);
     for (size_t k = 0; k < n; ++k)
       out[at++] = d[k];
   }

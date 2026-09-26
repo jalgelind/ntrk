@@ -379,6 +379,20 @@ instrument_bits_for(uint8_t type) {
   return type == (uint8_t) InstrumentType::kPcm16 ? (uint8_t) 16u : (uint8_t) 8u;
 }
 
+// The bytes one frame of an instrument's data takes, and the bytes all of it takes in the
+// blob. **The one spelling of a sample's size**: the loader's containment check and the
+// writer's three walks (size, directory, copy) all read these, so a sample shape that changes
+// its stride changes it once.
+inline uint32_t
+instrument_frame_bytes(const Instrument &ins) {
+  return (uint32_t) (instrument_bits_for(ins.type) / 8u);
+}
+
+inline size_t
+instrument_blob_bytes(const Instrument &ins) {
+  return (size_t) ins.length * (size_t) instrument_frame_bytes(ins);
+}
+
 // One cell. Four bytes, because that is what a pattern is mostly made of and a
 // tune is thousands of them: 64 rows by 4 channels by 4 bytes is a 1K pattern.
 struct Note {
