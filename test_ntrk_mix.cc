@@ -2825,6 +2825,87 @@ test_send_modes_and_stereo_taps() {
   strip_clear();
 }
 
+// Routing: a channel into a Bus goes there INSTEAD of the master, and a send into a higher send
+// reaches the master once. Each check is arranged so the additions happen in the same order
+// either way, which is what lets them be exact.
+static void
+test_routing() {
+  printf("a channel routed to a Bus leaves the master; a send routed on arrives once\n");
+  const size_t bytes = sizeof(double) * (size_t) (kTickFrames * 6) * 2u;
+
+  // One channel through an empty Bus is bit-identical to the same channel direct.
+  mac_build(1, 1);
+  for (int c = 1; c < kMacChannels; ++c)
+    g_mac_pat[c] = Note();
+  slot_clear();
+  strip_clear();
+  slot_render(6, g_a);
+  g_mixer.send_mode[2] = mix::SendMode::kBus;
+  g_mixer.channel_output[0] = 3u;
+  slot_render(6, g_b);
+  CHECK(memcmp(g_a, g_b, bytes) == 0);
+  CHECK(peak_of(g_a, kTickFrames * 12) > 0.0);
+
+  // Absent from the master: routed with the Bus's return at zero is the render without it.
+  mac_build(1, 1);
+  slot_clear();
+  strip_clear();
+  g_mac_pat[0] = Note();                        // channel 0 silent: the reference
+  slot_render(6, g_a);
+  mac_build(1, 1);
+  g_mixer.send_mode[2] = mix::SendMode::kBus;
+  g_mixer.channel_output[0] = 3u;
+  g_mixer.return_level[2] = 0.f;
+  slot_render(6, g_b);
+  CHECK(memcmp(g_a, g_b, bytes) == 0);
+  g_mixer.return_level[2] = 1.f;
+
+  // An output naming a Send is ignored: the channel stays on the master.
+  mac_build(1, 1);
+  slot_clear();
+  strip_clear();
+  slot_render(6, g_a);
+  g_mixer.channel_output[0] = 2u;               // S2 is a Send
+  slot_render(6, g_b);
+  CHECK(memcmp(g_a, g_b, bytes) == 0);
+
+  // S1 -> S2: the tap arrives once, not twice. Both sends pass through (a filter at 0 is off).
+  mac_build(1, 1);
+  slot_clear();
+  strip_clear();
+  mix::slot_set_kind(&g_mixer.send[0], mix::FxKind::kFilter);
+  mix::slot_set_kind(&g_mixer.send[1], mix::FxKind::kFilter);
+  for (int c = 0; c < kMacChannels; ++c)
+    g_mixer.send_level[c][0] = 0.5f;
+  slot_render(6, g_a);
+  g_mixer.send_output[0] = 2u;
+  slot_render(6, g_b);
+  CHECK(memcmp(g_a, g_b, bytes) == 0);
+  // ...and a destination that is not running sends it to the master rather than nowhere.
+  mix::slot_set_kind(&g_mixer.send[1], mix::FxKind::kNone);
+  slot_render(6, g_b);
+  CHECK(memcmp(g_a, g_b, bytes) == 0);
+
+  // Two channels panned apart into an empty Bus come back stereo.
+  mac_build(1, 1);
+  slot_clear();
+  strip_clear();
+  g_mixer.send_mode[3] = mix::SendMode::kBus;
+  g_mixer.channel_pan[0] = 1u;                  // hard left
+  g_mixer.channel_pan[1] = 255u;                // hard right
+  g_mixer.channel_output[0] = 4u;
+  g_mixer.channel_output[1] = 4u;
+  slot_render(6, g_b);
+  long differ = 0;
+  for (int i = 0; i < kTickFrames * 12; i += 2)
+    if (g_b[i] != g_b[i + 1])
+      ++differ;
+  CHECK(differ > 0);
+
+  slot_clear();
+  strip_clear();
+}
+
 // The widened macro target range, which is the same numbering as the set
 // commands and needed no second accumulator: `Slot::param` already persists
 // across ticks the way `fxpl_val` does.
@@ -4613,6 +4694,7 @@ main(void) {
   test_master_slots_from_the_plane();
   test_channel_strip();
   test_send_modes_and_stereo_taps();
+  test_routing();
   test_slot_macro_targets();
   test_slot_resync_restores_the_configuration();
   test_slot_apply_skips_and_fires();

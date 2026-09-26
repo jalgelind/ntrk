@@ -1822,9 +1822,19 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
         }
       }
 
+      // **Where the channel goes**: the master, or a Bus it is routed into -- instead of the
+      // master, not as well, which is what makes the Bus's return the group's fader. An output
+      // naming a send that is not a Bus is ignored at use (the setter refuses it too), so a send
+      // switched back to Send mode does not swallow the channels that were grouped into it.
+      float *out_l = mx->mix_l, *out_r = mx->mix_r;
+      const int to = (int) mx->channel_output[c];
+      if (to > 0 && to <= kSends && mx->send_mode[to - 1] == SendMode::kBus) {
+        out_l = mx->send_bus[to - 1][0];
+        out_r = mx->send_bus[to - 1][1];
+      }
       for (int i = 0; i < run; ++i) {
-        mx->mix_l[i] += v[i] * gain_l[c];
-        mx->mix_r[i] += v[i] * gain_r[c];
+        out_l[i] += v[i] * gain_l[c];
+        out_r[i] += v[i] * gain_r[c];
       }
     }
 
@@ -1854,16 +1864,25 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       // choice about the mix rather than a silent send.
       peak_hold(&mx->slot_peak[s], run_peak(bus_l, bus_r, run), run_secs);
 
+      // **Where the return goes**: the master, or a HIGHER send -- processed later in this same
+      // loop, so its bus has everything by the time it runs. A destination that is not running
+      // (a Send with no effect) would drop the signal on the floor, so it goes to the master.
+      float *ret_l = mx->mix_l, *ret_r = mx->mix_r;
+      const int to = (int) mx->send_output[s];
+      if (to > s + 1 && to <= kSends && send_on[to - 1]) {
+        ret_l = mx->send_bus[to - 1][0];
+        ret_r = mx->send_bus[to - 1][1];
+      }
       const float ret = mx->return_level[s];
       if (ret >= 1.f) {
         for (int i = 0; i < run; ++i) {
-          mx->mix_l[i] += bus_l[i];
-          mx->mix_r[i] += bus_r[i];
+          ret_l[i] += bus_l[i];
+          ret_r[i] += bus_r[i];
         }
       } else if (ret > 0.f) {
         for (int i = 0; i < run; ++i) {
-          mx->mix_l[i] += bus_l[i] * ret;
-          mx->mix_r[i] += bus_r[i] * ret;
+          ret_l[i] += bus_l[i] * ret;
+          ret_r[i] += bus_r[i] * ret;
         }
       }
       // ...and at zero nothing is added at all, so a silenced send costs the mix nothing
