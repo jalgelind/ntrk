@@ -43,7 +43,7 @@ slot_set_kind(Slot *s, FxKind kind) {
   // a byte in, and an enum class holding a value it has no name for is exactly
   // the case this existed for. One test rather than two now, because the
   // underlying type is unsigned and there is no longer a below-zero to reject.
-  if (kind > FxKind::kReverb)
+  if (kind > FxKind::kLimiter)
     kind = FxKind::kNone;   // an unknown kind is off, not a guess
   s->kind = kind;
   slot_hold(s);
@@ -55,6 +55,7 @@ slot_set_kind(Slot *s, FxKind kind) {
   fx::svf_reset(&s->svf[1]);
   fx::delay_reset(&s->delay);
   fx::reverb_reset(&s->reverb);
+  s->lim_gain = 1.f;
 }
 
 bool
@@ -84,6 +85,91 @@ slot_filter_sample(fx::Svf *f, FilterMode mode, float x) {
   }
 }
 
+// 10^(db/20) without libm, for the limiter's coefficients: an octave count and
+// a cubic for 2^f on [0,1) (within 0.01 dB), so the answer is the same bits on
+// every platform, like the rest of this file.
+static float
+db_to_gain(float db) {
+  float x = db * 0.166096405f;            // log2(10) / 20
+  if (!(x > -24.f)) return 0.f;
+  if (x > 24.f) x = 24.f;
+  int n = (int) x;
+  if ((float) n > x) --n;                 // floor, for negatives too
+  const float f = x - (float) n;
+  float y = 1.f + f * (0.695976f + f * (0.224494f + f * 0.0795301f));
+  for (; n > 0; --n) y *= 2.f;
+  for (; n < 0; ++n) y *= 0.5f;
+  return y;
+}
+
+// The divisions a delay's Sync chooses between, in beats. Index 0 is off.
+static const int kDelaySyncCount = 13;
+static const float kDelaySyncBeats[kDelaySyncCount] = {
+    0.f,    0.125f, 1.f / 6.f, 0.25f, 0.375f, 1.f / 3.f, 0.5f,
+    0.75f,  2.f / 3.f, 1.f,    1.5f,  2.f,    4.f};
+static const char *const kDelaySyncNames[kDelaySyncCount] = {
+    "off", "1/32", "1/16T", "1/16", "1/16D", "1/8T", "1/8",
+    "1/8D", "1/4T", "1/4", "1/4D", "1/2", "1/1"};
+
+bool
+fx_param_idle(FxKind kind, int param, const float *params) {
+  return params != nullptr && kind == FxKind::kDelay && param == 0 &&
+         slot_choice(params[5], kDelaySyncCount) != 0;
+}
+
+// A synced delay is a division of the tune's beat, capped at the line's
+// length; off -- or no tempo to divide -- is the Time knob, as it always was.
+static float
+slot_delay_seconds(const Slot *s) {
+  const int sync = slot_choice(s->param[5], kDelaySyncCount);
+  if (!fx_param_idle(FxKind::kDelay, 0, s->param) || !(s->beat_seconds > 0.f))
+    return s->param[0] * kSlotDelayMaxSeconds;
+  const float t = kDelaySyncBeats[sync] * s->beat_seconds;
+  return t < kSlotDelayMaxSeconds ? t : kSlotDelayMaxSeconds;
+}
+
+static const float kSlotLimiterRangeDb = 24.f;
+static const float kSlotCeilingRangeDb = 12.f;
+
+// 10 ms at 0, 1 s at 1, quadratic so the short end -- where it is heard --
+// gets the travel.
+static float
+slot_limiter_release(float v) {
+  return 0.01f + 0.99f * v * v;
+}
+
+// A peak limiter with no lookahead: instant attack (smoothing the way down
+// would let the sample that asked for it through), a linear release (a
+// one-pole towards unity stalls a few ulps short of it, so a slot that limited
+// once would never again be the identity), and a clamp for the last ulp.
+static void
+slot_limit(Slot *s, float *l, float *r, int frames) {
+  const float pre = s->lim_pre, ceil = s->lim_ceil, step = s->lim_step;
+  float g = s->lim_gain;
+  for (int i = 0; i < frames; ++i) {
+    const float xl = l[i] * pre;
+    const float xr = r != nullptr ? r[i] * pre : xl;
+    float peak = std::fabs(xl);
+    const float pr = std::fabs(xr);
+    if (pr > peak) peak = pr;
+    const float target = peak > ceil ? ceil / peak : 1.f;
+    if (target < g) {
+      g = target;
+    } else {
+      g += step;
+      if (g > target) g = target;
+    }
+    float yl = xl * g;
+    yl = yl > ceil ? ceil : (yl < -ceil ? -ceil : yl);
+    l[i] = yl;
+    if (r != nullptr) {
+      float yr = xr * g;
+      r[i] = yr > ceil ? ceil : (yr < -ceil ? -ceil : yr);
+    }
+  }
+  s->lim_gain = g;
+}
+
 void
 slot_apply_params(Slot *s, float rate) {
   // **The whole cost of a slot that nobody is automating.** `slot_process_*`
@@ -93,10 +179,12 @@ slot_apply_params(Slot *s, float rate) {
   // question is whether the setter would be handed the same bits, not whether
   // two parameters are close.
   if (s->applied_kind == (int) s->kind && s->applied_rate == rate &&
+      s->applied_beat == s->beat_seconds &&
       memcmp(s->param, s->applied, sizeof s->param) == 0)
     return;
   s->applied_kind = (int) s->kind;
   s->applied_rate = rate;
+  s->applied_beat = s->beat_seconds;
   memcpy(s->applied, s->param, sizeof s->param);
 
   // **This is where 0..1 becomes seconds and hertz.** The slot layer owns the
@@ -117,9 +205,17 @@ slot_apply_params(Slot *s, float rate) {
       }
       break;
     case FxKind::kDelay:
-      fx::delay_set(&s->delay, s->param[0] * kSlotDelayMaxSeconds, s->param[1],
+      fx::delay_set(&s->delay, slot_delay_seconds(s), s->param[1],
                     s->param[2], s->param[3], s->param[4] > 0.5f);
       break;
+    case FxKind::kLimiter: {
+      const float threshold = db_to_gain(-kSlotLimiterRangeDb * s->param[0]);
+      s->lim_ceil = db_to_gain(-kSlotCeilingRangeDb * s->param[1]);
+      s->lim_pre = s->lim_ceil / threshold;
+      const float release = slot_limiter_release(s->param[2]);
+      s->lim_step = rate > 1.f ? 1.f / (release * rate) : 1.f;
+      break;
+    }
     case FxKind::kReverb: {
       // **Zero on one of the three late knobs means "as the five-knob call
       // derived it", not the bottom of its range.** They live in indices that
@@ -193,6 +289,9 @@ slot_process_stereo(Slot *s, float *l, float *r, int frames, float rate) {
     case FxKind::kReverb:
       fx::reverb_process(&s->reverb, l, r, frames);
       break;
+    case FxKind::kLimiter:
+      slot_limit(s, l, r, frames);
+      break;
     default:
       break;
   }
@@ -202,10 +301,16 @@ void
 slot_process_mono(Slot *s, float *m, int frames, float rate) {
   if (s == nullptr || m == nullptr || frames <= 0)
     return;
-  if (s->kind != FxKind::kShape && s->kind != FxKind::kFilter)
+  if (s->kind != FxKind::kShape && s->kind != FxKind::kFilter &&
+      s->kind != FxKind::kLimiter)
     return;
 
   slot_apply_params(s, rate);
+
+  if (s->kind == FxKind::kLimiter) {
+    slot_limit(s, m, nullptr, frames);
+    return;
+  }
 
   if (s->kind == FxKind::kShape) {
     const fx::ShapeKind kind = (fx::ShapeKind) slot_choice(s->param[0], 4);
@@ -382,36 +487,34 @@ mixer_pan_gains(const Player *player, bool stereo, float *gain_l,
 const float kHeadroom = 0.25f;
 
 // **And the hard clip is deliberately not reused.** `render_add` clamps each
-// bus to +-1 after the gain; doing that here would mean the limiter never sees
-// a sample above full scale, which is every peak it exists to catch. A clip in
-// front of a limiter is a limiter that does nothing.
+// bus to +-1 after the gain; a soft knee is what keeps an over from sounding
+// like one, and a hard clip in front of it would leave the knee nothing to do.
 
-// -1 dBFS, the usual delivery ceiling: a little under full scale so that a
-// resampler or a lossy encoder downstream has somewhere to put its overshoot.
-const float kLimiterCeiling = 0.891250938f;
+// Full scale. **A guard, not the loudness stage**: that is a FxKind::kLimiter in
+// the master slot, whose ceiling reaches -12..0 dB -- so the clipper sits above
+// everything a limiter would let through and touches none of it, rather than
+// reshaping a limited master a second time.
+const float kClipCeiling = 1.f;
 
-// Where the knee starts, about -3.1 dBFS. Below this the limiter multiplies by
-// exactly 1.0f, which is an identity in IEEE -- that is what makes "no effects"
-// provably the pan and gain path alone rather than merely inaudibly close to it.
-const float kLimiterKnee = 0.7f;
-
-// Long enough that a bass note does not pump the whole mix under it, short
-// enough to hand the level back before the next phrase.
-const float kLimiterReleaseSeconds = 0.05f;
+// Where the knee starts, -1 dBFS. Below this a sample passes untouched, which is
+// what makes "no effects" provably the pan and gain path alone rather than
+// merely inaudibly close to it -- and what a limiter's default -1.2 dB ceiling
+// stays under.
+const float kClipKnee = 0.891250938f;
 
 float
-limiter_curve(float peak) {
-  if (peak <= kLimiterKnee)
-    return peak;
-  const float range = kLimiterCeiling - kLimiterKnee;
-  return kLimiterKnee + range * fx::soft_clip((peak - kLimiterKnee) / range);
+clip_curve(float magnitude) {
+  if (magnitude <= kClipKnee)
+    return magnitude;
+  const float range = kClipCeiling - kClipKnee;
+  return kClipKnee + range * fx::soft_clip((magnitude - kClipKnee) / range);
 }
 
 float
-limiter_ceil(float x) {
-  if (x > kLimiterCeiling)
-    return kLimiterCeiling;
-  return x < -kLimiterCeiling ? -kLimiterCeiling : x;
+clip_ceil(float x) {
+  if (x > kClipCeiling)
+    return kClipCeiling;
+  return x < -kClipCeiling ? -kClipCeiling : x;
 }
 
 namespace {
@@ -465,7 +568,6 @@ mixer_reset(Mixer *mx) {
   }
   slot_revert(&mx->master_fx);
   slot_set_kind(&mx->master_fx, mx->master_fx.kind);
-  mx->limit_gain = 1.f;
   // Every tail is gone, so every meter is empty. Left to the release it would
   // fall from wherever the last tune left it, which reads as a bus still
   // running after the thing feeding it was dropped.
@@ -533,7 +635,7 @@ config_readable(const uint8_t *block) {
       ntrk::read_u16(block + 2) != (uint16_t) kMixrSlots)
     return false;
   for (int i = 0; i < kMixrSlots; ++i)
-    if (block[kMixrHeaderBytes + i * kMixrSlotBytes] > (uint8_t) FxKind::kReverb)
+    if (block[kMixrHeaderBytes + i * kMixrSlotBytes] > (uint8_t) FxKind::kLimiter)
       return false;
   return true;
 }
@@ -659,7 +761,7 @@ config_set_slot_kind(uint8_t *block, int slot, FxKind kind) {
     return;
   // The same ceiling `config_readable` enforces, so a set can never leave a
   // block this file would then refuse to read back.
-  if ((uint8_t) kind > (uint8_t) FxKind::kReverb)
+  if ((uint8_t) kind > (uint8_t) FxKind::kLimiter)
     return;
   block[kMixrHeaderBytes + slot * kMixrSlotBytes] = (uint8_t) kind;
 }
@@ -701,7 +803,7 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
   // as it parsed -- half a mixer is a tune that plays, sounds wrong, and says
   // nothing about why.
   for (int i = 0; i < kMixrSlots; ++i)
-    if (p[kMixrHeaderBytes + i * kMixrSlotBytes] > (uint8_t) FxKind::kReverb)
+    if (p[kMixrHeaderBytes + i * kMixrSlotBytes] > (uint8_t) FxKind::kLimiter)
       return false;
 
   mx->master_gain = (float) ntrk::read_u16(p + 4) / (float) kMixrQUnit;
@@ -1250,58 +1352,15 @@ fxpl_run(Mixer *mx, Player *player, int order, int row, int tick) {
 }
 
 void
-limiter_process(Mixer *mx, float *l, float *r, int frames, float rate) {
-  // **A linear ramp, not the usual one-pole.** exp() is not bit-identical
-  // across platforms and this output is hashed, which rules the textbook
-  // coefficient out; and a one-pole towards unity *stalls* a few parts in
-  // 100000 short of it, because the remaining step falls under half an ulp
-  // long before the difference does. A gain of 0.99993 for ever afterwards is
-  // inaudible and is not 1.0f, so a mixer that limited once would never again
-  // be bit-for-bit the unprocessed path. A ramp lands on the target exactly.
-  float step = (rate > 1.f) ? 1.f / (kLimiterReleaseSeconds * rate) : 1.f;
-  if (step > 1.f)
-    step = 1.f;
-  if (!(step > 0.f))
-    step = 1.f;                 // a NaN rate lands here rather than freezing
-
-  float g = mx->limit_gain;
+soft_clip_process(float *l, float *r, int frames) {
+  // Per sample and stateless: a sample under the knee is returned as it came,
+  // bit for bit. The clamp is the last ulp of `clip_curve`'s own bound, not a
+  // clip in front of it.
   for (int i = 0; i < frames; ++i) {
-    float peak = std::fabs(l[i]);
-    const float peak_r = std::fabs(r[i]);
-    if (peak_r > peak)
-      peak = peak_r;
-
-    float target = 1.f;
-    if (peak > kLimiterKnee)
-      target = limiter_curve(peak) / peak;
-
-    if (target < g) {
-      // **Instantaneous attack, and with no lookahead it has to be.** Smoothing
-      // the way down lets the sample that asked for the reduction through at
-      // full height, which is precisely the peak the ceiling was promised
-      // against. The knee is what keeps that from sounding like a clip: by the
-      // time the gain moves quickly it has already been moving gently for
-      // 3 dB.
-      g = target;
-    } else {
-      // Never past the target: overshooting it while the signal is still over
-      // the knee is the one way a gain computed from the peak stops bounding
-      // the peak it was computed from.
-      g += step;
-      if (g > target)
-        g = target;
-    }
-
-    // The clamp is the last ulp of the limiter's own promise, not a clip in
-    // front of it: `g` is `curve(peak)/peak`, so a divide and a multiply later
-    // the product can land one ulp the wrong side of the ceiling, and a
-    // ceiling that holds to within a rounding error is not a ceiling anything
-    // can be tested against. It cannot fire on a sample the gain already
-    // brought under, so it colours nothing.
-    l[i] = limiter_ceil(l[i] * g);
-    r[i] = limiter_ceil(r[i] * g);
+    const float al = std::fabs(l[i]), ar = std::fabs(r[i]);
+    if (al > kClipKnee) l[i] = clip_ceil(l[i] < 0.f ? -clip_curve(al) : clip_curve(al));
+    if (ar > kClipKnee) r[i] = clip_ceil(r[i] < 0.f ? -clip_curve(ar) : clip_curve(ar));
   }
-  mx->limit_gain = g;
 }
 
 void
@@ -1352,6 +1411,16 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
     // time and not a fixed one -- `player_run_begin` cuts it at the next tick --
     // so a fall per BLOCK would be a fall that changed with the tempo.
     const float run_secs = frate > 0.f ? (float) run / frate : 0.f;
+
+    // The beat a synced delay divides, per run because an Fxx can move it
+    // mid-block. A row lasts `speed` ticks of 2.5/bpm seconds.
+    const float beat = player->bpm > 0
+                           ? (float) (m->rows_per_beat * player->speed) * 2.5f /
+                                 (float) player->bpm
+                           : 0.f;
+    for (int s = 0; s < kSends; ++s)
+      mx->send[s].beat_seconds = beat;
+    mx->master_fx.beat_seconds = beat;
 
     // **A module with no plane drops what was queued rather than holding it.** The
     // plane is where a macro is applied, so a pending input has nowhere to go --
@@ -1548,10 +1617,10 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       }
     }
 
-    limiter_process(mx, mx->mix_l, mx->mix_r, run, frate);
+    soft_clip_process(mx->mix_l, mx->mix_r, run);
 
     // The master is what the caller is about to hear -- after the gain, the
-    // master effect, the width and the limiter. **And every send that did NOT
+    // master effect, the width and the soft clipper. **And every send that did NOT
     // run this block falls too**: a slot switched off mid-tail would otherwise
     // hold its last peak forever, which reads as a bus still running.
     peak_hold(&mx->slot_peak[kSends], run_peak(mx->mix_l, mx->mix_r, run), run_secs);
@@ -1587,6 +1656,7 @@ fx_kind_name(FxKind kind) {
     case FxKind::kFilter: return "Filter";
     case FxKind::kDelay:  return "Delay";
     case FxKind::kReverb: return "Reverb";
+    case FxKind::kLimiter: return "Limiter";
     default:        return nullptr;
   }
 }
@@ -1602,7 +1672,8 @@ fx_param_name(FxKind kind, int param) {
   static const char *const shape[8]  = {"Kind", "Drive", "Dry"};
   static const char *const filter[8] = {"Mode", "Cutoff", "Resonance"};
   static const char *const delay[8]  = {"Time", "Feedback", "Damping", "Mix",
-                                        "Ping-pong"};
+                                        "Ping-pong", "Sync"};
+  static const char *const limiter[8] = {"Threshold", "Ceiling", "Release"};
   // Index 1 keeps the bare name it has always printed. It is the treble shelf
   // and index 6 is the bass one, but renaming it would move a string an editor
   // and this library's own tests already read, for no new information.
@@ -1614,6 +1685,7 @@ fx_param_name(FxKind kind, int param) {
     case FxKind::kFilter: return filter[param];
     case FxKind::kDelay:  return delay[param];
     case FxKind::kReverb: return reverb[param];
+    case FxKind::kLimiter: return limiter[param];
     default:        return nullptr;
   }
 }
@@ -1629,6 +1701,8 @@ fx_param_choice_count(FxKind kind, int param) {
     return 3;                            // slot_choice(param[0], 3) -> FilterMode
   if (kind == FxKind::kDelay && param == 4)
     return 2;                            // param[4] > 0.5f -> ping-pong on/off
+  if (kind == FxKind::kDelay && param == 5)
+    return kDelaySyncCount;              // slot_delay_seconds
   return 0;
 }
 
@@ -1645,6 +1719,8 @@ fx_param_choice_name(FxKind kind, int param, int i) {
   // would have been the third place these four words were written.
   if (kind == FxKind::kFilter)
     return filter_mode_names(nullptr)[i];
+  if (kind == FxKind::kDelay && param == 5)
+    return kDelaySyncNames[i];
   return offOn[i];
 }
 
@@ -1692,6 +1768,17 @@ fx_param_value_text(FxKind kind, int param, float v, char *out, size_t cap) {
     text_add(&t, " ms");
     return t.len;
   }
+  if (kind == FxKind::kLimiter && param <= 1) {
+    const double db = -(param == 0 ? kSlotLimiterRangeDb : kSlotCeilingRangeDb) * v;
+    text_fixed1(&t, std::fabs(db) < 0.05 ? 0.0 : db);
+    text_add(&t, " dB");
+    return t.len;
+  }
+  if (kind == FxKind::kLimiter && param == 2) {
+    text_int(&t, (long) std::lround(double(slot_limiter_release(v)) * 1000.0));
+    text_add(&t, " ms");
+    return t.len;
+  }
   if (kind == FxKind::kReverb && param >= 5 && v <= 0.f) {
     text_add(&t, "auto");                // derived from the size, `reverb_derived`
     return t.len;
@@ -1730,7 +1817,13 @@ fx_param_default(FxKind kind, int param, bool wet) {
   // the numbers that make "switch it on" mean "hear it".
   static const float shape[kMixrSlotParams]  = {0.f, 0.3f, 0.f};
   static const float filter[kMixrSlotParams] = {0.f, 0.7f, 0.2f};
-  static const float delay[kMixrSlotParams]  = {0.3f, 0.35f, 0.3f, 1.f, 0.f};
+  // Sync at 1/8D: the delay a tracker tune usually wants, and it follows the tempo.
+  static const float delay[kMixrSlotParams]  = {0.3f, 0.35f, 0.3f, 1.f, 0.f,
+                                                slot_choice_param(7, kDelaySyncCount)};
+  // -3 dB threshold into a -1.2 dB ceiling, 200 ms release: a master that
+  // catches peaks without pumping, with the ceiling under the soft clipper's
+  // knee so nothing after it reshapes what it let through.
+  static const float limiter[kMixrSlotParams] = {0.125f, 0.1f, 0.44f};
   static const float reverb[kMixrSlotParams] = {0.5f, 0.4f, 0.1f, 1.f,
                                                 1.f,  0.5f, 0.3f, 0.7f};
   const float *t;
@@ -1739,6 +1832,7 @@ fx_param_default(FxKind kind, int param, bool wet) {
     case FxKind::kFilter: t = filter; break;
     case FxKind::kDelay:  t = delay;  break;
     case FxKind::kReverb: t = reverb; break;
+    case FxKind::kLimiter: t = limiter; break;
     default: return 0.f;
   }
   float v = t[param];

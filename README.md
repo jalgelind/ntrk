@@ -49,7 +49,7 @@ Three rules a caller has to keep:
 | `ntrk_fx_shape.h` | header | the waveshapers and the state-variable filter |
 | `ntrk_fx_delay.h` / `.cc` | split | stereo delay |
 | `ntrk_fx_reverb.h` / `.cc` | split | a Gardner diffuser into an eight-line FDN |
-| `ntrk_mix.h` / `.cc` | split | slots, sends, the effect plane, the limiter |
+| `ntrk_mix.h` / `.cc` | split | slots, sends, the effect plane, the soft clipper |
 | `ntrk_unity.h` | header | includes the `.cc` files, for a single-TU build |
 | `ntrk_render.cc` | tool | renders a module to a WAV; not part of the library |
 | `ntrk_gen.cc` | tool | writes the coverage module the cross-target check renders |

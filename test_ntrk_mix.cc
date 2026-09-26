@@ -185,13 +185,12 @@ test_bypass_is_render_add() {
   CHECK(differ == 0);
 }
 
-// A limiter that does not bound its output is decoration. The ceiling is
-// -1 dBFS, and the input here is driven four times over full scale.
+// A clipper that does not bound its output is decoration. The ceiling is full
+// scale, and the input here is driven four times over it.
 static void
-test_limiter_bounds() {
-  printf("the limiter bounds a signal driven 12 dB hot\n");
+test_soft_clip_bounds() {
+  printf("the master soft clipper bounds a signal driven 12 dB hot\n");
 
-  mix::mixer_reset(&g_mixer);
   float peak = 0.f;
   g_rng = 1u;
   for (int block = 0; block < 200; ++block) {
@@ -199,7 +198,7 @@ test_limiter_bounds() {
       g_l[i] = noise() * 4.f;
       g_r[i] = noise() * 4.f;
     }
-    mix::limiter_process(&g_mixer, g_l, g_r, 1024, 48000.f);
+    mix::soft_clip_process(g_l, g_r, 1024);
     for (int i = 0; i < 1024; ++i) {
       const float a = g_l[i] < 0.f ? -g_l[i] : g_l[i];
       const float b = g_r[i] < 0.f ? -g_r[i] : g_r[i];
@@ -207,10 +206,20 @@ test_limiter_bounds() {
       if (b > peak) peak = b;
     }
   }
-  // 10^(-1/20). The tolerance is for the compare, not for the limiter: the
-  // measured value lands on the ceiling exactly.
-  CHECK(peak <= 0.891251f + 1e-6f);
-  CHECK(peak > 0.5f);   // and it is limiting, not muting
+  CHECK(peak <= 1.f);
+  CHECK(peak > 0.5f);   // and it is clipping, not muting
+  // Under the knee is the identity, bit for bit.
+  float a[1] = {0.89f}, b[1] = {-0.5f};
+  mix::soft_clip_process(a, b, 1);
+  CHECK(a[0] == 0.89f && b[0] == -0.5f);
+  // And a default master limiter's ceiling is under the knee, so nothing it
+  // lets through is reshaped here.
+  mix::Slot lim;
+  mix::slot_set_kind(&lim, mix::FxKind::kLimiter);
+  for (int p = 0; p < kMixrSlotParams; ++p)
+    lim.param[p] = mix::fx_param_default(mix::FxKind::kLimiter, p, false);
+  mix::slot_apply_params(&lim, 48000.f);
+  CHECK(lim.lim_ceil < 0.891250938f);
 }
 
 // An empty slot of every kind has to be an exact identity, or a mixer with one
@@ -219,7 +228,7 @@ static void
 test_empty_slots_are_identity() {
   printf("a default slot of every kind passes audio through untouched\n");
 
-  for (int k = 0; k <= (int) mix::FxKind::kReverb; ++k) {
+  for (int k = 0; k <= (int) mix::FxKind::kLimiter; ++k) {
     const mix::FxKind kind = (mix::FxKind) k;
     mix::Slot s;
     mix::slot_set_kind(&s, kind);
@@ -243,6 +252,78 @@ test_empty_slots_are_identity() {
         ++changed;
     CHECK(changed == 0);
   }
+}
+
+// A synced delay is a division of the beat and follows it; a limiter slot holds
+// its ceiling; both describe themselves in their own units.
+static void
+test_delay_sync_and_limiter_slot() {
+  printf("a synced delay follows the beat, and a limiter slot holds its ceiling\n");
+
+  static float mem[2 * 48000 * 2 + 1024];
+  mix::Slot d;
+  CHECK(fx::delay_init(&d.delay, mem, sizeof mem, 48000.f, 2.f));
+  d.param[0] = 0.1f;                                   // Time: 200 ms
+  d.param[5] = mix::slot_choice_param(6, 13);          // 1/8
+  mix::slot_set_kind(&d, mix::FxKind::kDelay);
+  d.beat_seconds = 0.5f;                               // 120 BPM
+  mix::slot_apply_params(&d, 48000.f);
+  CHECK(d.delay.time_target == 12000.f);               // an eighth of 120 BPM
+  d.beat_seconds = 0.25f;                              // tempo doubled
+  mix::slot_apply_params(&d, 48000.f);
+  CHECK(d.delay.time_target == 6000.f);
+  d.beat_seconds = 0.f;                                // no tempo: Time
+  mix::slot_apply_params(&d, 48000.f);
+  CHECK(d.delay.time_target > 9599.f && d.delay.time_target < 9601.f);
+  d.param[5] = 0.f;                                    // Sync off, tempo known
+  d.beat_seconds = 0.5f;
+  mix::slot_apply_params(&d, 48000.f);
+  CHECK(d.delay.time_target > 9599.f && d.delay.time_target < 9601.f);
+
+  mix::Slot l;
+  l.param[0] = 0.25f;                                  // -6 dB threshold
+  l.param[1] = 0.25f;                                  // -3 dB ceiling
+  mix::slot_set_kind(&l, mix::FxKind::kLimiter);
+  float peak = 0.f;
+  g_rng = 11u;
+  for (int block = 0; block < 20; ++block) {
+    for (int i = 0; i < 1024; ++i) {
+      g_l[i] = noise() * 4.f;
+      g_r[i] = noise() * 4.f;
+    }
+    mix::slot_process_stereo(&l, g_l, g_r, 1024, 48000.f);
+    for (int i = 0; i < 1024; ++i) {
+      const float a = g_l[i] < 0.f ? -g_l[i] : g_l[i];
+      const float b = g_r[i] < 0.f ? -g_r[i] : g_r[i];
+      if (a > peak) peak = a;
+      if (b > peak) peak = b;
+    }
+  }
+  CHECK(peak <= l.lim_ceil);
+  CHECK(l.lim_ceil > 0.705f && l.lim_ceil < 0.710f);   // 10^(-3/20), within 0.01 dB
+  CHECK(peak > 0.6f);
+
+  char buf[32];
+  CHECK(strcmp(mix::fx_kind_name(mix::FxKind::kLimiter), "Limiter") == 0);
+  CHECK(mix::fx_param_choice_count(mix::FxKind::kDelay, 5) == 13);
+  mix::fx_param_value_text(mix::FxKind::kDelay, 5, mix::slot_choice_param(7, 13), buf, sizeof buf);
+  CHECK(strcmp(buf, "1/8D") == 0);
+  mix::fx_param_value_text(mix::FxKind::kDelay, 5, 0.f, buf, sizeof buf);
+  CHECK(strcmp(buf, "off") == 0);
+  float dp[8] = {0.1f, 0.f, 0.f, 0.f, 0.f, mix::slot_choice_param(7, 13)};
+  CHECK(mix::fx_param_idle(mix::FxKind::kDelay, 0, dp));
+  CHECK(!mix::fx_param_idle(mix::FxKind::kDelay, 1, dp));
+  dp[5] = 0.f;
+  CHECK(!mix::fx_param_idle(mix::FxKind::kDelay, 0, dp));
+  CHECK(!mix::fx_param_idle(mix::FxKind::kReverb, 0, dp));
+  mix::fx_param_value_text(mix::FxKind::kLimiter, 1, 0.25f, buf, sizeof buf);
+  CHECK(strcmp(buf, "-3.0 dB") == 0);
+  mix::fx_param_value_text(mix::FxKind::kLimiter, 0, 0.f, buf, sizeof buf);
+  CHECK(strcmp(buf, "0.0 dB") == 0);
+  uint8_t block[kMixrBytes];
+  mix_default(block);
+  mix::config_set_slot_kind(block, kMixrSends, mix::FxKind::kLimiter);
+  CHECK(mix::config_slot_kind(block, kMixrSends) == mix::FxKind::kLimiter);
 }
 
 // **Two filter instances, not one.** svf_lowpass runs the whole state update
@@ -975,8 +1056,6 @@ test_synth_retrigger_resets_the_filter() {
   // note's ring, and nothing said so.
   CHECK(memcmp(g_b, g_b + (size_t) second * 2, sizeof(double) *
                                                    (size_t) window * 2u) == 0);
-  // And no limiter gain was in flight to scale one window against the other.
-  CHECK(g_mixer.limit_gain == 1.f);
 }
 
 // ---------------------------------------------------------------------------
@@ -4050,7 +4129,7 @@ test_choice_params_name_themselves() {
       for (int i = 0; i < n; ++i)
         CHECK(mix::slot_choice(mix::slot_choice_param(i, n), n) == i);
     }
-  CHECK(choices == 3);
+  CHECK(choices == 4);
 
   // The filter's words are `filter_mode_names`', not a copy of them.
   int nModes = 0;
@@ -4144,7 +4223,8 @@ test_config_reads_params_without_a_mixer() {
 int
 main(void) {
   test_bypass_is_render_add();
-  test_limiter_bounds();
+  test_soft_clip_bounds();
+  test_delay_sync_and_limiter_slot();
   test_empty_slots_are_identity();
   test_stereo_filter_isolation();
   test_mono_refuses_stereo_only_effects();

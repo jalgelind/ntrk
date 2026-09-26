@@ -8,7 +8,7 @@
 // `render_add` is the whole mixer ntrk ships: pan, gain, clip. This is the
 // other caller `player_run_begin` was separated out for -- it drives the same
 // sequencer and replaces the mix stage entirely, so a tune gets a per-channel
-// insert, four effect sends, a stereo width control and a limiter without the
+// insert, four effect sends, a stereo width control and a soft clipper without the
 // player knowing anything about any of it.
 //
 //     ntrk::mix::Mixer mixer;                 // wherever your state lives
@@ -59,7 +59,7 @@
 // and no instrument carrying a filter flag, no effect code runs at all and the
 // output is the pan and gain path alone --
 // which, at `master_gain == player->gain`, is bit for bit what `render_add`
-// produces below the limiter's knee. A default-constructed `Slot` is also an
+// produces below the soft clipper's knee. A default-constructed `Slot` is also an
 // identity whatever its kind, because every effect's off position is its
 // zero: drive 0, mix 0, cutoff 0.
 //
@@ -93,7 +93,7 @@ const int kSends = 4;
 // caller configuration, and the plane addresses a slot's *parameters* by index
 // without ever naming its kind -- see `kFxplSlotSet`. `uint8_t` all the same,
 // so a `Slot` costs what it did.
-enum class FxKind : uint8_t { kNone = 0, kShape, kFilter, kDelay, kReverb };
+enum class FxKind : uint8_t { kNone = 0, kShape, kFilter, kDelay, kReverb, kLimiter };
 
 enum class FilterMode : uint8_t { kLowpass = 0, kHighpass = 1, kBandpass = 2 };
 
@@ -120,10 +120,13 @@ enum class FilterMode : uint8_t { kLowpass = 0, kHighpass = 1, kBandpass = 2 };
 //                                2 resonance
 //   FxKind::kDelay   0 time (x kSlotDelayMaxSeconds)   1 feedback  2 damping
 //                                3 mix           4 ping-pong (>0.5)
+//                                5 sync (13 ways: off, 1/32 .. 1/1; off uses Time)
 //   FxKind::kReverb  0 size            1 damping (HF)  2 predelay
 //                                  (x kSlotPredelayMaxSeconds)
 //                                3 width         4 mix
 //                                5 decay         6 damping LF   7 diffusion
+//   FxKind::kLimiter 0 threshold (0..-24 dB)  1 ceiling (0..-12 dB)
+//                                2 release (10 ms .. 1 s)
 //
 // A discrete parameter is a band of the same 0..1, through `slot_choice` --
 // which is what lets a slide sweep a shaper through its four kinds without the
@@ -140,6 +143,9 @@ enum class FilterMode : uint8_t { kLowpass = 0, kHighpass = 1, kBandpass = 2 };
 //   kShape 2   is *dry*, not wet, so zero is the fully wet shaper a send has
 //              always been -- and unlike a sentinel it leaves the whole range
 //              reachable, including a fully dry bypass at 1.
+//   kDelay 5   zero is "off": the time is Time's, as it always was.
+//   kLimiter   a new kind, but its zeros are the identity too: 0 dB in, a
+//              0 dB ceiling, so a default slot touches nothing under full scale.
 //   kReverb 5,6,7  zero means "as `fx::reverb_derived` derives it from size",
 //              the same three values the five-knob `reverb_set` supplies. A
 //              decay of exactly 0 is the only setting this costs, and it is one
@@ -169,6 +175,20 @@ struct Slot {
   float applied[8] = {};
   int   applied_kind = -1;
   float applied_rate = 0.f;
+
+  // Seconds per beat of the tune playing through this slot, written by the
+  // mixer every run; what a synced delay's division multiplies. Zero is "no
+  // tempo known", and a synced delay then falls back to its Time knob.
+  float beat_seconds = 0.f;
+  float applied_beat = 0.f;
+
+  // FxKind::kLimiter's coefficients (from `slot_apply_params`) and its one
+  // piece of state, the gain. One gain for both channels, so a loud side does
+  // not shift the image.
+  float lim_pre = 1.f;       // input gain: ceiling over threshold
+  float lim_ceil = 1.f;      // linear ceiling
+  float lim_step = 1.f;      // release, gain units per frame
+  float lim_gain = 1.f;
 
   // Two filters, not one: a stereo pair needs its own state per channel, and
   // `svf_lowpass` runs the whole state update per call -- pushing left and then
@@ -245,7 +265,7 @@ void slot_apply_params(Slot *s, float rate);
 
 void slot_process_stereo(Slot *s, float *l, float *r, int frames, float rate);
 
-// **Only FxKind::kShape and FxKind::kFilter, and the others are refused rather
+// **Only FxKind::kShape, FxKind::kFilter and FxKind::kLimiter, and the others are refused rather
 // than approximated.** The obvious way to run a stereo effect over one mono
 // buffer is to pass it as both channels, and that is wrong twice over:
 // `delay_process` would read and write the same array through `left` and
@@ -432,7 +452,7 @@ float fxpl_clamp(float v);
 // number.
 float fxpl_to_pan(float v);
 
-// 128 is unity, so the command reaches a shade under +6 dB. The limiter is what
+// 128 is unity, so the command reaches a shade under +6 dB. The soft clipper is what
 // stands behind that; the gain is staged before the master effect either way.
 float fxpl_to_gain(float v);
 
@@ -455,20 +475,22 @@ void mixer_pan_gains(const Player *player, bool stereo, float *gain_l,
                      float *gain_r);
 
 // ----------------------------------------------------------------------------
-// -- Gain staging and the limiter
+// -- Gain staging and the soft clipper
 // ----------------------------------------------------------------------------
 //
 // The headroom, the ceiling, the knee and the release are in the .cc: nothing
 // outside the mixer reads them, and each carries the reasoning for its number.
 
-// A static soft knee, bounded by construction: `soft_clip` never exceeds 1, so
-// the return never exceeds the ceiling, and it reaches the ceiling exactly once
-// the input is three knee-widths past the knee (about +2.1 dBFS). `soft_clip`
-// rather than tanh() because it is arithmetic -- libm is not bit-identical
-// across platforms and this output gets hashed.
-float limiter_curve(float peak);
+// The master bus's last stage: a static soft knee on each sample's magnitude,
+// bounded by construction -- `soft_clip` never exceeds 1, so the return never
+// exceeds the ceiling (full scale), and it reaches it exactly once the input is
+// three knee-widths past the -1 dBFS knee (about +1.2 dBFS). `soft_clip` rather than
+// tanh() because it is arithmetic -- libm is not bit-identical across platforms
+// and this output gets hashed. Stateless: loudness control is a
+// FxKind::kLimiter in the master slot; this only keeps a peak off full scale.
+float clip_curve(float magnitude);
 
-float limiter_ceil(float x);
+float clip_ceil(float x);
 
 // ----------------------------------------------------------------------------
 // -- The mixer
@@ -582,10 +604,6 @@ struct Mixer {
 
   Slot  master_fx;
 
-  // The limiter's whole state. One gain for both channels -- a per-channel gain
-  // shifts the stereo image every time one side goes loud.
-  float limit_gain = 1.f;
-
   // -- What each bus is doing, for a host that wants to show it.
   //
   // **A send is the one thing in this mixer a listener cannot locate.** A slot
@@ -622,14 +640,14 @@ struct Mixer {
 // lane's own channel and is read only by `kSlotInsert`.
 Slot *slot_at(Mixer *mx, int slot, int channel);
 
-// Drops every tail and returns the limiter to unity gain. Settings are kept:
+// Drops every tail and every limiter slot to unity gain. Settings are kept:
 // this is the "stop the sound" call, not the "forget the patch" one -- so a
 // slot the plane had automated goes back to its `base`, which is the setting.
 void mixer_reset(Mixer *mx);
 
 // What slot `index` last put out, as a peak magnitude with a release applied:
 // 0..kSends-1 are the sends after their own effect, kSends is the master after
-// the gain, the master effect, the width and the limiter -- which is to say,
+// the gain, the master effect, the width and the soft clipper -- which is to say,
 // what the caller is about to hear.
 //
 // Zero for an index this mixer has no slot for, so a host that walks
@@ -743,7 +761,7 @@ float config_width(const uint8_t *block);
 // had one. False only for a null pointer.
 bool config_init(uint8_t *block);
 
-// A slot's kind. Refused (not clamped) past `kReverb`, which is the same ceiling
+// A slot's kind. Refused (not clamped) past `kLimiter`, which is the same ceiling
 // `config_readable` enforces: a set that left a block this file would refuse to
 // read back would be a mixer the editor can see and the player cannot.
 void config_set_slot_kind(uint8_t *block, int slot, FxKind kind);
@@ -774,6 +792,12 @@ size_t fx_param_value_text(FxKind kind, int param, float v, char *out, size_t ca
 // A linear gain -- a send, a return, the master -- in dB, one decimal: `0.0 dB` at unity,
 // `-inf dB` at zero.
 size_t level_text(float gain, char *out, size_t cap);
+
+// Whether `param` is set aside by another of the slot's own parameters: a delay's Time while
+// its Sync names a division. An editor greys or relabels it -- a knob that moves a readout
+// and not the sound reads as broken. `params` is the slot's eight. (With no tempo to divide
+// the mixer falls back to Time anyway; an editor has no player to ask, so this says "synced".)
+bool fx_param_idle(FxKind kind, int param, const float *params);
 
 // How many values a parameter really has, or 0 when it is continuous.
 //
@@ -964,7 +988,7 @@ void fxpl_slide(Mixer *mx, Player *player);
 // that what runs next is a row's first, and (order, row) is that row.
 void fxpl_run(Mixer *mx, Player *player, int order, int row, int tick);
 
-void limiter_process(Mixer *mx, float *l, float *r, int frames, float rate);
+void soft_clip_process(float *l, float *r, int frames);
 
 // Adds into `buffer` rather than over it, exactly as `render_add` does and for
 // the same reason: a renderer that assigns drops whatever else was already

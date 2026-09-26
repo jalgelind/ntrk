@@ -361,8 +361,8 @@ slot_setup(mix::Slot *s, mix::FxKind kind, bool wet) {
 
 // A default-constructed `Mixer`, kept once. Assigning from it is how the mixer
 // is returned to nothing-switched-on between cases: `mixer_reset` deliberately
-// keeps the settings, and a `memset` would flatten the three members whose
-// off position is not zero (`master_gain`, `width`, `limit_gain`).
+// keeps the settings, and a `memset` would flatten the two members whose
+// off position is not zero (`master_gain` and `width`).
 static const mix::Mixer kMixerOff = {};
 
 static void
