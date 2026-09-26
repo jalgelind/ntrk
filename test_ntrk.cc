@@ -1556,8 +1556,8 @@ test_v2_refusals() {
   CHECK(!ntrk::module_load(&m, g_bytes, g_size));   // no such instrument type
 
   build_v2(s);
-  // 0x10 was the example until slice stop took it; 0x20 is still reserved.
-  g_bytes[v2_entry_at(s, 0) + 19] = 0x20u;
+  // 0x10 was the example until slice stop took it, 0x20 until stereo did; 0x40 is still reserved.
+  g_bytes[v2_entry_at(s, 0) + 19] = 0x40u;
   CHECK(!ntrk::module_load(&m, g_bytes, g_size));   // reserved instrument flags
 
   build_v2(s);
@@ -2835,6 +2835,51 @@ test_mixr_block() {
   CHECK(!ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
   ntrk::write_u16(a.mix + 0, (uint16_t) ntrk::kMixrVersion);
   ntrk::write_u16(a.mix + 2, 0u);
+  CHECK(!ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
+}
+
+// A stereo sample: interleaved L/R, `length` in frames, twice the bytes -- round-trips, and is
+// refused on a type with no sample data and by a reader that predates the bit.
+static void
+test_stereo_sample_flag() {
+  printf("a stereo sample round-trips, and is refused where it cannot mean anything\n");
+
+  Spec s;
+  build(s);
+  ntrk::Module a;
+  CHECK(ntrk::module_load(&a, g_bytes, g_size));
+  static uint8_t pcm[32 * 4];                  // 32 frames, pcm16, two channels
+  for (int i = 0; i < 32 * 4; ++i)
+    pcm[i] = (uint8_t) (i * 7 + 3);
+  ntrk::Instrument &ins = a.instruments[0];
+  ins.type = (uint8_t) ntrk::InstrumentType::kPcm16;
+  ins.bits = 16u;
+  ins.flags = (uint8_t) (ins.flags | ntrk::kInstrumentStereo);
+  ins.data = (const int8_t *) (const void *) pcm;
+  ins.length = 32u;
+  ins.loop_start = 0u;
+  ins.loop_len = 32u;
+  CHECK(ntrk::instrument_frame_bytes(ins) == 4u);
+  CHECK(ntrk::instrument_blob_bytes(ins) == 128u);
+
+  size_t need = 0;
+  CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
+  ntrk::Module b;
+  CHECK(ntrk::module_load(&b, g_saved, need));
+  CHECK((b.instruments[0].flags & ntrk::kInstrumentStereo) != 0u);
+  CHECK(b.instruments[0].length == 32u);
+  CHECK(memcmp(b.instruments[0].data, pcm, sizeof pcm) == 0);
+
+  // A reader from before the bit: its reserved mask was 0xe0, which holds 0x20, so the file is
+  // refused rather than played as mono at the wrong stride.
+  CHECK((0xe0u & ntrk::kInstrumentStereo) != 0u);
+  CHECK((ntrk::kInstrumentReserved & ntrk::kInstrumentStereo) == 0u);
+
+  // On a type with no sample data it means nothing, and both ends refuse it.
+  ntrk::Instrument bad = ins;
+  bad.type = (uint8_t) ntrk::InstrumentType::kWaveBuiltin;
+  CHECK(!ntrk::instrument_fields_valid(bad));
+  ins.type = (uint8_t) ntrk::InstrumentType::kSynth;
   CHECK(!ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
 }
 
@@ -7631,6 +7676,7 @@ main(void) {
   test_synth_reference_pitch();
   test_render_hashes();
   test_mixr_block();
+  test_stereo_sample_flag();
   test_instrument_param_shape();
   test_instrument_param_group();
   test_instrument_param_clamps();

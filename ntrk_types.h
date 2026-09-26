@@ -227,7 +227,14 @@ const uint8_t kInstrumentFilterType = 0x0c;
 // Renoise's slice stop: a note started at a slice (`SLC`, or `S` on a sliced
 // instrument) stops at the next boundary instead of playing on through it.
 const uint8_t kInstrumentSliceStop = 0x10;
-const uint8_t kInstrumentReserved = 0xe0;
+// The sample is stereo: `data` interleaves L and R, and `length` -- like every
+// position in the format -- still counts FRAMES. A property of the data rather than
+// a setting, so it is not in `instrument_param_table`: flipping it would reinterpret
+// the bytes at a different stride. Legal on kPcm8/kPcm16 only. Taken from the
+// reserved bits, which every older reader refuses -- the right failure for a file
+// it would otherwise play as mono at double speed.
+const uint8_t kInstrumentStereo = 0x20;
+const uint8_t kInstrumentReserved = 0xc0;
 
 // Where a channel's volume envelope has got to. **`EnvStage::kOff` is the
 // absence of a stage rather than one of them**: an instrument with the envelope
@@ -385,7 +392,8 @@ instrument_bits_for(uint8_t type) {
 // its stride changes it once.
 inline uint32_t
 instrument_frame_bytes(const Instrument &ins) {
-  return (uint32_t) (instrument_bits_for(ins.type) / 8u);
+  const uint32_t channels = (ins.flags & kInstrumentStereo) != 0u ? 2u : 1u;
+  return (uint32_t) (instrument_bits_for(ins.type) / 8u) * channels;
 }
 
 inline size_t

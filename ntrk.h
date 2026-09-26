@@ -609,6 +609,11 @@ instrument_fields_valid(const Instrument &ins) {
   // a sample -- the blob is a buffer in memory that was read in one piece.
   if (ins.length > (uint32_t) 0x7fffffff)
     return false;
+  // Stereo is a shape of sample data, so only a type that has sample data may carry it.
+  if ((ins.flags & kInstrumentStereo) != 0u &&
+      ins.type != (uint8_t) InstrumentType::kPcm8 &&
+      ins.type != (uint8_t) InstrumentType::kPcm16)
+    return false;
   for (int id = 0; id < (int) InsParam::kCount; ++id) {
     // **`Absent` is the only state that skips.** `Inert` still checks: the
     // loader validates a kick's `synth_dist` whatever the voice, because a
