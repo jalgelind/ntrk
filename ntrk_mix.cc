@@ -301,8 +301,7 @@ void
 slot_process_mono(Slot *s, float *m, int frames, float rate) {
   if (s == nullptr || m == nullptr || frames <= 0)
     return;
-  if (s->kind != FxKind::kShape && s->kind != FxKind::kFilter &&
-      s->kind != FxKind::kLimiter)
+  if (s->kind == FxKind::kNone || !slot_kind_insertable(s->kind))
     return;
 
   slot_apply_params(s, rate);
@@ -617,6 +616,20 @@ mixr_unit(float v) {
   return v >= 1.f ? (uint16_t) 65535 : (uint16_t) (v * 65535.f + 0.5f);
 }
 
+// A stored channel pan: 0 is "the player's own layout", 1..255 is -1..+1 with 128 the centre, so
+// centre is exact both ways and the byte never lands on the 0 that means something else.
+uint8_t
+pan_to_stored(float pan) {
+  const float p = pan < -1.f ? -1.f : (pan > 1.f ? 1.f : (pan == pan ? pan : 0.f));
+  const float b = 128.f + p * 127.f;
+  return (uint8_t) (b < 1.f ? 1.f : b + 0.5f);
+}
+
+float
+pan_from_stored(uint8_t b) {
+  return ((float) b - 128.f) * (1.f / 127.f);
+}
+
 }  // namespace
 
 namespace {
@@ -659,20 +672,178 @@ config_readable(const uint8_t *block) {
 
 }  // namespace
 
+// An effect slot's record -- kind, reserved, eight u16 parameters -- or null where the block is
+// unreadable or `slot` names none. **The one place the effect-slot numbering meets the layout**:
+// 0..4 are the header's table (the sends, then master FX 1), 5..6 the v3 tail's master FX 2, 3.
+static uint8_t *
+config_slot_record(uint8_t *block, int slot) {
+  if (!config_readable(block) || slot < 0 || slot >= kMixrFxSlots)
+    return nullptr;
+  if (slot < kMixrSlots)
+    return block + kMixrHeaderBytes + slot * kMixrSlotBytes;
+  return block + kMixrV3MasterSlots + (slot - kMixrSlots) * kMixrSlotBytes;
+}
+
+static const uint8_t *
+config_slot_record(const uint8_t *block, int slot) {
+  return config_slot_record(const_cast<uint8_t *>(block), slot);
+}
+
+// A channel's insert record, the same shape as a slot's.
+static uint8_t *
+config_insert_record(uint8_t *block, int channel) {
+  if (!config_readable(block) || channel < 0 || channel >= kMaxChannels)
+    return nullptr;
+  return block + kMixrV3Insert + channel * kMixrSlotBytes;
+}
+
+static const uint8_t *
+config_insert_record(const uint8_t *block, int channel) {
+  return config_insert_record(const_cast<uint8_t *>(block), channel);
+}
+
+static float
+record_param(const uint8_t *r, int param) {
+  if (r == nullptr || param < 0 || param >= kMixrSlotParams)
+    return 0.f;
+  return (float) ntrk::read_u16(r + 2 + param * 2) / 65535.f;
+}
+
 FxKind
 config_slot_kind(const uint8_t *block, int slot) {
-  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots)
-    return FxKind::kNone;
-  return (FxKind) block[kMixrHeaderBytes + slot * kMixrSlotBytes];
+  const uint8_t *r = config_slot_record(block, slot);
+  return r != nullptr ? (FxKind) r[0] : FxKind::kNone;
 }
 
 float
 config_slot_param(const uint8_t *block, int slot, int param) {
-  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots || param < 0 ||
-      param >= kMixrSlotParams)
+  return record_param(config_slot_record(block, slot), param);
+}
+
+bool
+slot_kind_insertable(FxKind kind) {
+  // **The kinds that hold no tank.** A reverb or a delay per channel would be sixteen tanks and
+  // sixteen lines -- megabytes -- for a strip; the kinds left are the ones whose whole state is a
+  // few floats in the `Slot` itself. `kNone` is insertable: it is how an insert is switched off.
+  return kind == FxKind::kNone || kind == FxKind::kShape || kind == FxKind::kFilter ||
+         kind == FxKind::kLimiter;
+}
+
+FxKind
+config_channel_insert_kind(const uint8_t *block, int channel) {
+  const uint8_t *r = config_insert_record(block, channel);
+  return r != nullptr ? (FxKind) r[0] : FxKind::kNone;
+}
+
+float
+config_channel_insert_param(const uint8_t *block, int channel, int param) {
+  return record_param(config_insert_record(block, channel), param);
+}
+
+void
+config_set_channel_insert_kind(uint8_t *block, int channel, FxKind kind) {
+  uint8_t *r = config_insert_record(block, channel);
+  if (r == nullptr || !slot_kind_insertable(kind))
+    return;
+  r[0] = (uint8_t) kind;
+}
+
+void
+config_set_channel_insert_param(uint8_t *block, int channel, int param, float v) {
+  uint8_t *r = config_insert_record(block, channel);
+  if (r == nullptr || param < 0 || param >= kMixrSlotParams)
+    return;
+  ntrk::write_u16(r + 2 + param * 2, mixr_unit(v));
+}
+
+float
+config_channel_volume(const uint8_t *block, int channel) {
+  if (!config_readable(block) || channel < 0 || channel >= kMaxChannels)
+    return 1.f;
+  return (float) ntrk::read_u16(block + kMixrV3Volume + channel * 2) / (float) kMixrQUnit;
+}
+
+void
+config_set_channel_volume(uint8_t *block, int channel, float v) {
+  if (!config_readable(block) || channel < 0 || channel >= kMaxChannels)
+    return;
+  ntrk::write_u16(block + kMixrV3Volume + channel * 2, mixr_q12(v));
+}
+
+bool
+config_channel_pan_explicit(const uint8_t *block, int channel) {
+  return config_readable(block) && channel >= 0 && channel < kMaxChannels &&
+         block[kMixrV3Pan + channel] != 0u;
+}
+
+float
+config_channel_pan(const uint8_t *block, int channel) {
+  if (!config_channel_pan_explicit(block, channel))
     return 0.f;
-  const uint8_t *r = block + kMixrHeaderBytes + slot * kMixrSlotBytes;
-  return (float) ntrk::read_u16(r + 2 + param * 2) / 65535.f;
+  return pan_from_stored(block[kMixrV3Pan + channel]);
+}
+
+void
+config_set_channel_pan(uint8_t *block, int channel, float pan) {
+  if (!config_readable(block) || channel < 0 || channel >= kMaxChannels)
+    return;
+  block[kMixrV3Pan + channel] = pan_to_stored(pan);
+}
+
+void
+config_clear_channel_pan(uint8_t *block, int channel) {
+  if (!config_readable(block) || channel < 0 || channel >= kMaxChannels)
+    return;
+  block[kMixrV3Pan + channel] = 0u;
+}
+
+int
+config_channel_output(const uint8_t *block, int channel) {
+  if (!config_readable(block) || channel < 0 || channel >= kMaxChannels)
+    return 0;
+  return (int) block[kMixrV3Output + channel];
+}
+
+void
+config_set_channel_output(uint8_t *block, int channel, int output) {
+  if (!config_readable(block) || channel < 0 || channel >= kMaxChannels || output < 0 ||
+      output > kSends)
+    return;
+  // Only into a Bus: a Send takes taps, not a whole channel -- see `SendMode`.
+  if (output > 0 && config_send_mode(block, output - 1) != SendMode::kBus)
+    return;
+  block[kMixrV3Output + channel] = (uint8_t) output;
+}
+
+int
+config_send_output(const uint8_t *block, int send) {
+  if (!config_readable(block) || send < 0 || send >= kSends)
+    return 0;
+  return (int) block[kMixrV3SendOutput + send];
+}
+
+void
+config_set_send_output(uint8_t *block, int send, int output) {
+  if (!config_readable(block) || send < 0 || send >= kSends || output < 0 || output > kSends)
+    return;
+  if (output != 0 && output <= send + 1)
+    return;                          // only ever a higher send: the order is the cycle check
+  block[kMixrV3SendOutput + send] = (uint8_t) output;
+}
+
+SendMode
+config_send_mode(const uint8_t *block, int send) {
+  if (!config_readable(block) || send < 0 || send >= kSends)
+    return SendMode::kSend;
+  return (SendMode) block[kMixrV3SendMode + send];
+}
+
+void
+config_set_send_mode(uint8_t *block, int send, SendMode mode) {
+  if (!config_readable(block) || send < 0 || send >= kSends ||
+      (mode != SendMode::kSend && mode != SendMode::kBus))
+    return;
+  block[kMixrV3SendMode + send] = (uint8_t) mode;
 }
 
 // A send level's byte, or null where the arguments do not name one.
@@ -774,21 +945,19 @@ config_init(uint8_t *block) {
 
 void
 config_set_slot_kind(uint8_t *block, int slot, FxKind kind) {
-  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots)
-    return;
+  uint8_t *r = config_slot_record(block, slot);
   // The same ceiling `config_readable` enforces, so a set can never leave a
   // block this file would then refuse to read back.
-  if ((uint8_t) kind > (uint8_t) FxKind::kLimiter)
+  if (r == nullptr || (uint8_t) kind > (uint8_t) FxKind::kLimiter)
     return;
-  block[kMixrHeaderBytes + slot * kMixrSlotBytes] = (uint8_t) kind;
+  r[0] = (uint8_t) kind;
 }
 
 void
 config_set_slot_param(uint8_t *block, int slot, int param, float v) {
-  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots || param < 0 ||
-      param >= kMixrSlotParams)
+  uint8_t *r = config_slot_record(block, slot);
+  if (r == nullptr || param < 0 || param >= kMixrSlotParams)
     return;
-  uint8_t *r = block + kMixrHeaderBytes + slot * kMixrSlotBytes;
   ntrk::write_u16(r + 2 + param * 2, mixr_unit(v));
 }
 
@@ -1862,14 +2031,24 @@ fx_param_default(FxKind kind, int param, bool wet) {
 
 void
 config_seed_slot(uint8_t *block, int slot) {
-  if (!config_readable(block) || slot < 0 || slot >= kMixrSlots)
+  if (!config_readable(block) || slot < 0 || slot >= kMixrFxSlots)
     return;
   const FxKind kind = config_slot_kind(block, slot);
-  // The master is the last slot; everything before it is a send. `kMixrSlots == kSends + 1`
-  // is asserted where the layout is, so this is reading that fact rather than restating it.
-  const bool wet = slot < kSends;
+  // **Wet only on a send in Send mode**: its output is the effect alone and the dry path is the
+  // channel itself. A Bus carries the channels routed into it, so it is an insert on the group;
+  // a master slot is an insert on the mix.
+  const bool wet = slot < kSends && config_send_mode(block, slot) == SendMode::kSend;
   for (int p = 0; p < kMixrSlotParams; ++p)
     config_set_slot_param(block, slot, p, fx_param_default(kind, p, wet));
+}
+
+void
+config_seed_insert(uint8_t *block, int channel) {
+  if (!config_readable(block) || channel < 0 || channel >= kMaxChannels)
+    return;
+  const FxKind kind = config_channel_insert_kind(block, channel);
+  for (int p = 0; p < kMixrSlotParams; ++p)
+    config_set_channel_insert_param(block, channel, p, fx_param_default(kind, p, false));
 }
 
 // The send names below are spelled out rather than counted, so this is the

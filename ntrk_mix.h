@@ -738,6 +738,55 @@ void config_set_send_level(uint8_t *block, int channel, int send, float v);
 // that feeds no send is written as v1 and an untouched file keeps its bytes.
 bool config_has_send_levels(const uint8_t *block);
 
+// ---- v3: the channel strip, the master's other slots, routing --------------
+//
+// **The effect-slot accessors above take 0..kMixrFxSlots-1**: the four sends, then master FX 1
+// (the header's slot 4, as before v3), then master FX 2 and 3 from the v3 tail. Every setter
+// below refuses an unreadable block and touches nothing, and clamps a value, as the rest do.
+
+// What a send is. **A Send** takes each channel's level into it (stereo, post-pan, post-fader)
+// and returns only its effect -- an empty one returns silence. **A Bus** takes the channels whose
+// output names it, whole, and passes them through an empty slot: a group. Zero is Send, which is
+// what every send was before v3.
+enum class SendMode : uint8_t { kSend = 0, kBus = 1 };
+
+SendMode config_send_mode(const uint8_t *block, int send);
+void config_set_send_mode(uint8_t *block, int send, SendMode mode);
+
+// Where a send's return goes: 0 the master, n send n -- refused unless n is HIGHER than its own
+// (send index + 1). The ordering is the whole cycle check, and sends are processed in order.
+int config_send_output(const uint8_t *block, int send);
+void config_set_send_output(uint8_t *block, int send, int output);
+
+// Where a channel goes: 0 the master, n send n. Refused unless send n is a Bus.
+int config_channel_output(const uint8_t *block, int channel);
+void config_set_channel_output(uint8_t *block, int channel, int output);
+
+// A channel's fader, Q12 like every gain here: unity for a block that says nothing.
+float config_channel_volume(const uint8_t *block, int channel);
+void config_set_channel_volume(uint8_t *block, int channel, float v);
+
+// A channel's pan, -1..+1, when the block sets one. **Not set is its own state**: the player's
+// own layout (ProTracker's LRRL), which every file before v3 plays with. `clear` returns to it.
+bool config_channel_pan_explicit(const uint8_t *block, int channel);
+float config_channel_pan(const uint8_t *block, int channel);
+void config_set_channel_pan(uint8_t *block, int channel, float pan);
+void config_clear_channel_pan(uint8_t *block, int channel);
+
+// Whether a kind may be a channel's insert: the ones that hold no tank (shaper, filter,
+// limiter, and `kNone`). Asked by `slot_process_mono` and by an editor's kind picker.
+bool slot_kind_insertable(FxKind kind);
+
+// A channel's insert: its kind (refused unless insertable) and its eight parameters.
+FxKind config_channel_insert_kind(const uint8_t *block, int channel);
+float config_channel_insert_param(const uint8_t *block, int channel, int param);
+void config_set_channel_insert_kind(uint8_t *block, int channel, FxKind kind);
+void config_set_channel_insert_param(uint8_t *block, int channel, int param, float v);
+
+// `config_seed_slot` for an insert: its kind's defaults, not wet -- an insert replaces what it
+// is inserted into.
+void config_seed_insert(uint8_t *block, int channel);
+
 // The master gain and the stereo width the block carries, 0..1 and 0..1.
 float config_master_gain(const uint8_t *block);
 float config_width(const uint8_t *block);
@@ -815,7 +864,7 @@ int fx_param_choice_count(FxKind kind, int param);
 const char *fx_param_choice_name(FxKind kind, int param, int i);
 
 // Put every parameter of `slot` at its kind's default, taking `wet` from the slot's own
-// position. **What a slot should be given when its kind CHANGES** -- a reverb switched on with
+// position and mode (a send in Send mode is wet; a Bus and the master are not). **What a slot should be given when its kind CHANGES** -- a reverb switched on with
 // every knob at zero is a reverb nobody can hear, and the eight bytes are shared across kinds,
 // so a delay's Time would otherwise arrive as a reverb's Size.
 void config_seed_slot(uint8_t *block, int slot);
@@ -831,6 +880,47 @@ config_slot_kind(const ntrk::Module *module, int slot) {
 inline float
 config_slot_param(const ntrk::Module *module, int slot, int param) {
   return module != nullptr ? config_slot_param(module->mix, slot, param) : 0.f;
+}
+
+// The v3 readers, for a module -- null reads as the default block would.
+inline SendMode
+config_send_mode(const ntrk::Module *module, int send) {
+  return module != nullptr ? config_send_mode(module->mix, send) : SendMode::kSend;
+}
+
+inline int
+config_send_output(const ntrk::Module *module, int send) {
+  return module != nullptr ? config_send_output(module->mix, send) : 0;
+}
+
+inline int
+config_channel_output(const ntrk::Module *module, int channel) {
+  return module != nullptr ? config_channel_output(module->mix, channel) : 0;
+}
+
+inline float
+config_channel_volume(const ntrk::Module *module, int channel) {
+  return module != nullptr ? config_channel_volume(module->mix, channel) : 1.f;
+}
+
+inline bool
+config_channel_pan_explicit(const ntrk::Module *module, int channel) {
+  return module != nullptr && config_channel_pan_explicit(module->mix, channel);
+}
+
+inline float
+config_channel_pan(const ntrk::Module *module, int channel) {
+  return module != nullptr ? config_channel_pan(module->mix, channel) : 0.f;
+}
+
+inline FxKind
+config_channel_insert_kind(const ntrk::Module *module, int channel) {
+  return module != nullptr ? config_channel_insert_kind(module->mix, channel) : FxKind::kNone;
+}
+
+inline float
+config_channel_insert_param(const ntrk::Module *module, int channel, int param) {
+  return module != nullptr ? config_channel_insert_param(module->mix, channel, param) : 0.f;
 }
 
 inline float

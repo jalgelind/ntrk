@@ -4232,12 +4232,87 @@ test_config_set_refuses_a_bad_block() {
   CHECK(memcmp(good, bad, sizeof bad) == 0);
 
   // And an index outside the record touches nothing either.
-  mix::config_set_slot_kind(bad, kMixrSlots, mix::FxKind::kDelay);
+  mix::config_set_slot_kind(bad, kMixrFxSlots, mix::FxKind::kDelay);
   mix::config_set_slot_param(bad, 0, kMixrSlotParams, 1.f);
   mix::config_set_slot_param(bad, -1, 0, 1.f);
   CHECK(memcmp(good, bad, sizeof bad) == 0);
   mix::config_set_slot_kind(nullptr, 0, mix::FxKind::kDelay);
   mix::config_set_master_gain(nullptr, 1.f);
+}
+
+// The v3 accessors: each reads what it set, each refuses what the reader would refuse.
+static void
+test_config_v3_accessors() {
+  printf("the v3 channel strip, master slots and routing read back what was set\n");
+
+  uint8_t b[kMixrBytes];
+  CHECK(mix::config_init(b));
+  // Master FX 2 and 3 are effect slots 5 and 6, in the tail -- and slot 4 is still the header's.
+  mix::config_set_slot_kind(b, 6, mix::FxKind::kLimiter);
+  mix::config_set_slot_param(b, 6, 1, 0.5f);
+  CHECK(mix::config_slot_kind(b, 6) == mix::FxKind::kLimiter);
+  CHECK(b[kMixrV3MasterSlots + kMixrSlotBytes] == (uint8_t) mix::FxKind::kLimiter);
+  CHECK(mix::config_slot_kind(b, 4) == mix::FxKind::kNone);
+  CHECK(mix::config_slot_param(b, 6, 1) > 0.49f && mix::config_slot_param(b, 6, 1) < 0.51f);
+
+  CHECK(mix::config_channel_volume(b, 3) == 1.f);
+  mix::config_set_channel_volume(b, 3, 0.5f);
+  CHECK(mix::config_channel_volume(b, 3) == 0.5f);
+
+  CHECK(!mix::config_channel_pan_explicit(b, 2));
+  mix::config_set_channel_pan(b, 2, 0.f);
+  CHECK(mix::config_channel_pan_explicit(b, 2) && mix::config_channel_pan(b, 2) == 0.f);
+  mix::config_set_channel_pan(b, 2, -1.f);
+  CHECK(mix::config_channel_pan(b, 2) == -1.f);
+  mix::config_set_channel_pan(b, 2, 1.f);
+  CHECK(mix::config_channel_pan(b, 2) == 1.f);
+  mix::config_clear_channel_pan(b, 2);
+  CHECK(!mix::config_channel_pan_explicit(b, 2));
+
+  CHECK(mix::slot_kind_insertable(mix::FxKind::kLimiter));
+  CHECK(!mix::slot_kind_insertable(mix::FxKind::kReverb));
+  mix::config_set_channel_insert_kind(b, 1, mix::FxKind::kDelay);   // refused: a tank
+  CHECK(mix::config_channel_insert_kind(b, 1) == mix::FxKind::kNone);
+  mix::config_set_channel_insert_kind(b, 1, mix::FxKind::kFilter);
+  mix::config_seed_insert(b, 1);
+  CHECK(mix::config_channel_insert_kind(b, 1) == mix::FxKind::kFilter);
+  CHECK(mix::config_channel_insert_param(b, 1, 1) > 0.f);           // the cutoff's default
+
+  // Routing: into a Bus only; a send only to a higher one.
+  mix::config_set_channel_output(b, 0, 3);                           // S3 is a Send: refused
+  CHECK(mix::config_channel_output(b, 0) == 0);
+  mix::config_set_send_mode(b, 2, mix::SendMode::kBus);
+  mix::config_set_channel_output(b, 0, 3);
+  CHECK(mix::config_channel_output(b, 0) == 3);
+  mix::config_set_send_output(b, 2, 1);                              // backwards: refused
+  mix::config_set_send_output(b, 2, 3);                              // itself: refused
+  CHECK(mix::config_send_output(b, 2) == 0);
+  mix::config_set_send_output(b, 2, 4);
+  CHECK(mix::config_send_output(b, 2) == 4);
+  CHECK(mix_version_needed(b) == kMixrVersion);
+
+  // The seed follows the mode: a Delay on a Bus is an insert (Mix 0.25), on a Send all wet.
+  mix::config_set_slot_kind(b, 2, mix::FxKind::kDelay);
+  mix::config_seed_slot(b, 2);
+  CHECK(mix::config_slot_param(b, 2, 3) < 0.26f);
+  mix::config_set_slot_kind(b, 1, mix::FxKind::kDelay);
+  mix::config_seed_slot(b, 1);
+  CHECK(mix::config_slot_param(b, 1, 3) == 1.f);
+
+  // Every setter on a block the reader refuses touches nothing.
+  uint8_t bad[kMixrBytes];
+  memcpy(bad, b, sizeof bad);
+  bad[0] = 0xffu;
+  uint8_t before[kMixrBytes];
+  memcpy(before, bad, sizeof before);
+  mix::config_set_channel_volume(bad, 0, 0.1f);
+  mix::config_set_channel_pan(bad, 0, 0.3f);
+  mix::config_set_channel_insert_kind(bad, 0, mix::FxKind::kShape);
+  mix::config_set_channel_output(bad, 0, 0);
+  mix::config_set_send_mode(bad, 0, mix::SendMode::kBus);
+  mix::config_set_send_output(bad, 0, 2);
+  mix::config_set_slot_kind(bad, 5, mix::FxKind::kShape);
+  CHECK(memcmp(before, bad, sizeof bad) == 0);
 }
 
 static void
@@ -4348,6 +4423,7 @@ main(void) {
   test_slot_peaks();
   test_mixr_version_follows_the_levels();
   test_mixr_v3_versions();
+  test_config_v3_accessors();
   test_mixr_refuses_an_unknown_kind();
   test_mixr_writes_the_setting_not_the_slide();
   test_config_slot_kind_reads_without_a_mixer();
