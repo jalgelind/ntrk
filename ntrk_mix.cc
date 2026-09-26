@@ -601,6 +601,7 @@ mixer_reset(Mixer *mx) {
   // cleared to defaults here: those knobs are settings, and this call keeps
   // settings.
   mx->fxpl_synced = false;
+  mx->strip_synced = false;
   // A queued external input is NOT a setting -- it is an invocation that has not
   // happened yet, and a reset is where the caller says the last tune is over.
   // Carried across, it would fire on the first row of whatever comes next, at a
@@ -1034,6 +1035,22 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
   for (int i = 0; i < kMixrSlots; ++i)
     mx->return_level[i] =
         (float) p[kMixrBytesV1 + kMixrSendLevelBytes + i] / 255.f;
+
+  // The v3 strip. The inserts go through the same parameters-then-kind order as the slots.
+  for (int c = 0; c < kMaxChannels; ++c) {
+    mx->channel_volume[c] = config_channel_volume(p, c);
+    mx->channel_pan[c] = p[kMixrV3Pan + c];
+    mx->channel_output[c] = p[kMixrV3Output + c];
+    const uint8_t *r = config_insert_record(p, c);
+    for (int k = 0; k < kMixrSlotParams; ++k)
+      mx->insert[c].param[k] = record_param(r, k);
+    slot_set_kind(&mx->insert[c], (FxKind) r[0]);
+  }
+  for (int s = 0; s < kSends; ++s) {
+    mx->send_output[s] = p[kMixrV3SendOutput + s];
+    mx->send_mode[s] = (SendMode) p[kMixrV3SendMode + s];
+  }
+  mx->strip_synced = false;         // the next run writes these pans into the player
   return true;
 }
 
@@ -1074,6 +1091,22 @@ mixer_config_write(const Mixer *mx, uint8_t *block) {
     const float v = mx->return_level[i];
     const float cl = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
     p[kMixrBytesV1 + kMixrSendLevelBytes + i] = (uint8_t) (cl * 255.f + 0.5f);
+  }
+
+  for (int c = 0; c < kMaxChannels; ++c) {
+    ntrk::write_u16(p + kMixrV3Volume + c * 2, mixr_q12(mx->channel_volume[c]));
+    p[kMixrV3Pan + c] = mx->channel_pan[c];
+    p[kMixrV3Output + c] = mx->channel_output[c];
+    uint8_t *r = config_insert_record(p, c);
+    // An insert this build would refuse to read back is written as off, not as a block the
+    // reader rejects whole.
+    r[0] = slot_kind_insertable(mx->insert[c].kind) ? (uint8_t) mx->insert[c].kind : 0u;
+    for (int k = 0; k < kMixrSlotParams; ++k)
+      ntrk::write_u16(r + 2 + k * 2, mixr_unit(mx->insert[c].base[k]));
+  }
+  for (int s = 0; s < kSends; ++s) {
+    p[kMixrV3SendOutput + s] = mx->send_output[s];
+    p[kMixrV3SendMode + s] = (uint8_t) mx->send_mode[s];
   }
 }
 
@@ -1640,6 +1673,24 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
     if (!plane && mx->macro_pending != 0u)
       mx->macro_pending = 0u;
 
+    // **The stored pans, written into the player where the player itself would reset them** --
+    // at a start or a seek, which `ticks_elapsed` going backwards is the tell for (the one
+    // `fxpl_run` reads). Ahead of the plane, because `fxpl_sync` reads `player->pan` to seed its
+    // own pan value; a pattern's pan commands move it afterwards as they always have. A pan of
+    // 0 writes nothing: that channel keeps the player's layout, which is every file before v3.
+    if (!mx->strip_synced || player->ticks_elapsed < mx->strip_seen) {
+      bool moved = false;
+      for (int c = 0; c < kMaxChannels; ++c)
+        if (mx->channel_pan[c] != 0u) {
+          player->pan[c] = pan_from_stored(mx->channel_pan[c]);
+          moved = true;
+        }
+      if (moved)
+        mixer_pan_gains(player, stereo, gain_l, gain_r);
+      mx->strip_synced = true;
+    }
+    mx->strip_seen = player->ticks_elapsed;
+
     if (plane) {
       fxpl_run(mx, player, at_order, at_row, at_tick);
       // Pan is the one thing the plane writes that was hoisted out of the loop,
@@ -1740,6 +1791,15 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
         continue;
 
       slot_process_mono(&mx->insert[c], v, run, frate);
+
+      // **The fader, after the insert and before everything that leaves the strip** -- the send
+      // taps and the pan both -- so a track pulled down takes its reverb with it. Branched at
+      // unity, which is every channel of every file before v3: `x * 1.f` is exact, but a branch
+      // is also no work.
+      const float vol = mx->channel_volume[c];
+      if (vol != 1.f)
+        for (int i = 0; i < run; ++i)
+          v[i] *= vol;
 
       for (int s = 0; s < kSends; ++s) {
         if (!send_on[s])

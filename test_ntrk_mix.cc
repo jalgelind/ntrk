@@ -2665,6 +2665,99 @@ test_master_slots_from_the_plane() {
   CHECK(peak <= 0.2512 && peak > 0.1);
 }
 
+// Every strip field back to what a mixer before v3 had, so the tests after this see none of it.
+static void
+strip_clear(void) {
+  for (int c = 0; c < kMaxChannels; ++c) {
+    g_mixer.channel_volume[c] = 1.f;
+    g_mixer.channel_pan[c] = 0u;
+    g_mixer.channel_output[c] = 0u;
+  }
+  for (int s = 0; s < mix::kSends; ++s) {
+    g_mixer.send_output[s] = 0u;
+    g_mixer.send_mode[s] = mix::SendMode::kSend;
+  }
+}
+
+static double
+peak_of(const double *b, int n) {
+  double p = 0.0;
+  for (int i = 0; i < n; ++i)
+    p = b[i] > p ? b[i] : (-b[i] > p ? -b[i] : p);
+  return p;
+}
+
+// The channel strip: a fader after the insert, a stored pan the player is given at every
+// restart, and an insert that comes out of the block.
+static void
+test_channel_strip() {
+  printf("the channel strip: a fader, a stored pan, an insert from the block\n");
+  const int n = kTickFrames * 6 * 2;
+
+  mac_build(1, 1);
+  slot_clear();
+  strip_clear();
+  slot_render(6, g_a);
+  CHECK(peak_of(g_a, n) < 0.89);           // under the clipper's knee, or halving is not exact
+  CHECK(g_mac_player.pan[0] == -1.f);      // LRRL: the player's own layout
+
+  // Half the fader on every channel is exactly half the output: *0.5 is exact in floats.
+  for (int c = 0; c < kMaxChannels; ++c)
+    g_mixer.channel_volume[c] = 0.5f;
+  slot_render(6, g_b);
+  long off = 0;
+  for (int i = 0; i < n; ++i)
+    if (g_b[i] * 2.0 != g_a[i])
+      ++off;
+  CHECK(off == 0);
+  CHECK(peak_of(g_a, n) > 0.0);
+  strip_clear();
+
+  // A stored pan reaches the player at the start, and again after a restart the mixer was
+  // not told about (the `ticks_elapsed` tell).
+  g_mixer.channel_pan[0] = 128u;           // explicit centre
+  slot_render(6, g_b);
+  CHECK(g_mac_player.pan[0] == 0.f);
+  CHECK(g_mac_player.pan[1] == 1.f);       // channel 1 kept the layout: pan 0 writes nothing
+  player_start(&g_mac_player, &g_mac);     // back to LRRL, no mixer_reset
+  CHECK(g_mac_player.pan[0] == -1.f);
+  memset(g_b, 0, sizeof(double) * (size_t) n);
+  mix::mixer_render_add(&g_mixer, &g_mac_player, g_b, kTickFrames * 6, 2, 48000.f);
+  CHECK(g_mac_player.pan[0] == 0.f);
+
+  // A pattern's own 8xx still moves it afterwards.
+  g_mac_pat[kMacChannels * 1 + 0].effect = 8u;
+  g_mac_pat[kMacChannels * 1 + 0].param = 0xffu;
+  slot_render(12, g_b);                    // past row 1
+  CHECK(g_mac_player.pan[0] > 0.9f);
+  g_mac_pat[kMacChannels * 1 + 0] = Note();
+  strip_clear();
+
+  // An insert stored in the block is built by mixer_config_read and runs.
+  uint8_t block[kMixrBytes];
+  CHECK(mix::config_init(block));
+  mix::config_set_channel_insert_kind(block, 0, mix::FxKind::kLimiter);
+  mix::config_set_channel_insert_param(block, 0, 0, 1.f);       // -24 dB threshold: it limits
+  mix::config_set_channel_volume(block, 2, 0.25f);
+  mix::config_set_channel_pan(block, 3, 0.5f);
+  CHECK(mix::mixer_config_read(&g_mixer, block));
+  CHECK(g_mixer.insert[0].kind == mix::FxKind::kLimiter);
+  CHECK(g_mixer.channel_volume[2] == 0.25f);
+  player_start(&g_mac_player, &g_mac);
+  g_mixer.master_gain = g_mac_player.gain;
+  memset(g_b, 0, sizeof(double) * (size_t) n);
+  mix::mixer_render_add(&g_mixer, &g_mac_player, g_b, kTickFrames * 6, 2, 48000.f);
+  CHECK(g_mixer.insert[0].lim_gain < 1.f);
+  // And the mixer writes back the v3 strip it read (the master gain above was set by hand).
+  uint8_t back[kMixrBytes];
+  mix::mixer_config_write(&g_mixer, back);
+  CHECK(memcmp(back + kMixrV3MasterSlots, block + kMixrV3MasterSlots,
+               (size_t) (kMixrBytes - kMixrV3MasterSlots)) == 0);
+
+  mix::slot_set_kind(&g_mixer.insert[0], mix::FxKind::kNone);
+  strip_clear();
+}
+
 // The widened macro target range, which is the same numbering as the set
 // commands and needed no second accumulator: `Slot::param` already persists
 // across ticks the way `fxpl_val` does.
@@ -4451,6 +4544,7 @@ main(void) {
   test_slot_commands_set_and_slide();
   test_slot_lane_restrictions();
   test_master_slots_from_the_plane();
+  test_channel_strip();
   test_slot_macro_targets();
   test_slot_resync_restores_the_configuration();
   test_slot_apply_skips_and_fires();

@@ -97,6 +97,12 @@ enum class FxKind : uint8_t { kNone = 0, kShape, kFilter, kDelay, kReverb, kLimi
 
 enum class FilterMode : uint8_t { kLowpass = 0, kHighpass = 1, kBandpass = 2 };
 
+// What a send is. **A Send** takes each channel's level into it (stereo, post-pan, post-fader)
+// and returns only its effect -- an empty one returns silence. **A Bus** takes the channels whose
+// output names it, whole, and passes them through an empty slot: a group. Zero is Send, which is
+// what every send was before v3.
+enum class SendMode : uint8_t { kSend = 0, kBus = 1 };
+
 // **Side by side, not a union.** `Delay` and `Reverb` have default member
 // initialisers, which makes them illegal C++11 union members, and the saving
 // would be illusory anyway: two `Svf` at 24 bytes, a `Delay` at 56 and a
@@ -606,6 +612,20 @@ struct Mixer {
   // round trip is algebraically the identity and is not one in floating point.
   float width = 1.f;
 
+  // -- The channel strip and routing, out of MIXR v3. Every default is what a
+  //    mixer did before v3, so a fresh mixer renders as one always has.
+  static_assert(kMaxChannels == 16, "the volume initialiser below names sixteen");
+  float   channel_volume[kMaxChannels] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f,
+                                          1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f};
+  uint8_t channel_pan[kMaxChannels] = {};     // 0 = the player's layout; see config_channel_pan
+  uint8_t channel_output[kMaxChannels] = {};  // 0 = master, n = send n (a Bus)
+  uint8_t send_output[kSends] = {};           // 0 = master, n = a higher send
+  SendMode send_mode[kSends] = {};
+  // Where the stored pans were last written into the player -- the same restart
+  // test `fxpl_run` makes, kept apart because a module with no plane never runs it.
+  bool     strip_synced = false;
+  uint64_t strip_seen = 0;
+
   // Master FX 1..3, run in order after the gain and before the width.
   Slot  master_fx[kMixrMasterSlots];
 
@@ -746,12 +766,6 @@ bool config_has_send_levels(const uint8_t *block);
 // **The effect-slot accessors above take 0..kMixrFxSlots-1**: the four sends, then master FX 1
 // (the header's slot 4, as before v3), then master FX 2 and 3 from the v3 tail. Every setter
 // below refuses an unreadable block and touches nothing, and clamps a value, as the rest do.
-
-// What a send is. **A Send** takes each channel's level into it (stereo, post-pan, post-fader)
-// and returns only its effect -- an empty one returns silence. **A Bus** takes the channels whose
-// output names it, whole, and passes them through an empty slot: a group. Zero is Send, which is
-// what every send was before v3.
-enum class SendMode : uint8_t { kSend = 0, kBus = 1 };
 
 SendMode config_send_mode(const uint8_t *block, int send);
 void config_set_send_mode(uint8_t *block, int send, SendMode mode);
