@@ -1629,9 +1629,11 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
   // close to it.
   const bool plane = m->fx != nullptr;
 
+  // A Send with no effect returns nothing, so it is not run at all; a Bus with no effect is a
+  // group and passes what is routed into it, so it always runs.
   bool send_on[kSends];
   for (int s = 0; s < kSends; ++s)
-    send_on[s] = mx->send[s].kind != FxKind::kNone;
+    send_on[s] = mx->send[s].kind != FxKind::kNone || mx->send_mode[s] == SendMode::kBus;
 
   int frame = 0;
   while (frame < frames) {
@@ -1705,11 +1707,10 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
     for (int s = 0; s < kSends; ++s) {
       if (!send_on[s])
         continue;
-      // Only the left half is accumulated into; it is copied across below. That
-      // is what keeps a send tap one multiply per channel per send instead of
-      // two, and a mono send is centred by definition anyway.
-      for (int i = 0; i < run; ++i)
+      for (int i = 0; i < run; ++i) {
         mx->send_bus[s][0][i] = 0.f;
+        mx->send_bus[s][1][i] = 0.f;
+      }
     }
 
     for (int c = 0; c < m->channels; ++c) {
@@ -1801,15 +1802,24 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
         for (int i = 0; i < run; ++i)
           v[i] *= vol;
 
+      // **The taps are stereo and after the pan**, so a channel panned left reaches the reverb
+      // on the left. At centre both gains are exactly 1.f and `x * 1.f` is exact, so a centred
+      // tune's taps are bit for bit the mono taps they replaced. A Bus takes no taps: it takes
+      // whole channels (NTRK-42), and mixing the two into one buffer would be two kinds of input
+      // with one fader.
       for (int s = 0; s < kSends; ++s) {
-        if (!send_on[s])
+        if (!send_on[s] || mx->send_mode[s] == SendMode::kBus)
           continue;
         const float level = mx->send_level[c][s];
         if (level == 0.f)
           continue;
-        float *bus = mx->send_bus[s][0];
-        for (int i = 0; i < run; ++i)
-          bus[i] += v[i] * level;
+        float *bus_l = mx->send_bus[s][0];
+        float *bus_r = mx->send_bus[s][1];
+        const float gl = gain_l[c], gr = gain_r[c];
+        for (int i = 0; i < run; ++i) {
+          bus_l[i] += v[i] * gl * level;
+          bus_r[i] += v[i] * gr * level;
+        }
       }
 
       for (int i = 0; i < run; ++i) {
@@ -1827,15 +1837,13 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
         continue;
       float *bus_l = mx->send_bus[s][0];
       float *bus_r = mx->send_bus[s][1];
-      for (int i = 0; i < run; ++i)
-        bus_r[i] = bus_l[i];
 
       slot_process_stereo(&mx->send[s], bus_l, bus_r, run, frate);
 
-      // A send with no effect in it returns nothing -- the `FxKind::kNone`
-      // skip above is the whole behaviour. It is an effect send, not a second
-      // copy of the dry mix, and returning the dry would just double every
-      // voice feeding it.
+      // A Send with no effect in it returns nothing -- the `send_on` skip above is the whole
+      // behaviour. It is an effect send, not a second copy of the dry mix, and returning the
+      // dry would just double every voice feeding it. A Bus with no effect reaches here and
+      // `slot_process_stereo` leaves it untouched: the group passes through.
       //
       // **The return level scales what comes back**, and the unity case is branched rather
       // than multiplied by 1: `1.f * x` is not the identity for every x this can carry --

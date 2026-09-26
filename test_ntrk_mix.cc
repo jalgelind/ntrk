@@ -1571,8 +1571,15 @@ test_everything_at_once() {
   // And when kSynthRefPeriod was re-derived from the anchor. It had been the
   // literal 214, so after the move to concert pitch every drum in the kit rang
   // 17.64 cents sharp of its own spec. This tune has a kit in it, so it moves.
+  //
+  // And when the send taps went stereo and post-pan (NTRK-44). The plane sets
+  // send levels on channels 2 and 5, which the player's LRRL layout pans right
+  // at separation 0.7, so their reverb input moved from the centre to the
+  // right: it *must* move. The discrimination: every centred-pan render is bit
+  // for bit what it was (`test_send_modes_and_stereo_taps` proves the
+  // `x * 1.f` claim), and test_ntrk.cc's fingerprints did not move.
   check_hash("everything at once", hash_stream(g_ref, kBigFrames * 2),
-             0xf53416a7306196c8ULL);
+             0x800aaafc8a32d183ULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -2755,6 +2762,66 @@ test_channel_strip() {
                (size_t) (kMixrBytes - kMixrV3MasterSlots)) == 0);
 
   mix::slot_set_kind(&g_mixer.insert[0], mix::FxKind::kNone);
+  strip_clear();
+}
+
+// Send taps are stereo and post-pan; a Bus takes no taps. A filter at cutoff 0 is off, so a
+// send holding one returns exactly what reached it -- the tap itself, measurable.
+static void
+test_send_modes_and_stereo_taps() {
+  printf("send taps are stereo and post-pan, centre is bit-identical, a Bus takes no taps\n");
+  const int n = kTickFrames * 6 * 2;
+
+  // Centred: both gains are exactly 1.f, so L and R of the tap are the same bits -- which is
+  // precisely what the mono tap copied across both sides used to produce.
+  mac_build(1, 1);
+  slot_clear();
+  strip_clear();
+  for (int c = 0; c < kMacChannels; ++c) {
+    g_mixer.channel_pan[c] = 128u;
+    g_mixer.send_level[c][0] = 0.5f;
+  }
+  mix::slot_set_kind(&g_mixer.send[0], mix::FxKind::kFilter);        // cutoff 0: off
+  slot_render(6, g_a);
+  long lr = 0;
+  for (int i = 0; i < n; i += 2)
+    if (g_a[i] != g_a[i + 1])
+      ++lr;
+  CHECK(lr == 0);
+  CHECK(peak_of(g_a, n) > 0.0);
+
+  // One channel, hard left. `player_start` sets separation 0.7, so the gains are 1 and 0.3 and
+  // the tap's energy on the right is 0.3^2 = 0.09 of the left's -- a mono tap would be 1.
+  mac_build(1, 1);
+  for (int c = 1; c < kMacChannels; ++c)
+    g_mac_pat[c] = Note();                                            // only channel 0 plays
+  slot_clear();
+  strip_clear();
+  g_mixer.channel_pan[0] = 1u;                                        // hard left
+  mix::slot_set_kind(&g_mixer.send[0], mix::FxKind::kFilter);
+  slot_render(6, g_a);                                                // no tap
+  g_mixer.send_level[0][0] = 1.f;
+  slot_render(6, g_b);                                                // the tap
+  double dl = 0.0, dr = 0.0;
+  for (int i = 0; i < n; i += 2) {
+    dl += (g_b[i] - g_a[i]) * (g_b[i] - g_a[i]);
+    dr += (g_b[i + 1] - g_a[i + 1]) * (g_b[i + 1] - g_a[i + 1]);
+  }
+  CHECK(dl > 0.0);
+  CHECK(dr / dl > 0.089 && dr / dl < 0.091);
+
+  // A Bus takes no taps: the same levels into a Bus change nothing (nothing is routed to it).
+  mac_build(1, 1);
+  slot_clear();
+  strip_clear();
+  slot_render(6, g_a);
+  g_mixer.send_mode[1] = mix::SendMode::kBus;
+  for (int c = 0; c < kMacChannels; ++c)
+    g_mixer.send_level[c][1] = 1.f;
+  slot_render(6, g_b);
+  CHECK(memcmp(g_a, g_b, sizeof(double) * (size_t) n) == 0);
+
+  slot_clear();
   strip_clear();
 }
 
@@ -4545,6 +4612,7 @@ main(void) {
   test_slot_lane_restrictions();
   test_master_slots_from_the_plane();
   test_channel_strip();
+  test_send_modes_and_stereo_taps();
   test_slot_macro_targets();
   test_slot_resync_restores_the_configuration();
   test_slot_apply_skips_and_fires();
