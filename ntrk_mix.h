@@ -382,9 +382,13 @@ const int kFxplSlotEnd = 0xc0;
 // which is why no channel is encoded anywhere: a channel lane already says
 // which one, and a macro says it through `scope`.
 const int kSlotSend = 0;          // 0 .. kSends-1
-const int kSlotMaster = 4;
+const int kSlotMaster = 4;        // master FX 1 -- what "the master" meant before v3
 const int kSlotInsert = 5;
-const int kSlotCount = 8;         // 6 and 7 are spare and are ignored at use
+const int kSlotMaster2 = 6;       // master FX 2 and 3: the ids that were spare, so a file
+const int kSlotMaster3 = 7;       // written before them never names one
+const int kSlotCount = 8;
+// `FxplDeltas::slot`'s rows: every global slot, then one insert per channel.
+const int kSlotDeltaRows = kMixrFxSlots + kMaxChannels;
 
 // **Where a slot command has a referent, and it is a slot-id range check rather
 // than an effect-semantics one** -- so it costs the format none of its opacity:
@@ -392,7 +396,7 @@ const int kSlotCount = 8;         // 6 and 7 are spare and are ignored at use
 //   channel lane   only kSlotInsert. A send or the master written from four
 //                  channel lanes is the master-gain wart: four columns each
 //                  sliding one reverb size sum four deltas into one value.
-//   meta lane      sends and the master. A meta lane is the whole row, so it
+//   meta lane      sends and the master's three. A meta lane is the whole row, so it
 //                  writes a global thing once. kSlotInsert names no channel
 //                  there and is ignored; a macro with scope 0xFF is how an
 //                  insert is reached from a global place.
@@ -602,7 +606,8 @@ struct Mixer {
   // round trip is algebraically the identity and is not one in floating point.
   float width = 1.f;
 
-  Slot  master_fx;
+  // Master FX 1..3, run in order after the gain and before the width.
+  Slot  master_fx[kMixrMasterSlots];
 
   // -- What each bus is doing, for a host that wants to show it.
   //
@@ -673,10 +678,8 @@ mixer_slot_peak(const Mixer *mx, int index) {
 static_assert(kMixrSlots == kSends + 1, "MIXR carries the sends, then the master");
 static_assert(kMixrSlotParams == 8, "a slot has eight parameters");
 
-// The slot a MIXR index names: 0..kSends-1 are the sends, kSends is the master.
-// Inserts are not in the block.
-// ponytail: no insert slots. They are per channel and nothing has wanted one
-// saved yet; widening `kMixrSlots` and bumping `kMixrVersion` is the way in.
+// The slot an effect-slot index names: 0..kSends-1 the sends, then master FX 1..3
+// (0..kMixrFxSlots-1). Inserts are per channel and reached through `insert[c]`.
 Slot *mixr_slot_at(Mixer *mx, int index);
 
 // Read `module->mix` into the mixer. False, touching nothing, if the module
@@ -1000,13 +1003,19 @@ struct FxplDeltas {
   // Slot parameters gather the same way and for the same reason. One row per
   // global slot, then one per channel's insert -- `slot_delta_row` is the only
   // place that layout is spelled out.
-  float    slot[kSlotInsert + kMaxChannels][8];
-  uint8_t  slot_touched[kSlotInsert + kMaxChannels];
+  float    slot[kSlotDeltaRows][8];
+  uint8_t  slot_touched[kSlotDeltaRows];
 };
 
 // Which row of `FxplDeltas::slot` a (slot, channel) pair accumulates into, or
-// -1 for a pair with no referent.
+// -1 for a pair with no referent. **Rows are not slot ids**: the sends, then the
+// master's three, then one per channel's insert -- the command ids leave a gap
+// at 5 (`kSlotInsert`) that a row numbering must not.
 int slot_delta_row(int slot, int channel);
+
+// The inverse: the slot id a row belongs to, and for an insert row its channel
+// (-1 otherwise).
+int slot_delta_row_slot(int row, int *channel);
 
 // One macro invocation, from a meta lane's `{macro, input}` cell.
 //

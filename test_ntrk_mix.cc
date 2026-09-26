@@ -1391,9 +1391,9 @@ big_mixer_setup() {
   mix::slot_set_kind(&g_mixer.send[2], mix::FxKind::kNone);
   mix::slot_set_kind(&g_mixer.send[3], mix::FxKind::kNone);
 
-  g_mixer.master_fx.param[0] = mix::slot_choice_param((int) fx::ShapeKind::kTape, 4);
-  g_mixer.master_fx.param[1] = 0.3f;
-  mix::slot_set_kind(&g_mixer.master_fx, mix::FxKind::kShape);
+  g_mixer.master_fx[0].param[0] = mix::slot_choice_param((int) fx::ShapeKind::kTape, 4);
+  g_mixer.master_fx[0].param[1] = 0.3f;
+  mix::slot_set_kind(&g_mixer.master_fx[0], mix::FxKind::kShape);
 
   g_mixer.master_gain = 1.5f;
   g_mixer.width = 1.25f;
@@ -1687,7 +1687,7 @@ fuzz_mixer_setup() {
     for (int i = 0; i < 8; ++i)
       g_mixer.send[s].param[i] = 0.f;
   for (int i = 0; i < 8; ++i)
-    g_mixer.master_fx.param[i] = 0.f;
+    g_mixer.master_fx[0].param[i] = 0.f;
 
   g_mixer.insert[0].param[0] = mix::slot_choice_param((int) fx::ShapeKind::kFold, 4);
   g_mixer.insert[0].param[1] = 0.5f;
@@ -1710,9 +1710,9 @@ fuzz_mixer_setup() {
     }
   }
 
-  g_mixer.master_fx.param[0] = mix::slot_choice_param((int) fx::ShapeKind::kTape, 4);
-  g_mixer.master_fx.param[1] = 0.35f;
-  mix::slot_set_kind(&g_mixer.master_fx, mix::FxKind::kShape);
+  g_mixer.master_fx[0].param[0] = mix::slot_choice_param((int) fx::ShapeKind::kTape, 4);
+  g_mixer.master_fx[0].param[1] = 0.35f;
+  mix::slot_set_kind(&g_mixer.master_fx[0], mix::FxKind::kShape);
 
   g_mixer.master_gain = 1.4f;
   g_mixer.width = 1.2f;
@@ -1918,7 +1918,7 @@ mac_render(int ticks, double *out) {
     for (int s = 0; s < mix::kSends; ++s)
       g_mixer.send_level[c][s] = 0.f;
   }
-  mix::slot_set_kind(&g_mixer.master_fx, mix::FxKind::kNone);
+  mix::slot_set_kind(&g_mixer.master_fx[0], mix::FxKind::kNone);
   g_mixer.master_gain = g_mac_player.gain;
   g_mixer.width = 1.f;
   const int frames = kTickFrames * ticks;
@@ -2453,9 +2453,11 @@ slot_clear(void) {
       g_mixer.send[s].param[i] = 0.f;
     mix::slot_set_kind(&g_mixer.send[s], mix::FxKind::kNone);
   }
-  for (int i = 0; i < 8; ++i)
-    g_mixer.master_fx.param[i] = 0.f;
-  mix::slot_set_kind(&g_mixer.master_fx, mix::FxKind::kNone);
+  for (int m = 0; m < kMixrMasterSlots; ++m) {
+    for (int i = 0; i < 8; ++i)
+      g_mixer.master_fx[m].param[i] = 0.f;
+    mix::slot_set_kind(&g_mixer.master_fx[m], mix::FxKind::kNone);
+  }
   g_mixer.width = 1.f;
 }
 
@@ -2550,7 +2552,7 @@ test_slot_commands_set_and_slide() {
   slot_render(2, g_a);
   CHECK(g_mixer.insert[2].param[3] == 1.f);
   CHECK(about(g_mixer.send[1].param[4], 128.f / 255.f));
-  CHECK(about(g_mixer.master_fx.param[1], 64.f / 255.f));
+  CHECK(about(g_mixer.master_fx[0].param[1], 64.f / 255.f));
   // And nothing else moved: the pair is packed into the command byte, so a
   // decode off by one bit would land on a neighbour.
   CHECK(g_mixer.insert[2].param[2] == 0.f);
@@ -2608,15 +2610,59 @@ test_slot_lane_restrictions() {
   for (int c = 0; c < kMacChannels; ++c)
     CHECK(g_mixer.insert[c].param[0] == 0.f);
 
-  // The spare slot ids are ignored from either lane, which is what keeps 6 and
-  // 7 free to mean something later.
+  // Master FX 2 and 3 (ids 6 and 7) are global slots: ignored from a channel
+  // lane, like every global slot, and reached from a meta lane.
   mac_build(1, 1);
   slot_clear();
   mac_chan(0, 0, 0, 0x01, 200);
-  mac_chan(0, 1, 0, slot_cmd_byte(6, 0, false), 255);
-  mac_meta(0, 0, slot_cmd_byte(7, 0, false), 255);
+  mac_chan(0, 1, 0, slot_cmd_byte(mix::kSlotMaster2, 0, false), 255);
   slot_render(6, g_b);
   CHECK(memcmp(g_a, g_b, sizeof(double) * (size_t) (kTickFrames * 6) * 2u) == 0);
+  CHECK(g_mixer.master_fx[1].param[0] == 0.f);
+}
+
+// **Command ids and delta rows are two numberings.** Ids 6 and 7 are master FX
+// 2 and 3; the delta rows used to put channel 1's insert at row 6. A set and a
+// slide on each from a meta lane land on the master slot and on no insert.
+static void
+test_master_slots_from_the_plane() {
+  printf("master FX 2 and 3 are reached from a meta lane, and no insert moves\n");
+
+  mac_build(2, 2);
+  slot_clear();
+  mac_meta(0, 0, slot_cmd_byte(mix::kSlotMaster2, 2, false), 100);
+  mac_meta(0, 1, slot_cmd_byte(mix::kSlotMaster2, 2, true), 10);      // a slide: the delta path
+  mac_meta(1, 0, slot_cmd_byte(mix::kSlotMaster3, 1, false), 64);
+  slot_render(12, g_a);
+  CHECK(about(g_mixer.master_fx[1].param[2], (100.f + 5.f * 10.f) / 255.f));
+  CHECK(about(g_mixer.master_fx[2].param[1], 64.f / 255.f));
+  CHECK(g_mixer.master_fx[0].param[2] == 0.f);
+  for (int c = 0; c < kMaxChannels; ++c)                               // the collision's control
+    for (int i = 0; i < 8; ++i)
+      CHECK(g_mixer.insert[c].param[i] == 0.f);
+  CHECK(mix::slot_is_global(mix::kSlotMaster3) && !mix::slot_is_global(mix::kSlotInsert));
+  int ch = 99;
+  for (int row = 0; row < mix::kSlotDeltaRows; ++row) {
+    const int id = mix::slot_delta_row_slot(row, &ch);
+    CHECK(mix::slot_delta_row(id, ch) == row);                         // a real inverse
+  }
+  // And the chain runs: a limiter in master FX 3 at a -12 dB ceiling bounds what comes out.
+  mac_build(1, 1);
+  slot_clear();
+  mac_chan(0, 0, 0, 0x01, 200);
+  slot_render(6, g_a);
+  double loud = 0.0;
+  for (int i = 0; i < kTickFrames * 6 * 2; ++i)
+    loud = g_a[i] > loud ? g_a[i] : (-g_a[i] > loud ? -g_a[i] : loud);
+  g_mixer.master_fx[2].param[0] = 0.f;
+  g_mixer.master_fx[2].param[1] = 1.f;                                 // -12 dB
+  mix::slot_set_kind(&g_mixer.master_fx[2], mix::FxKind::kLimiter);
+  slot_render(6, g_b);
+  double peak = 0.0;
+  for (int i = 0; i < kTickFrames * 6 * 2; ++i)
+    peak = g_b[i] > peak ? g_b[i] : (-g_b[i] > peak ? -g_b[i] : peak);
+  CHECK(loud > 0.26);                                                  // or the bound proves nothing
+  CHECK(peak <= 0.2512 && peak > 0.1);
 }
 
 // The widened macro target range, which is the same numbering as the set
@@ -2825,7 +2871,7 @@ desc_build_mixer(mix::Mixer *mx) {
     mx->insert[i].kind = mix::FxKind::kNone;
   mx->send[0].kind = mix::FxKind::kDelay;
   mx->send[1].kind = mix::FxKind::kReverb;
-  mx->master_fx.kind = mix::FxKind::kShape;
+  mx->master_fx[0].kind = mix::FxKind::kShape;
   mx->insert[2].kind = mix::FxKind::kFilter;
 }
 
@@ -3509,7 +3555,7 @@ test_describe_command_space() {
   CHECK(mix::fx_param_name(mix::FxKind::kDelay, 8) == nullptr);
   CHECK(mix::fx_param_name(mix::FxKind::kNone, 0) == nullptr);
   CHECK(mix::fxpl_slot_name(mix::kSlotInsert) != nullptr);
-  CHECK(mix::fxpl_slot_name(6) == nullptr);
+  CHECK(strcmp(mix::fxpl_slot_name(mix::kSlotMaster2), "Master FX 2") == 0);
   CHECK(mix::fxpl_slot_name(mix::kSlotCount) == nullptr);
   CHECK(mix::fxpl_value_name(mix::kFxplPan) != nullptr);
   CHECK(mix::fxpl_value_name(mix::kFxplValues) == nullptr);
@@ -3538,8 +3584,8 @@ mixr_configure(mix::Mixer *mx) {
   mx->send[1].param[4] = 1.f;
   mix::slot_set_kind(&mx->send[1], mix::FxKind::kDelay);
 
-  mx->master_fx.param[0] = 0.6f;
-  mix::slot_set_kind(&mx->master_fx, mix::FxKind::kShape);
+  mx->master_fx[0].param[0] = 0.6f;
+  mix::slot_set_kind(&mx->master_fx[0], mix::FxKind::kShape);
 }
 
 static void
@@ -3582,7 +3628,7 @@ test_mixr_round_trip() {
 
   // Past the end is null both ways, so a caller cannot walk off the block.
   CHECK(mix::mixr_slot_at(&b, -1) == NULL);
-  CHECK(mix::mixr_slot_at(&b, kMixrSlots) == NULL);
+  CHECK(mix::mixr_slot_at(&b, kMixrFxSlots) == NULL);
 }
 
 // **A send only sounds if a channel feeds it**, and until v2 the block could not say which
@@ -3715,7 +3761,7 @@ test_mixr_version_follows_the_levels() {
   // written — and a file that never used the feature keeps its bytes and its old reader.
   static mix::Mixer quiet;
   mix::mixer_reset(&quiet);
-  mix::slot_set_kind(&quiet.master_fx, mix::FxKind::kShape);
+  mix::slot_set_kind(&quiet.master_fx[0], mix::FxKind::kShape);
   mix::mixer_config_write(&quiet, &plain);
   // **Unity returns are not new information.** They are exactly what a v1 file meant, so a
   // mixer that feeds nothing and returns everything still needs no v2 bytes — which is what
@@ -4404,6 +4450,7 @@ main(void) {
   test_slot_units_are_normalised();
   test_slot_commands_set_and_slide();
   test_slot_lane_restrictions();
+  test_master_slots_from_the_plane();
   test_slot_macro_targets();
   test_slot_resync_restores_the_configuration();
   test_slot_apply_skips_and_fires();

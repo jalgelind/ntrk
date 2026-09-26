@@ -390,7 +390,7 @@ mixer_setup(const Cfg &cfg) {
       slot_setup(&g_mixer.insert[c], cfg.insert, false);
   }
 
-  slot_setup(&g_mixer.master_fx, cfg.master, false);
+  slot_setup(&g_mixer.master_fx[0], cfg.master, false);
 }
 
 // ----------------------------------------------------------------------------

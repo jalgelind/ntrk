@@ -407,9 +407,15 @@ fxpl_slide_index(int cmd) {
   return -1;
 }
 
+// Master FX 1..3 as an index into `Mixer::master_fx`, or -1 for any other id.
+static int
+slot_master_index(int slot) {
+  return slot == kSlotMaster ? 0 : slot == kSlotMaster2 ? 1 : slot == kSlotMaster3 ? 2 : -1;
+}
+
 bool
 slot_is_global(int slot) {
-  return slot >= 0 && slot <= kSlotMaster;
+  return (slot >= kSlotSend && slot < kSlotSend + kSends) || slot_master_index(slot) >= 0;
 }
 
 bool
@@ -427,20 +433,37 @@ Slot *
 slot_at(Mixer *mx, int slot, int channel) {
   if (slot >= kSlotSend && slot < kSlotSend + kSends)
     return &mx->send[slot - kSlotSend];
-  if (slot == kSlotMaster)
-    return &mx->master_fx;
+  const int m = slot_master_index(slot);
+  if (m >= 0)
+    return &mx->master_fx[m];
   if (slot == kSlotInsert && channel >= 0 && channel < kMaxChannels)
     return &mx->insert[channel];
-  return nullptr;                   // 6 and 7 are spare; an insert with no lane
+  return nullptr;                   // an insert with no lane
 }
 
 int
 slot_delta_row(int slot, int channel) {
-  if (slot_is_global(slot))
-    return slot;
+  if (slot >= kSlotSend && slot < kSlotSend + kSends)
+    return slot - kSlotSend;
+  const int m = slot_master_index(slot);
+  if (m >= 0)
+    return kSends + m;
   if (slot == kSlotInsert && channel >= 0 && channel < kMaxChannels)
-    return kSlotInsert + channel;
+    return kMixrFxSlots + channel;
   return -1;
+}
+
+int
+slot_delta_row_slot(int row, int *channel) {
+  *channel = -1;
+  if (row < kSends)
+    return kSlotSend + row;
+  if (row < kMixrFxSlots) {
+    static const int ids[kMixrMasterSlots] = {kSlotMaster, kSlotMaster2, kSlotMaster3};
+    return ids[row - kSends];
+  }
+  *channel = row - kMixrFxSlots;
+  return kSlotInsert;
 }
 
 // A normalised parameter never leaves 0..1: a slide that ran off the end would
@@ -565,8 +588,10 @@ mixer_reset(Mixer *mx) {
     slot_revert(&mx->send[s]);
     slot_set_kind(&mx->send[s], mx->send[s].kind);
   }
-  slot_revert(&mx->master_fx);
-  slot_set_kind(&mx->master_fx, mx->master_fx.kind);
+  for (int m = 0; m < kMixrMasterSlots; ++m) {
+    slot_revert(&mx->master_fx[m]);
+    slot_set_kind(&mx->master_fx[m], mx->master_fx[m].kind);
+  }
   // Every tail is gone, so every meter is empty. Left to the release it would
   // fall from wherever the last tune left it, which reads as a bus still
   // running after the thing feeding it was dropped.
@@ -587,9 +612,9 @@ mixer_reset(Mixer *mx) {
 
 Slot *
 mixr_slot_at(Mixer *mx, int index) {
-  if (mx == nullptr || index < 0 || index >= kMixrSlots)
+  if (mx == nullptr || index < 0 || index >= kMixrFxSlots)
     return nullptr;
-  return index < kSends ? &mx->send[index] : &mx->master_fx;
+  return index < kSends ? &mx->send[index] : &mx->master_fx[index - kSends];
 }
 
 namespace {
@@ -990,8 +1015,8 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
   mx->master_gain = (float) ntrk::read_u16(p + 4) / (float) kMixrQUnit;
   mx->width = (float) ntrk::read_u16(p + 6) / (float) kMixrQUnit;
 
-  for (int i = 0; i < kMixrSlots; ++i) {
-    const uint8_t *r = p + kMixrHeaderBytes + i * kMixrSlotBytes;
+  for (int i = 0; i < kMixrFxSlots; ++i) {
+    const uint8_t *r = config_slot_record(p, i);
     Slot *slot = mixr_slot_at(mx, i);
     for (int k = 0; k < kMixrSlotParams; ++k)
       slot->param[k] = (float) ntrk::read_u16(r + 2 + k * 2) / 65535.f;
@@ -1025,9 +1050,9 @@ mixer_config_write(const Mixer *mx, uint8_t *block) {
   ntrk::write_u16(p + 4, mixr_q12(mx->master_gain));
   ntrk::write_u16(p + 6, mixr_q12(mx->width));
 
-  for (int i = 0; i < kMixrSlots; ++i) {
-    uint8_t *r = p + kMixrHeaderBytes + i * kMixrSlotBytes;
-    const Slot *slot = i < kSends ? &mx->send[i] : &mx->master_fx;
+  for (int i = 0; i < kMixrFxSlots; ++i) {
+    uint8_t *r = config_slot_record(p, i);
+    const Slot *slot = mixr_slot_at(const_cast<Mixer *>(mx), i);
     r[0] = (uint8_t) slot->kind;
     // **`base`, not `param`.** `param` is where a slide currently stands, so
     // saving mid-automation would bake the tune's own movement into its
@@ -1089,7 +1114,8 @@ fxpl_sync(Mixer *mx, const Player *player) {
     slot_revert(&mx->insert[c]);
   for (int s = 0; s < kSends; ++s)
     slot_revert(&mx->send[s]);
-  slot_revert(&mx->master_fx);
+  for (int m = 0; m < kMixrMasterSlots; ++m)
+    slot_revert(&mx->master_fx[m]);
   mx->fxpl_synced = true;
 }
 
@@ -1413,7 +1439,7 @@ fxpl_slide(Mixer *mx, Player *player) {
     for (int i = 0; i < kFxplValues; ++i)
       d.value[c][i] = 0.f;
   }
-  for (int rowi = 0; rowi < kSlotInsert + kMaxChannels; ++rowi) {
+  for (int rowi = 0; rowi < kSlotDeltaRows; ++rowi) {
     d.slot_touched[rowi] = 0u;
     for (int i = 0; i < 8; ++i)
       d.slot[rowi][i] = 0.f;
@@ -1490,11 +1516,12 @@ fxpl_slide(Mixer *mx, Player *player) {
   // The slots' half of the same store. **`Slot::param` is the accumulator** --
   // it persists across ticks exactly as `fxpl_val` does, which is why widening
   // the macro target range needed no second one.
-  for (int rowi = 0; rowi < kSlotInsert + kMaxChannels; ++rowi) {
+  for (int rowi = 0; rowi < kSlotDeltaRows; ++rowi) {
     if (d.slot_touched[rowi] == 0u)
       continue;
-    const int slot = rowi < kSlotInsert ? rowi : kSlotInsert;
-    Slot *s = slot_at(mx, slot, rowi - kSlotInsert);
+    int channel;
+    const int slot = slot_delta_row_slot(rowi, &channel);
+    Slot *s = slot_at(mx, slot, channel);
     for (int i = 0; i < 8; ++i) {
       if ((d.slot_touched[rowi] & (uint8_t) (1u << i)) == 0u)
         continue;
@@ -1602,7 +1629,8 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
                            : 0.f;
     for (int s = 0; s < kSends; ++s)
       mx->send[s].beat_seconds = beat;
-    mx->master_fx.beat_seconds = beat;
+    for (int m = 0; m < kMixrMasterSlots; ++m)
+      mx->master_fx[m].beat_seconds = beat;
 
     // **A module with no plane drops what was queued rather than holding it.** The
     // plane is where a macro is applied, so a pending input has nowhere to go --
@@ -1784,7 +1812,8 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       mx->mix_r[i] *= k;
     }
 
-    slot_process_stereo(&mx->master_fx, mx->mix_l, mx->mix_r, run, frate);
+    for (int m = 0; m < kMixrMasterSlots; ++m)
+      slot_process_stereo(&mx->master_fx[m], mx->mix_l, mx->mix_r, run, frate);
 
     // Mid/side. Skipped at exactly 1 and for a mono caller: `(l+r)*0.5 +
     // (l-r)*0.5` is `l` in arithmetic and not always in floats, so computing it
@@ -2057,11 +2086,13 @@ static_assert(kSends == 4, "the slot and value names below name four sends");
 
 const char *
 fxpl_slot_name(int slot) {
+  // "Master FX" for id 4 as it always was -- a describe string files and editors already read.
   static const char *const names[kSlotCount] = {
-      "Send 1", "Send 2", "Send 3", "Send 4", "Master FX", "Insert"};
+      "Send 1", "Send 2", "Send 3", "Send 4", "Master FX", "Insert",
+      "Master FX 2", "Master FX 3"};
   if (slot < 0 || slot >= kSlotCount)
     return nullptr;
-  return names[slot];   // 6 and 7 are spare, and null says so
+  return names[slot];
 }
 
 const char *
@@ -2093,8 +2124,9 @@ slot_const_at(const Mixer *mx, int slot, int channel) {
     return nullptr;
   if (slot >= kSlotSend && slot < kSlotSend + kSends)
     return &mx->send[slot];
-  if (slot == kSlotMaster)
-    return &mx->master_fx;
+  const int m = slot_master_index(slot);
+  if (m >= 0)
+    return &mx->master_fx[m];
   if (slot == kSlotInsert && channel >= 0 && channel < kMaxChannels)
     return &mx->insert[channel];
   return nullptr;
