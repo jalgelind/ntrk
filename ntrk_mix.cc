@@ -1255,7 +1255,7 @@ fxpl_macro(Mixer *mx, Player *player, const Macro *mac, int input,
       if (is_slot) {
         const int row = slot_delta_row(slot, c);
         if (row < 0)
-          continue;                 // a spare slot id, ignored at use
+          continue;                 // an insert with no channel to name, ignored at use
         if (deltas != nullptr) {
           deltas->slot[row][sparam] += slot_from_param((int) value);
           deltas->slot_touched[row] |= (uint8_t) (1u << sparam);
@@ -2473,9 +2473,9 @@ fxpl_describe(const Mixer *mx, const Module *m, int channel, FxCell cell,
     // it here costs the format none of its opacity — and it is the thing an
     // editor most needs said, because a send written into a channel lane looks
     // exactly like a command that works.
-    if (slot > kSlotInsert)
-      text_add(&t, " (spare slot, ignored)");
-    else if (meta && !slot_is_global(slot))
+    // Every id 0..7 names a slot now (master FX 2/3 took the last spares), so the only
+    // mistakes left to say are the lane ones.
+    if (meta && !slot_is_global(slot))
       text_add(&t, " (an insert names no channel here, ignored)");
     else if (!meta && slot_is_global(slot))
       text_add(&t, " (a global slot is meta-lane only, ignored)");

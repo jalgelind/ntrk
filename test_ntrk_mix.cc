@@ -3137,6 +3137,11 @@ test_describe_slot_params() {
   CHECK(strcmp(b, "Send 2 (Reverb) Damping -> 0.50") == 0);
   mix::fxpl_describe(nullptr, nullptr, -1, desc_cell(0x49, 0x80), b, sizeof b);
   CHECK(strcmp(b, "Send 2 param 1 -> 0.50") == 0);
+  // Master FX 3 is id 7: command byte 0x40 + (7 << 3) + 0.
+  mix::slot_set_kind(&g_mixer.master_fx[2], mix::FxKind::kLimiter);
+  mix::fxpl_describe(&g_mixer, nullptr, -1, desc_cell(0x78, 0x80), b, sizeof b);
+  CHECK(strcmp(b, "Master FX 3 (Limiter) Threshold -> 0.50") == 0);
+  mix::slot_set_kind(&g_mixer.master_fx[2], mix::FxKind::kNone);
 
   // The same parameter index means something else behind a different kind,
   // which is the opacity this function exists to see through.
@@ -3166,8 +3171,9 @@ test_describe_slot_params() {
   CHECK(strstr(b, "meta-lane only, ignored") != nullptr);
   mix::fxpl_describe(&g_mixer, nullptr, -1, desc_cell(0x69, 0x80), b, sizeof b);
   CHECK(strstr(b, "names no channel here, ignored") != nullptr);
+  // Id 6 is master FX 2 now, a global slot: from a channel lane it is the lane rule.
   mix::fxpl_describe(&g_mixer, nullptr, 2, desc_cell(0x76, 0x80), b, sizeof b);
-  CHECK(strstr(b, "spare slot, ignored") != nullptr);
+  CHECK(strstr(b, "meta-lane only, ignored") != nullptr);
 
   // The mixer's own range, and its "parameter zero means the last one" memory,
   // which must not be printed as a 0.00 the player never uses.
