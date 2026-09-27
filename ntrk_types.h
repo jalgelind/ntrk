@@ -473,107 +473,85 @@ const int kFxplValueCount = 8;
 // to put.** Every level, pan, filter and slot *parameter* is an FXPL command
 // and has always been saved; a slot's *kind* is deliberately not one -- a row
 // that switched a shaper to a reverb would point the tank at memory the caller
-// laid out for something else -- and the stereo width has no command at all. So
-// those are a block rather than a plane, and they are the mixer's starting
-// state, which automation moves from.
+// laid out for something else -- and the stereo width, a channel's fader and
+// its routing have no command at all. So those are a block rather than a plane,
+// and they are the mixer's starting state, which automation moves from.
 //
 // The layout is here for the same reason `kFxplValueCount` is: the loader
 // length-checks the block exactly, and the loader cannot see `ntrk_mix.h`. The
 // static_asserts that pin these to the mixer's own counts are in that header,
 // which is the end that can see both.
 //
-//   u16 version (2)   u16 slots   u16 master gain   u16 width
-//   then per slot: u8 kind, u8 reserved, u16 param[8]
-//   then, at v2 and later: u8 send_level[kMaxChannels][kMixrSends], u8 return_level[kMixrSlots]
-//   then, at v3 only: master FX 2 and 3 (a slot record each), u16 channel volume (Q12) per
-//   channel, u8 channel pan per channel, a slot record per channel (its insert), u8 channel
-//   output per channel, u8 send output per send, u8 send mode per send
+//   u16 version (3)   u16 slots (5)   u16 master gain   u16 width
+//   per bus slot (the four sends, then master FX 1): u8 kind, u8 reserved, u16 param[8]
+//   u8 send level [channel][send]     u8 return level [bus slot]
+//   master FX 2 and 3: a slot record each
+//   per channel: u16 volume (Q12)     per channel: u8 pan (0 = the player's own layout)
+//   per channel: its insert, a slot record          per channel: u8 output (0 master, n send n)
+//   per send: u8 output (0 master, n a higher send)  per send: u8 mode (0 Send, 1 Bus)
 //
 // Gain and width are Q12 -- 4096 is unity -- which reaches 16 with a resolution
 // of 0.00024, far finer than a fader moves. A parameter is normalised 0..1 over
 // the whole u16, because a slot's own ceiling is what denormalises it and a
 // delay time against a two-second ceiling wants better than a byte's 8 ms.
-// **Version 2 adds the send levels.** A send only sounds if a channel feeds it --
-// `bus[i] += v[i] * send_level[c][s]` -- and until v2 the only thing that could write
-// that number was an effect-plane command, so a tune had to carry a command on row 0
-// to say which channels go to the reverb. That is exactly what this block's own
-// argument about the master gain says a file should not have to do.
 //
-// **A v1 block still loads**, with every level at zero, which is what a file written
-// before this meant: nothing fed the sends except what the plane said. And a module
-// whose levels are ALL zero is written back as v1, so a file that does not use the
-// feature round-trips byte-identical and an older reader keeps it -- the same policy
-// TUNE and SMUT follow, for the same reason.
-//
-// **Version 3 appends the channel strip, two more master slots, and routing.** Appended, never
-// inserted, so every v2 offset keeps its meaning and no accessor needs a second copy of the
-// layout. Every new byte's zero is the behaviour a v2 file had -- no master FX 2/3, the
-// player's own pan layout, no insert, every output to the master, every send a Send -- except
-// the channel volume, which is Q12 like every other gain here and is filled with unity on the
-// way in, as the returns are. The writer chooses the narrowest version (`mix_version_needed`).
-const int kMixrVersion = 3;        // what `Module::mix` always holds in memory
-const int kMixrVersion2 = 2;       // before the channel strip; still read, written when enough
-const int kMixrVersion1 = 1;       // before the send levels; still read, never written new
-// **The buses**: the four sends, then the master. The header's slot table, and what an editor's
-// bus picker and the mixer's meters count. Unchanged by v3 -- the loader checks it exactly.
+// **One layout, and its version is 3.** Versions 1 and 2 (98 and 167 bytes, the
+// same prefix without the later regions) were dropped rather than up-converted:
+// a file carrying one is refused, as any block whose length disagrees with the
+// layout is. **The number stays 3 and must not be renumbered to 1** -- a v1
+// block would then pass the version check and be read at the wrong length,
+// garbage that loads instead of a clean refusal.
+const int kMixrVersion = 3;
+// **The buses**: the four sends, then the master. The slot table, and what an editor's bus
+// picker and the mixer's meters count.
 const int kMixrSlots = 5;
 const int kMixrSends = kMixrSlots - 1;
-// **The effect slots**: 0..3 the sends, 4..6 master FX 1..3. Slot 4 is the header's slot 4, so an
-// index that meant the master before v3 means master FX 1 now.
+// **The effect slots**: 0..3 the sends, 4..6 master FX 1..3. Slot 4 is the table's slot 4 --
+// master FX 1 -- and 5..6 live in their own region further on.
 const int kMixrMasterSlots = 3;
 const int kMixrFxSlots = kMixrSends + kMixrMasterSlots;
 const int kMixrSlotParams = 8;
 const int kMixrSlotBytes = 2 + kMixrSlotParams * 2;
 const int kMixrHeaderBytes = 8;
-const int kMixrBytesV1 = kMixrHeaderBytes + kMixrSlots * kMixrSlotBytes;
 // One byte per (channel, send). A level is a gain in 0..1 and a byte's 1/255 is finer
 // than the plane's own command resolution, which is also a byte -- so the block can say
 // anything an automation of it could.
 const int kMixrSendLevelBytes = kMaxChannels * kMixrSends;
-// A RETURN level per slot: how much of what the slot produces reaches the mix.
+// A RETURN level per bus slot: how much of what the slot produces reaches the mix.
 //
 // **Not the same as a kind's own `Mix` knob**, which is what stood in for this and could not.
-// Only two of the four kinds have one — delay at parameter 3, reverb at 4 — and a shaper or a
-// filter on a send had no level at all, so it was audible or bypassed with nothing in between.
-// A blend inside an effect is also a different quantity from how loud its bus comes back:
-// `mix` at 0.5 on a send means half the DRY signal returning too, which on a send is the
-// channel arriving twice rather than a quieter effect.
+// Only two kinds have one — delay at parameter 3, reverb at 4 — and a shaper or a filter on a
+// send had no level at all, so it was audible or bypassed with nothing in between. A blend
+// inside an effect is also a different quantity from how loud its bus comes back: `mix` at
+// 0.5 on a send means half the DRY signal returning too, which on a send is the channel
+// arriving twice rather than a quieter effect.
 //
 // The master's own byte is written and read like the rest and is simply not applied — its
 // output IS the mix, so scaling it here would be a second master gain. It stays in the layout
 // so a slot index means the same thing in every table.
 const int kMixrReturnBytes = kMixrSlots;
-const int kMixrBytesV2 = kMixrBytesV1 + kMixrSendLevelBytes + kMixrReturnBytes;
-// The v3 tail, region by region. `kMixrV3*` is where each starts.
-const int kMixrV3MasterSlots = kMixrBytesV2;                     // master FX 2, 3
-const int kMixrV3Volume = kMixrV3MasterSlots + (kMixrMasterSlots - 1) * kMixrSlotBytes;
-const int kMixrV3Pan = kMixrV3Volume + kMaxChannels * 2;         // 0 = the player's layout
-const int kMixrV3Insert = kMixrV3Pan + kMaxChannels;
-const int kMixrV3Output = kMixrV3Insert + kMaxChannels * kMixrSlotBytes;  // 0 master, n send n
-const int kMixrV3SendOutput = kMixrV3Output + kMaxChannels;      // 0 master, n > own send n
-const int kMixrV3SendMode = kMixrV3SendOutput + kMixrSends;      // 0 Send, 1 Bus
-const int kMixrBytes = kMixrV3SendMode + kMixrSends;
-static_assert(kMixrBytesV2 == 167 && kMixrBytes == 563, "MIXR v2/v3 sizes are file format");
+// Where each region starts.
+const int kMixrSendLevelsAt = kMixrHeaderBytes + kMixrSlots * kMixrSlotBytes;
+const int kMixrReturnsAt = kMixrSendLevelsAt + kMixrSendLevelBytes;
+const int kMixrMasterFxAt = kMixrReturnsAt + kMixrReturnBytes;   // master FX 2, 3
+const int kMixrVolumeAt = kMixrMasterFxAt + (kMixrMasterSlots - 1) * kMixrSlotBytes;
+const int kMixrPanAt = kMixrVolumeAt + kMaxChannels * 2;
+const int kMixrInsertAt = kMixrPanAt + kMaxChannels;
+const int kMixrOutputAt = kMixrInsertAt + kMaxChannels * kMixrSlotBytes;
+const int kMixrSendOutputAt = kMixrOutputAt + kMaxChannels;
+const int kMixrSendModeAt = kMixrSendOutputAt + kMixrSends;
+const int kMixrBytes = kMixrSendModeAt + kMixrSends;
+static_assert(kMixrBytes == 563, "the MIXR length is file format");
 const int kMixrQUnit = 4096;       // Q12: what 1.0 is stored as
 
 // **The mixer is no longer optional, so every `Module` needs a block even when
-// no file supplied one.** This is that block: version 3, every slot `kNone`,
-// every param zero, master gain and width at unity (`kMixrQUnit`), every send
-// level zero, every return level at unity (255), every channel volume at unity
-// and everything else of v3 at its zero. It is `config_init`'s own
-// bytes, written here instead, because `Module`'s constructor (below) is the
-// end that cannot see `ntrk_mix.h` — the same reason the layout comment above
-// lives in this file rather than that one.
-// The v3 bytes whose default is not zero: each channel's volume, Q12 unity. **One writer**, read
-// by `mix_default` and by the loader's up-convert of a v1/v2 block.
-inline void
-mix_fill_v3_defaults(uint8_t block[kMixrBytes]) {
-  for (int c = 0; c < kMaxChannels; ++c) {
-    block[kMixrV3Volume + c * 2 + 0] = (uint8_t) (kMixrQUnit & 0xFF);
-    block[kMixrV3Volume + c * 2 + 1] = (uint8_t) (kMixrQUnit >> 8);
-  }
-}
-
+// no file supplied one.** This is that block: every slot `kNone`, every param
+// zero, master gain, width and every channel volume at unity (`kMixrQUnit`),
+// every send level zero, every return at unity (255), and the rest at its zero
+// -- the player's pan layout, no insert, everything to the master, every send
+// a Send. It is `config_init`'s own bytes, written here instead, because
+// `Module`'s constructor (below) is the end that cannot see `ntrk_mix.h` — the
+// same reason the layout comment above lives in this file rather than that one.
 inline void
 mix_default(uint8_t block[kMixrBytes]) {
   for (int i = 0; i < kMixrBytes; ++i)
@@ -587,10 +565,12 @@ mix_default(uint8_t block[kMixrBytes]) {
   block[6] = (uint8_t) (kMixrQUnit & 0xFF);   // width, unity
   block[7] = (uint8_t) (kMixrQUnit >> 8);
   // Slot kind/reserved/params are already zero, which is `kNone` and silence.
-  const int returnOffset = kMixrBytesV1 + kMixrSendLevelBytes;
   for (int s = 0; s < kMixrReturnBytes; ++s)
-    block[returnOffset + s] = 255;            // return level, unity
-  mix_fill_v3_defaults(block);
+    block[kMixrReturnsAt + s] = 255;          // return level, unity
+  for (int c = 0; c < kMaxChannels; ++c) {
+    block[kMixrVolumeAt + c * 2 + 0] = (uint8_t) (kMixrQUnit & 0xFF);   // volume, unity
+    block[kMixrVolumeAt + c * 2 + 1] = (uint8_t) (kMixrQUnit >> 8);
+  }
 }
 
 // Whether a block is exactly `mix_default`'s bytes — the writer's test for
@@ -607,32 +587,6 @@ mix_is_default(const uint8_t block[kMixrBytes]) {
   return true;
 }
 
-
-// The narrowest `MIXR` version that says what `block` means -- the writer's one decision. v3 when
-// any v3 byte differs from the default block's; else v2 when any send level is non-zero (the
-// returns ride along in v2: a v1 file meant unity returns, and a v2 block is what can say
-// otherwise -- so a non-unity return also needs v2); else v1.
-inline int
-mix_version_needed(const uint8_t block[kMixrBytes]) {
-  uint8_t d[kMixrBytes];
-  mix_default(d);
-  for (int i = kMixrBytesV2; i < kMixrBytes; ++i)
-    if (block[i] != d[i])
-      return kMixrVersion;
-  for (int i = kMixrBytesV1; i < kMixrBytesV2; ++i)
-    if (block[i] != d[i])
-      return kMixrVersion2;
-  return kMixrVersion1;
-}
-
-// The length of a `MIXR` block at `version`, or 0 for a version this reader does not know.
-inline int
-mix_bytes_for(int version) {
-  return version == kMixrVersion1 ? kMixrBytesV1
-       : version == kMixrVersion2 ? kMixrBytesV2
-       : version == kMixrVersion  ? kMixrBytes
-                                  : 0;
-}
 
 // A macro's `flags`. Everything above bit 0 is reserved and a file that sets
 // any of it is refused, so those bits stay free to mean something.

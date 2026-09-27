@@ -709,24 +709,20 @@ already protects it.
 slot *parameter* is an FXPL command and has always been saved as automation; a
 slot's *kind* is deliberately not one — a row that swapped a shaper for a reverb
 would point the tank at memory the caller laid out for something else — and the
-stereo width has no command at all. Version 1 is 98 fixed bytes: `u16`
-version, `u16` slots (5), `u16` master gain and `u16` width in Q12, then per
-slot a `u8` kind, a reserved byte and eight `u16` parameters normalised 0..1 —
-the four sends and then master FX 1. **Version 2** (167 bytes) appends a `u8`
-level per channel per send and a `u8` return per slot. **Version 3** (563 bytes)
-appends master FX 2 and 3 (a slot record each), then per channel a `u16` Q12
-volume, a `u8` pan (0 is the player's own LRRL layout), an insert slot record and
-a `u8` output (0 the master, *n* a send in Bus mode), then per send a `u8` output
-(0 the master, or a higher send) and a `u8` mode (0 Send, 1 Bus). Each version
-only appends, so every earlier offset keeps its meaning, and a writer uses the
-narrowest version that says the module: an untouched file keeps its bytes.
+stereo width, a channel's fader and its routing have no command at all. The
+block is 563 fixed bytes: `u16` version (3), `u16` slots (5), `u16` master gain
+and `u16` width in Q12; per slot — the four sends, then master FX 1 — a `u8`
+kind, a reserved byte and eight `u16` parameters normalised 0..1; a `u8` level
+per channel per send and a `u8` return per slot; master FX 2 and 3 as two more
+slot records; per channel a `u16` Q12 volume, a `u8` pan (0 is the player's own
+LRRL layout), an insert slot record and a `u8` output (0 the master, *n* a send
+in Bus mode); per send a `u8` output (0 the master, or a higher send) and a `u8`
+mode (0 Send, 1 Bus).
 
-**A reader older than a version refuses that block whole** — the version and the
-length are checked exactly — and, the block being optional, plays the tune with
-no mixer at all rather than half of one. A partial read (the v2 sends but not the
-routing) would run a Bus as an effect send: a grouped channel would skip its group's
-effect and fader, and a Bus holding an effect would return it as a wet send — a
-mix nobody made.
+**One layout.** The 98- and 167-byte blocks of versions 1 and 2 are refused, not
+up-converted, and the file with them — the rule every block's exact length is
+held to. The version stays **3**: renumbering it to 1 would let an old block pass
+the version check and be read at the wrong length.
 
 It is **optional**, and `ntrk.h` never reads a byte of it — a mixer's
 configuration is not something a replayer can act on, so the format's own layer

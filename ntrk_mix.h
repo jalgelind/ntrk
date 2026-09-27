@@ -100,7 +100,7 @@ enum class FilterMode : uint8_t { kLowpass = 0, kHighpass = 1, kBandpass = 2 };
 // What a send is. **A Send** takes each channel's level into it (stereo, post-pan, post-fader)
 // and returns only its effect -- an empty one returns silence. **A Bus** takes the channels whose
 // output names it, whole, and passes them through an empty slot: a group. Zero is Send, which is
-// what every send was before v3.
+// what the default block holds.
 enum class SendMode : uint8_t { kSend = 0, kBus = 1 };
 
 // **Side by side, not a union.** `Delay` and `Reverb` have default member
@@ -388,7 +388,7 @@ const int kFxplSlotEnd = 0xc0;
 // which is why no channel is encoded anywhere: a channel lane already says
 // which one, and a macro says it through `scope`.
 const int kSlotSend = 0;          // 0 .. kSends-1
-const int kSlotMaster = 4;        // master FX 1 -- what "the master" meant before v3
+const int kSlotMaster = 4;        // master FX 1
 const int kSlotInsert = 5;
 const int kSlotMaster2 = 6;       // master FX 2 and 3: the ids that were spare, so a file
 const int kSlotMaster3 = 7;       // written before them never names one
@@ -614,8 +614,8 @@ struct Mixer {
   // round trip is algebraically the identity and is not one in floating point.
   float width = 1.f;
 
-  // -- The channel strip and routing, out of MIXR v3. Every default is what a
-  //    mixer did before v3, so a fresh mixer renders as one always has.
+  // -- The channel strip and routing, out of MIXR. Every default is the default
+  //    block's, so a fresh mixer renders as a module with no mixer block does.
   static_assert(kMaxChannels == 16, "the volume initialiser below names sixteen");
   float   channel_volume[kMaxChannels] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f,
                                           1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f};
@@ -716,8 +716,8 @@ Slot *mixr_slot_at(Mixer *mx, int index);
 // was never laid out is a passthrough rather than a fault, so this may be
 // called before or after `delay_init`/`reverb_init` -- but the tune is silent
 // on that send until it has been.
-// Read `module->mix` into the mixer — the slots, the master, the width, and from v2 the
-// per-channel send levels. **The levels land in `send_level[c][s]`**, which is where the
+// Read `module->mix` into the mixer — the slots, the master, the width, the per-channel
+// send levels, the channel strip and the routing. **The levels land in `send_level[c][s]`**, which is where the
 // plane's own `kFxplSend` command writes and where the render loop reads: the block is the
 // starting state and automation moves from it, exactly as the master gain does.
 bool mixer_config_read(Mixer *mx, const uint8_t *block);
@@ -750,24 +750,20 @@ float config_slot_param(const uint8_t *block, int slot, int param);
 // a blend inside an effect is a different quantity anyway: `Mix` at half on a send returns
 // half the DRY signal too, which is the channel arriving twice rather than a quieter effect.
 //
-// Unity for a block that carries none, which is what a v1 file meant.
+// Unity in the default block.
 float config_return_level(const uint8_t *block, int slot);
 void config_set_return_level(uint8_t *block, int slot, float v);
 
 // How much of `channel` reaches `send`, 0..1 — the number `mixer_render_add` multiplies a
-// voice by on its way to the bus, and the one thing a send needs that the block could not
-// say before v2. Zero for a block that does not carry them, which is what a v1 file meant.
+// voice by on its way to the bus. Zero in the default block: nothing feeds a send until
+// something says so.
 float config_send_level(const uint8_t *block, int channel, int send);
 void config_set_send_level(uint8_t *block, int channel, int send, float v);
 
-// Whether any level is non-zero. The writer asks this to choose the version, so a module
-// that feeds no send is written as v1 and an untouched file keeps its bytes.
-bool config_has_send_levels(const uint8_t *block);
-
-// ---- v3: the channel strip, the master's other slots, routing --------------
+// ---- the channel strip, the master's other slots, routing -------------------
 //
 // **The effect-slot accessors above take 0..kMixrFxSlots-1**: the four sends, then master FX 1
-// (the header's slot 4, as before v3), then master FX 2 and 3 from the v3 tail. Every setter
+// (the slot table's slot 4), then master FX 2 and 3 from their own region. Every setter
 // below refuses an unreadable block and touches nothing, and clamps a value, as the rest do.
 
 SendMode config_send_mode(const uint8_t *block, int send);
@@ -787,7 +783,8 @@ float config_channel_volume(const uint8_t *block, int channel);
 void config_set_channel_volume(uint8_t *block, int channel, float v);
 
 // A channel's pan, -1..+1, when the block sets one. **Not set is its own state**: the player's
-// own layout (ProTracker's LRRL), which every file before v3 plays with. `clear` returns to it.
+// own layout (ProTracker's LRRL), which an imported .mod and a module with no MIXR block play
+// with. `clear` returns to it.
 bool config_channel_pan_explicit(const uint8_t *block, int channel);
 float config_channel_pan(const uint8_t *block, int channel);
 void config_set_channel_pan(uint8_t *block, int channel, float pan);
@@ -902,7 +899,7 @@ config_slot_param(const ntrk::Module *module, int slot, int param) {
   return module != nullptr ? config_slot_param(module->mix, slot, param) : 0.f;
 }
 
-// The v3 readers, for a module -- null reads as the default block would.
+// The strip and routing readers, for a module -- null reads as the default block would.
 inline SendMode
 config_send_mode(const ntrk::Module *module, int send) {
   return module != nullptr ? config_send_mode(module->mix, send) : SendMode::kSend;
