@@ -21,6 +21,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <cmath>
 
 using namespace ntrk;
 
@@ -2966,6 +2967,110 @@ test_stereo_voice_through_the_mixer() {
   strip_clear();
 }
 
+// Percussive: one hit per channel on row 0 that decays to true silence in 120 ms, then nothing.
+static void
+mac_percussive(int channels) {
+  Instrument &ins = g_mac.instruments[0];
+  ins.volume = 64u;
+  ins.flags = kInstrumentEnvelope;
+  ins.env_attack_ms = 0u;
+  ins.env_decay_ms = 120u;
+  ins.env_sustain = 0u;
+  ins.env_release_ms = 0u;
+  for (int c = channels; c < kMacChannels; ++c)
+    g_mac_pat[c] = Note();
+}
+
+// TRK-257, measured: the default master limiter (master FX 3, as a new tune has it) against a
+// hit driven 12 dB over. What "by ear" asks -- peaks at the ceiling, the soft clipper never
+// reached, the level handed back after the hit -- as numbers.
+static void
+test_default_master_limiter_on_a_loud_tune() {
+  printf("the default master limiter holds its ceiling on a loud hit and hands the level back\n");
+  const int ticks = 24, n = kTickFrames * ticks * 2;
+  mac_build(1, 1);
+  mac_percussive(4);
+  slot_clear();
+  strip_clear();
+  for (int c = 0; c < kMacChannels; ++c)
+    g_mixer.channel_volume[c] = 2.f;                                  // +6 dB each
+  mix::Slot &lim = g_mixer.master_fx[2];
+  for (int p = 0; p < kMixrSlotParams; ++p)
+    lim.param[p] = mix::fx_param_default(mix::FxKind::kLimiter, p, false);
+  mix::slot_set_kind(&lim, mix::FxKind::kLimiter);
+  slot_render(ticks, g_a);
+
+  const double peak = peak_of(g_a, n);
+  const double ceiling = (double) lim.lim_ceil;
+  printf("  peak %.2f dBFS against a %.2f dB ceiling; gain at the end %.4f\n",
+         20.0 * std::log10(peak), 20.0 * std::log10(ceiling), (double) lim.lim_gain);
+  CHECK(ceiling > 0.866 && ceiling < 0.875);                          // -1.2 dB
+  CHECK(peak <= ceiling + 1e-6);                                      // the ceiling holds
+  CHECK(peak > ceiling * 0.95);                                       // and it was reached
+  CHECK(peak < 0.891250938);                                          // the clipper's knee: untouched
+  CHECK(lim.lim_gain == 1.f);                                         // handed back after the hit
+
+  mix::slot_set_kind(&lim, mix::FxKind::kNone);
+  slot_clear();
+  strip_clear();
+}
+
+// TRK-256, measured: two channels grouped into a Bus with a shaper, both also feeding a reverb.
+// Pulling the Bus's return down makes the hit quieter and leaves the reverb tail alone -- the
+// taps are post-fader but pre-routing, so the group fader is not the reverb's.
+static void
+test_group_fader_leaves_the_reverb_tail() {
+  printf("a group's return pulls the group down and leaves its reverb tail alone\n");
+  const int ticks = 24;
+  const fx::Reverb saved = g_mixer.send[0].reverb;
+  CHECK(fx::reverb_init(&g_mixer.send[0].reverb, g_slot_reverb_mem, sizeof g_slot_reverb_mem,
+                        48000.f, 0.25f));
+  const auto render = [&](float group_return, double *out) {
+    mac_build(1, 1);
+    mac_percussive(2);
+    slot_clear();
+    strip_clear();
+    mix::Slot &rv = g_mixer.send[0];
+    for (int p = 0; p < kMixrSlotParams; ++p)
+      rv.param[p] = mix::fx_param_default(mix::FxKind::kReverb, p, true);
+    mix::slot_set_kind(&rv, mix::FxKind::kReverb);
+    mix::Slot &sh = g_mixer.send[2];
+    for (int p = 0; p < kMixrSlotParams; ++p)
+      sh.param[p] = mix::fx_param_default(mix::FxKind::kShape, p, false);
+    mix::slot_set_kind(&sh, mix::FxKind::kShape);
+    g_mixer.send_mode[2] = mix::SendMode::kBus;
+    for (int c = 0; c < 2; ++c) {
+      g_mixer.channel_output[c] = 3u;
+      g_mixer.send_level[c][0] = 0.5f;
+    }
+    g_mixer.return_level[2] = group_return;
+    slot_render(ticks, out);
+  };
+  render(1.f, g_a);
+  render(0.25f, g_b);
+  const auto energy = [](const double *b, int from, int to) {
+    double e = 0.0;
+    for (int i = from * 2; i < to * 2; ++i)
+      e += b[i] * b[i];
+    return e;
+  };
+  const int hit_end = 48000 / 20;                                     // the first 50 ms
+  const int tail_from = 48000 * 3 / 10, tail_to = kTickFrames * ticks;// after the dry has decayed
+  const double hit_full = energy(g_a, 0, hit_end), hit_down = energy(g_b, 0, hit_end);
+  const double tail_full = energy(g_a, tail_from, tail_to), tail_down = energy(g_b, tail_from, tail_to);
+  printf("  hit %.1f dB quieter; tail energy ratio %.6f\n",
+         10.0 * std::log10(hit_full / hit_down), tail_down / tail_full);
+  CHECK(hit_down < hit_full * 0.5);                                   // the group got quieter
+  CHECK(tail_full > 0.0);                                             // there IS a tail
+  CHECK(tail_down == tail_full);                                      // and the fader left it alone
+
+  mix::slot_set_kind(&g_mixer.send[0], mix::FxKind::kNone);
+  g_mixer.send[0].reverb = saved;
+  g_mixer.return_level[2] = 1.f;
+  slot_clear();
+  strip_clear();
+}
+
 // The widened macro target range, which is the same numbering as the set
 // commands and needed no second accumulator: `Slot::param` already persists
 // across ticks the way `fxpl_val` does.
@@ -4781,6 +4886,8 @@ main(void) {
   test_send_modes_and_stereo_taps();
   test_routing();
   test_stereo_voice_through_the_mixer();
+  test_default_master_limiter_on_a_loud_tune();
+  test_group_fader_leaves_the_reverb_tail();
   test_slot_macro_targets();
   test_slot_resync_restores_the_configuration();
   test_slot_apply_skips_and_fires();
