@@ -768,6 +768,15 @@ void config_set_send_level(uint8_t *block, int channel, int send, float v);
 // below refuses an unreadable block and touches nothing, and clamps a value, as the rest do.
 
 SendMode config_send_mode(const uint8_t *block, int send);
+
+// Whether a send runs at all: it holds an effect, or it is a Bus (whose empty slot passes the
+// group through). **The one rule** -- the render loop asks it, and so does an editor showing
+// where a send's return really goes: into a send that does not run, it goes to the master.
+inline bool
+send_runs(FxKind kind, SendMode mode) {
+  return kind != FxKind::kNone || mode == SendMode::kBus;
+}
+bool config_send_runs(const uint8_t *block, int send);
 void config_set_send_mode(uint8_t *block, int send, SendMode mode);
 
 // Where a send's return goes: 0 the master, n send n -- refused unless n is HIGHER than its own

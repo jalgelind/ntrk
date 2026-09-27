@@ -856,6 +856,12 @@ config_set_send_output(uint8_t *block, int send, int output) {
   block[kMixrSendOutputAt + send] = (uint8_t) output;
 }
 
+bool
+config_send_runs(const uint8_t *block, int send) {
+  return config_readable(block) && send >= 0 && send < kSends &&
+         send_runs(config_slot_kind(block, send), config_send_mode(block, send));
+}
+
 SendMode
 config_send_mode(const uint8_t *block, int send) {
   if (!config_readable(block) || send < 0 || send >= kSends)
@@ -1615,7 +1621,7 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
   // group and passes what is routed into it, so it always runs.
   bool send_on[kSends];
   for (int s = 0; s < kSends; ++s)
-    send_on[s] = mx->send[s].kind != FxKind::kNone || mx->send_mode[s] == SendMode::kBus;
+    send_on[s] = send_runs(mx->send[s].kind, mx->send_mode[s]);
 
   int frame = 0;
   while (frame < frames) {
