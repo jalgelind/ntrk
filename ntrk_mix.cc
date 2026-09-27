@@ -682,7 +682,7 @@ config_readable(const uint8_t *block) {
     if (block[kMixrMasterFxAt + i * kMixrSlotBytes] > (uint8_t) FxKind::kLimiter)
       return false;
   for (int c = 0; c < kMaxChannels; ++c) {
-    if (block[kMixrInsertAt + c * kMixrSlotBytes] > (uint8_t) FxKind::kLimiter ||
+    if (!slot_kind_insertable((FxKind) block[kMixrInsertAt + c * kMixrSlotBytes]) ||
         block[kMixrOutputAt + c] > (uint8_t) kSends)
       return false;
   }
@@ -979,6 +979,20 @@ config_set_width(uint8_t *block, float v) {
   ntrk::write_u16(block + 6, mixr_q12(v));
 }
 
+// A saved slot record into a live slot. **A kind change resets the effect; anything else does
+// not** -- a live edit arrives here once per drag event, and resetting on each cut every reverb
+// tail and every filter's and limiter's state mid-note. Parameters first, then the kind or
+// `slot_hold`, so `base` is the configuration either way (see the header).
+static void
+mixr_slot_take(Slot *slot, const uint8_t *r) {
+  for (int k = 0; k < kMixrSlotParams; ++k)
+    slot->param[k] = (float) ntrk::read_u16(r + 2 + k * 2) / 65535.f;
+  if ((FxKind) r[0] != slot->kind)
+    slot_set_kind(slot, (FxKind) r[0]);
+  else
+    slot_hold(slot);
+}
+
 bool
 mixer_config_read(Mixer *mx, const uint8_t *block) {
   if (mx == nullptr || block == nullptr)
@@ -994,15 +1008,8 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
   mx->master_gain = (float) ntrk::read_u16(p + 4) / (float) kMixrQUnit;
   mx->width = (float) ntrk::read_u16(p + 6) / (float) kMixrQUnit;
 
-  for (int i = 0; i < kMixrFxSlots; ++i) {
-    const uint8_t *r = config_slot_record(p, i);
-    Slot *slot = mixr_slot_at(mx, i);
-    for (int k = 0; k < kMixrSlotParams; ++k)
-      slot->param[k] = (float) ntrk::read_u16(r + 2 + k * 2) / 65535.f;
-    // Last, so it is what takes `base` -- see the header. A parameter written
-    // after this is one the first plane resync throws away.
-    slot_set_kind(slot, (FxKind) r[0]);
-  }
+  for (int i = 0; i < kMixrFxSlots; ++i)
+    mixr_slot_take(mixr_slot_at(mx, i), config_slot_record(p, i));
 
   // The send levels: without them a slot carries an effect nothing feeds. They go where the plane's own command writes, so the block is the
   // starting state and an automation moves from it.
@@ -1016,18 +1023,19 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
   // The channel strip. The inserts go through the same parameters-then-kind order as the slots.
   for (int c = 0; c < kMaxChannels; ++c) {
     mx->channel_volume[c] = config_channel_volume(p, c);
+    // **Only a pan that CHANGED is pushed into the player**, on the next run. A live edit of
+    // anything else must not snap every channel back to its stored pan over the pattern's own
+    // `8xx`; a restart re-seeds them all (`strip_synced`).
+    if (p[kMixrPanAt + c] != mx->channel_pan[c])
+      mx->strip_pan_dirty = (uint16_t) (mx->strip_pan_dirty | (1u << c));
     mx->channel_pan[c] = p[kMixrPanAt + c];
     mx->channel_output[c] = p[kMixrOutputAt + c];
-    const uint8_t *r = config_insert_record(p, c);
-    for (int k = 0; k < kMixrSlotParams; ++k)
-      mx->insert[c].param[k] = record_param(r, k);
-    slot_set_kind(&mx->insert[c], (FxKind) r[0]);
+    mixr_slot_take(&mx->insert[c], config_insert_record(p, c));
   }
   for (int s = 0; s < kSends; ++s) {
     mx->send_output[s] = p[kMixrSendOutputAt + s];
     mx->send_mode[s] = (SendMode) p[kMixrSendModeAt + s];
   }
-  mx->strip_synced = false;         // the next run writes these pans into the player
   return true;
 }
 
@@ -1654,16 +1662,19 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
     // `fxpl_run` reads). Ahead of the plane, because `fxpl_sync` reads `player->pan` to seed its
     // own pan value; a pattern's pan commands move it afterwards as they always have. A pan of
     // 0 writes nothing: that channel keeps the player's layout, which is also what a module with no MIXR block plays.
-    if (!mx->strip_synced || player->ticks_elapsed < mx->strip_seen) {
+    {
+      const bool restart = !mx->strip_synced || player->ticks_elapsed < mx->strip_seen;
+      const uint16_t which = restart ? (uint16_t) 0xFFFFu : mx->strip_pan_dirty;
       bool moved = false;
       for (int c = 0; c < kMaxChannels; ++c)
-        if (mx->channel_pan[c] != 0u) {
+        if ((which & (1u << c)) != 0u && mx->channel_pan[c] != 0u) {
           player->pan[c] = pan_from_stored(mx->channel_pan[c]);
           moved = true;
         }
       if (moved)
         mixer_pan_gains(player, stereo, gain_l, gain_r);
       mx->strip_synced = true;
+      mx->strip_pan_dirty = 0u;
     }
     mx->strip_seen = player->ticks_elapsed;
 

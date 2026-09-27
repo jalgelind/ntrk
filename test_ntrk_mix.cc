@@ -3071,6 +3071,58 @@ test_group_fader_leaves_the_reverb_tail() {
   strip_clear();
 }
 
+// A live edit re-reads the block once per drag event. It must not snap a pattern's own pan back
+// to the stored one, nor reset an effect whose kind did not change; a CHANGED stored pan lands.
+static void
+test_live_config_read_keeps_state() {
+  printf("a live mixer edit keeps the pattern's pan and every effect's state\n");
+  uint8_t block[kMixrBytes];
+  CHECK(mix::config_init(block));
+  for (int c = 0; c < kMacChannels; ++c)
+    mix::config_set_channel_pan(block, c, 0.f);                      // explicit centre, as new tunes
+  mix::config_set_channel_insert_kind(block, 1, mix::FxKind::kLimiter);
+  mix::config_set_channel_insert_param(block, 1, 0, 1.f);             // -24 dB: it limits
+
+  mac_build(1, 1);
+  g_mac_pat[kMacChannels * 1 + 0].effect = 8u;                        // row 1: channel 0 hard right
+  g_mac_pat[kMacChannels * 1 + 0].param = 0xffu;
+  slot_clear();
+  strip_clear();
+  CHECK(mix::mixer_config_read(&g_mixer, block));
+  slot_render(12, g_a);                                               // past row 1
+  CHECK(g_mac_player.pan[0] > 0.9f);
+  const float gain = g_mixer.insert[1].lim_gain;
+  CHECK(gain < 1.f);
+
+  // A live edit of something else: the send level of channel 3.
+  mix::config_set_send_level(block, 3, 0, 0.5f);
+  CHECK(mix::mixer_config_read(&g_mixer, block));
+  CHECK(g_mixer.insert[1].lim_gain == gain);                          // the insert kept its state
+  mac_render_resume(1, g_b);
+  CHECK(g_mac_player.pan[0] > 0.9f);                                  // the pattern's pan stands
+
+  // A changed stored pan does land, on the next run -- and only on its own channel.
+  mix::config_set_channel_pan(block, 2, -1.f);
+  CHECK(mix::mixer_config_read(&g_mixer, block));
+  mac_render_resume(1, g_b);
+  CHECK(g_mac_player.pan[2] == -1.f);
+  CHECK(g_mac_player.pan[0] > 0.9f);
+
+  // And a restart re-seeds every stored pan over the pattern's.
+  player_start(&g_mac_player, &g_mac);
+  mac_render_resume(1, g_b);
+  CHECK(g_mac_player.pan[0] == 0.f);
+
+  // A tank kind as an insert is refused whole, as the setter refuses it.
+  block[kMixrInsertAt + 0 * kMixrSlotBytes] = (uint8_t) mix::FxKind::kReverb;
+  CHECK(!mix::mixer_config_read(&g_mixer, block));
+
+  g_mac_pat[kMacChannels * 1 + 0] = Note();
+  mix::slot_set_kind(&g_mixer.insert[1], mix::FxKind::kNone);
+  slot_clear();
+  strip_clear();
+}
+
 // The widened macro target range, which is the same numbering as the set
 // commands and needed no second accumulator: `Slot::param` already persists
 // across ticks the way `fxpl_val` does.
@@ -4815,6 +4867,7 @@ main(void) {
   test_stereo_voice_through_the_mixer();
   test_default_master_limiter_on_a_loud_tune();
   test_group_fader_leaves_the_reverb_tail();
+  test_live_config_read_keeps_state();
   test_slot_macro_targets();
   test_slot_resync_restores_the_configuration();
   test_slot_apply_skips_and_fires();

@@ -627,6 +627,7 @@ struct Mixer {
   // test `fxpl_run` makes, kept apart because a module with no plane never runs it.
   bool     strip_synced = false;
   uint64_t strip_seen = 0;
+  uint16_t strip_pan_dirty = 0;               // channels whose stored pan a read changed
 
   // Master FX 1..3, run in order after the gain and before the width.
   Slot  master_fx[kMixrMasterSlots];
