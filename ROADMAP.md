@@ -19,8 +19,12 @@ work rather than about how long the project has been going.
   load, with a compare-and-select — bit-exact and identical on ARM64 and wasm.
   Never inject DC or dither: the reference hashes would become hashes of the
   anti-denormal noise.
-- **No oversampling.** Where a model needs it, it goes behind `NTRK_OVERSAMPLE`,
-  off by default, and the non-oversampled path must stand on its own.
+- **No oversampling, with one exception.** The 303 bass voice runs its
+  oscillator, ladder and both shapers at 2x behind a halfband decimator
+  (`fx::Decim303`), always: a band-limited saw into a resonant ladder and two
+  saturators is exactly the model that needs it, and the 1x version was not
+  standing on its own. Anything else that wants it goes behind
+  `NTRK_OVERSAMPLE`, off by default.
 
 **Every port is minimal and self-contained:** a state struct and two free
 functions in one file, reaching for nothing but `<cmath>`. If it cannot be
@@ -38,9 +42,12 @@ reduced to that, it goes on the not-planned list instead.
 
 - [ ] **C10 One tune that uses everything at once.** Every feature on a real
       row, rendered and fingerprinted. The cross-target coverage module built by
-      `ntrk_gen.cc` is most of the way there and is the place to grow it, not a
-      second file — it already carries both effect planes, a macro lane, the
-      voice filter and both send effects.
+      `ntrk_gen.cc` is the place to grow it, not a second file — it carries both
+      effect planes, a macro lane, the voice filter, both sends, NAME and TUNE.
+      **What it does not reach yet** is everything since: SLIC slices with SLC,
+      S and slice stop, ITUN, SMUT, a stereo sample (NTRK-46..48), and MIXR's
+      channel strip, routing into a Bus, master slots 2 and 3, the limiter and
+      the tempo-synced delay (NTRK-38..44). Swing stays zero until T50.
 
 - [ ] **T41 Multi-sample XM instruments.** An XM instrument maps its 96 notes
       across up to sixteen samples; an ntrk instrument holds one, so the
@@ -60,31 +67,13 @@ reduced to that, it goes on the not-planned list instead.
       pair is a bounded change there rather than a new clock. It must not move
       a straight tune by a sample: swing zero has to be bit-identical, which is
       the check that makes it safe to add at all.
-      **Where it lives:** a module field is the honest home — swing belongs to
-      the tune, not to a row — and the header has no room (`a header change is
-      version 3`), so it is an optional block or an FXPL meta command. Decide
-      that before writing any of it.
+      **Where it lives is decided:** the TUNE block's `swing` field, in
+      `kSwingUnit` (4096ths of a row, at most 2047), written critical exactly
+      when it is non-zero. It is loaded, saved and exposed as a module param;
+      **only the player's half is left** — nothing reads `Module::swing`.
       **Verified by:** a straight module rendering bit-identically before and
       after, and a swung one placing its odd rows late by the frames the figure
       asks for, counted rather than heard.
-
-- [ ] **T51 Player-side pattern loop.** The editor loops a pattern by watching
-      the order index and rewinding it, which is fine for the editor and is not
-      something the library offers a caller. A loop flag on the player — loop
-      this order entry, or this row range — is a small piece of state and one
-      branch where the order advances.
-      **Verified by:** rendering N rows past the end of a looped pattern and
-      requiring the audio to equal the first N rows of it.
-
-- [ ] **T52 Seek without rendering.** Reaching row R today means rendering
-      everything before it, because the only way to advance the player is to ask
-      it for audio. A tick-without-render path — run the sequencer, skip the
-      mixer — makes an editor's "play from here" instant and is what an accurate
-      seek is made of. The risk is that it becomes a second sequencer that
-      drifts from the first, so it must be the *same* function with the audio
-      half skipped, not a copy.
-      **Verified by:** seeking to row R and rendering, against rendering from
-      the top and discarding — the two must be sample-identical.
 
 - [ ] **XM volume envelopes are dropped, and that is now the largest measured
       gap.** Checking every rendered file against libopenmpt put a number on it:
