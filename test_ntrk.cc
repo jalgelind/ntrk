@@ -3988,6 +3988,30 @@ test_synth_voice_defaults() {
   CHECK(m.instruments[0].synth_decay == 170u);
 }
 
+// A fresh bass sounds what its cell says. "C-2" (note 13) is C2, MIDI 36, 65.406 Hz: the
+// display names note 1 C-1 and the voice's law puts note 1 at MIDI 48, so the default
+// transpose is what brings the two into agreement. The negative control: every other voice
+// resets the transpose, or a bass switched to a kick would keep playing two octaves down.
+static void
+test_synth_bass_sounds_its_name() {
+  printf("a fresh bass sounds the note its cell names: C-2 is C2\n");
+  ntrk::Module m{};
+  m.note_max = ntrk::kMaxNote;
+  m.instruments[0].type = (uint8_t) ntrk::InstrumentType::kSynth;
+  ntrk::synth_voice_defaults(&m.instruments[0], ntrk::SynthVoice::kBass);
+  CHECK(m.instruments[0].transpose == ntrk::kSynthBassTranspose);
+  ntrk::Channel ch{};
+  ch.instrument = 1;
+  const int sounded = ntrk::note_transposed(&m, &ch, 13);          // cell "C-2"
+  const double hz = 7093789.2 / (2.0 * ntrk::period_for(sounded, 0) * 32.0);
+  CHECK(hz > 65.405 && hz < 65.407);                                 // C2, MIDI 36
+  // An A-1 (note 10) is A1, 55 Hz: the bottom of a 303 line is reachable.
+  const double a1 = 7093789.2 / (2.0 * ntrk::period_for(ntrk::note_transposed(&m, &ch, 10), 0) * 32.0);
+  CHECK(a1 > 54.999 && a1 < 55.001);
+  ntrk::synth_voice_defaults(&m.instruments[0], ntrk::SynthVoice::kKick);
+  CHECK(m.instruments[0].transpose == 0);
+}
+
 static void
 test_synth_voices() {
   printf("each drum sounds, stays finite, and decays to exactly zero\n");
@@ -7750,6 +7774,7 @@ main(void) {
   test_slice_on();
   test_protracker_commands();
   test_synth_voice_defaults();
+  test_synth_bass_sounds_its_name();
   test_envelope_inert_while_off();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);

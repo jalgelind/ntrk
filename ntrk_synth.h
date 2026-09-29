@@ -193,6 +193,15 @@ const SynthVoiceSpec kSynthVoiceSpecs[kSynthDrumCount] = {
     {   0.f, 1100.f, 0.50f, 0.000f, 0.000f, 0.030f, 0.400f, 0u, 3u },  // clap
 };
 
+// The bass voice's transpose, so a fresh bass sounds the note its cell is NAMED: C-2 is C2
+// (MIDI 36), which is where a 303 line lives. Note 1 is MIDI 48 on the 32-frame cycle this
+// voice steps (`ntrk_types.h`), so at transpose 0 a "C-1" bass sounded C3 and the lowest cell
+// anyone could enter was the top of the bass register. The way below note 1 is the
+// transpose -- see `note_transposed` -- and nothing set one. A default rather than a change
+// to the voice's pitch law: a saved bass keeps the transpose it was saved with and sounds as
+// it was written, and the pinned fingerprints are about the law, not about the default.
+const int8_t kSynthBassTranspose = -24;
+
 // Where a voice's own bytes start: audible, and each voice's character rather than a knob at
 // zero. **One writer**: an editor that switches an instrument to a voice seeds it here, and
 // the demo tune (`ntrk_gen.cc`) builds its voices from it -- so a fresh kick and the demo's
@@ -207,6 +216,8 @@ synth_voice_defaults(Instrument *ins, SynthVoice voice) {
   ins->synth_noise = 0; ins->synth_noise_decay = 0; ins->synth_drive = 0;
   ins->synth_cutoff = 0; ins->synth_reso = 0; ins->synth_env_mod = 0; ins->synth_accent = 0;
   ins->synth_dist = 0; ins->synth_dist_mix = 0; ins->synth_wave = 0;
+  // Every voice sets it, so a bass switched to a kick does not keep playing two octaves down.
+  ins->transpose = voice == SynthVoice::kBass ? kSynthBassTranspose : 0;
   switch (voice) {
     case SynthVoice::kKick:
       ins->synth_tune = 110; ins->synth_decay = 170; ins->synth_sweep = 120;
