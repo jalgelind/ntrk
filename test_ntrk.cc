@@ -4948,14 +4948,16 @@ test_synth_note_off() {
 
   // ---- the gate closes, and closes quietly --------------------------------
   //
-  // **C-2 on row 3, and both are chosen.** A hard cut is only audible where the
+  // **G#2 on row 3, and both are chosen.** A hard cut is only audible where the
   // waveform is away from zero when it happens, so a note-off landing on a zero
-  // crossing measures nothing at all — this is the placement, of the twelve
-  // swept, where the cut stands furthest above the saw's own slope.
+  // crossing measures nothing at all — this is a placement, of notes 8..24
+  // swept, where the cut stands well above the band-limited saw's own slope and
+  // the release stays clean. Any change to the voice's waveform or latency
+  // moves the crossings, and this is the note to re-sweep.
   const int off = 3 * row;
 
   fx_clear();
-  g_fx_pat[0].note = 13u;
+  g_fx_pat[0].note = 21u;
   g_fx_pat[0].instrument = 1u;
   g_fx_pat[3].note = (uint8_t) ntrk::kNoteOff;
 
@@ -4988,7 +4990,7 @@ test_synth_note_off() {
   CHECK(!p.channels[0].playing);
   const double cut_step = max_step(off - 4, off + 8);
 
-  // The cut's step *is* the level the waveform stood at, three times what it
+  // The cut's step *is* the level the waveform stood at, nearly three times what it
   // was travelling between samples. The release adds nothing to that slope at
   // all: an 8 ms ramp takes 1/176th off the level a sample, which is far below
   // what the saw is already doing.

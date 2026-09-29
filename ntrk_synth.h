@@ -295,8 +295,10 @@ synth_noise_sample(Channel *ch) {
 // one opening the filter and a different one setting the level. That is the
 // whole machine, and it is the *two* that matters -- see below.
 //
-// - **The oscillator is the wavetable path**, the same 32-frame cycle and the
-//   same `pos`/`step` walk a WAVE_BUILTIN instrument takes -- so vibrato, tone
+// - **The oscillator walks the wavetable path's phase**, the same 32-frame
+//   cycle and the same `pos`/`step` a WAVE_BUILTIN instrument takes, but
+//   computes a PolyBLEP saw or square from it rather than reading the 8-bit
+//   table -- so vibrato, tone
 //   portamento and arpeggio reach the bass line for nothing, which for a 303 is
 //   most of what playing one *is*. Saw and square only: that is what the
 //   instrument has, and a triangle option would be a different synth wearing
@@ -328,10 +330,14 @@ synth_noise_sample(Channel *ch) {
 // free-running counter would make the render depend on how it was buffered,
 // which is what this project's pinned fingerprints exist to catch.
 //
-// **No oversampling anywhere.** The saw is a 32-point table read at the note's
-// rate and already aliases the way every other wavetable instrument in this
-// format does; oversampling the filter and the shaper would fix the smaller
-// half of that while doubling the cost of the voice.
+// **Not the 32-point table, and at twice the rate.** A 32-frame cycle with
+// linear interpolation carries about fifteen harmonics: a 55 Hz saw measured
+// 15-20 dB short of a real one from 1.3 kHz up, which is exactly the band a
+// resonant sweep lives in, so the ladder had nothing to squelch on. The PolyBLEP
+// saw has every harmonic, and running oscillator, ladder, shaper and output
+// clip at 2x (`fx::Decim303` brings it back) keeps its edges and the two
+// nonlinearities from folding back as grit. This voice is the exception to the
+// no-oversampling policy; nothing else in the player is oversampled.
 //
 // ponytail: three things from the reference are deliberately not here. The
 // in-loop saturator (drive into the resonant state, so overdrive interacts
@@ -393,9 +399,44 @@ synth303_reso(uint8_t v) {
   return 2.52f * t * t;
 }
 
+// PolyBLEP's correction for a downward step of 2 at phase 0, `dt` the phase
+// advance per sub-sample. Zero outside one sub-sample either side of the edge,
+// so it never divides by a `dt` of zero.
+inline float
+synth303_blep(float t, float dt) {
+  if (t < dt) {
+    const float x = t / dt;
+    return x + x - x * x - 1.f;
+  }
+  if (t > 1.f - dt) {
+    const float x = (t - 1.f) / dt;
+    return x * x + x + x + 1.f;
+  }
+  return 0.f;
+}
+
+// The oscillator at phase `pos` of a `kBuiltinWaveFrames` cycle: a rising saw,
+// or a square high for the first half -- the shapes the builtin table held,
+// band-limited.
+inline float
+synth303_osc(double pos, double step, bool square) {
+  const float t = (float) (pos * (1.0 / (double) kBuiltinWaveFrames));
+  float dt = (float) (step * (1.0 / (double) kBuiltinWaveFrames));
+  if (dt > 0.5f)    // a note above a quarter of the rate: the edges would overlap
+    dt = 0.5f;
+  if (!square)
+    return 2.f * t - 1.f - synth303_blep(t, dt);
+  float t2 = t + 0.5f;
+  if (t2 >= 1.f)
+    t2 -= 1.f;
+  return (t < 0.5f ? 1.f : -1.f) + synth303_blep(t, dt) -
+         synth303_blep(t2, dt);
+}
+
 inline void
 synth303_trigger(Channel *ch, const Instrument &ins, float rate) {
   fx::ladder303_reset(&ch->synth_ladder);
+  fx::decim303_reset(&ch->synth_decim);
 
   // The drums' state, put back rather than left where it was. A row that
   // changes the instrument without playing a note hands this channel's next
@@ -445,17 +486,6 @@ synth303_recoef(Channel *ch, const Instrument &ins, float accent) {
 
 inline float
 synth303_sample(Channel *ch, const Instrument &ins) {
-  // Saw is built-in shape 1 and square is shape 0; the record's 0/1 is the
-  // player's order, not the table's, because a saw is what a 303 is for.
-  const int8_t *table = builtin_wave(ins.synth_wave == 0u ? 1 : 0);
-  const uint32_t i0 = (uint32_t) ch->pos & (uint32_t) (kBuiltinWaveFrames - 1);
-  const uint32_t i1 = (i0 + 1u) & (uint32_t) (kBuiltinWaveFrames - 1);
-  const double frac = ch->pos - (double) (uint32_t) ch->pos;
-  const float a = (float) table[i0];
-  const float b = (float) table[i1];
-  const float osc =
-      (float) ((double) a + ((double) b - (double) a) * frac) * (1.f / 128.f);
-
   // Accent is a 303's one dynamic: it lifts the level and opens the filter
   // further in the same gesture, which is why it is one knob and not two.
   //
@@ -471,27 +501,18 @@ synth303_sample(Channel *ch, const Instrument &ins) {
       (float) ins.synth_accent * (1.f / 255.f) * ch->accent;
 
   // The amortised coefficient update. The ladder walks toward what this
-  // computes over the next sixteen samples rather than stepping to it, so a
-  // sweep is a sweep and not a stair; see `ntrk_303.h`.
-  if ((ch->synth_age & (fx::kLadder303Stride - 1u)) == 0u) {
+  // computes over the next `kLadder303Stride` of its own samples rather than
+  // stepping to it, so a sweep is a sweep and not a stair; see `ntrk_303.h`.
+  // The ladder runs at 2x, so that is every half-stride output frames.
+  if ((ch->synth_age & (fx::kLadder303Stride / 2u - 1u)) == 0u) {
     synth303_recoef(ch, ins, accent);
     const float mod = (float) ins.synth_env_mod * (1.f / 255.f) *
                       kSynth303EnvModMax * (1.f + kSynth303AccentMod * accent);
     fx::ladder303_set(&ch->synth_ladder,
                       synth303_cutoff_hz(ins.synth_cutoff) *
                           (1.f + mod * ch->synth_env),
-                      synth303_reso(ins.synth_reso), ch->synth_rate);
+                      synth303_reso(ins.synth_reso), 2.f * ch->synth_rate);
   }
-  float s = fx::ladder303_process(&ch->synth_ladder, osc);
-
-  // Exactly a passthrough at drive 0 whatever the mix says, which is what
-  // `shape_sample` guarantees -- so the four kinds collapse to one signal there
-  // and the mix knob cannot introduce a difference of its own.
-  // `synth_dist` is refused above `kSynthDistKinds` at load and at save, so the
-  // byte is already one of the four by the time it gets here.
-  const float wet = fx::shape_sample((fx::ShapeKind) ins.synth_dist, s,
-                                     (float) ins.synth_drive * (1.f / 255.f));
-  s += (wet - s) * ((float) ins.synth_dist_mix * (1.f / 255.f));
 
   // The accent circuit's shape: the filter envelope through an RC, added to
   // the VCA. Run unconditionally and scaled by `accent` at the use site rather
@@ -501,21 +522,40 @@ synth303_sample(Channel *ch, const Instrument &ins) {
   const float level =
       (ch->synth_venv + kSynth303AccentVca * accent * ch->synth_acc_vca) *
       (1.f + kSynth303AccentLevel * accent);
-  s = s * level;
 
-  // **The output stage is the house saturator, and it is load-bearing.** A
-  // ladder at maximum resonance has a peak gain in the tens; a saw's harmonic
-  // sitting on that peak, times an accent, leaves the voice well outside the
-  // range the mixer's scaling assumes. Bounding it here is both what the
-  // hardware does after its VCA and the reason "finite across the whole
-  // parameter grid" is a property rather than a hope.
-  s = fx::soft_clip(s);
+  // The record's wave 0 is the saw, because a saw is what a 303 is for.
+  const bool square = ins.synth_wave != 0u;
+  const float drive = (float) ins.synth_drive * (1.f / 255.f);
+  const float mix = (float) ins.synth_dist_mix * (1.f / 255.f);
+  const double half = ch->step * 0.5;
+  float sub[2];
+  for (int k = 0; k < 2; ++k) {
+    float s = fx::ladder303_process(&ch->synth_ladder,
+                                    synth303_osc(ch->pos, half, square));
 
-  ch->pos += ch->step;
-  // A while rather than an if, for the reason the sample path's is: a high note
-  // at a low rate can step past a 32-frame cycle more than once in a frame.
-  while (ch->pos >= (double) kBuiltinWaveFrames)
-    ch->pos -= (double) kBuiltinWaveFrames;
+    // Exactly a passthrough at drive 0 whatever the mix says, which is what
+    // `shape_sample` guarantees -- so the four kinds collapse to one signal
+    // there and the mix knob cannot introduce a difference of its own.
+    // `synth_dist` is refused above `kSynthDistKinds` at load and at save, so
+    // the byte is already one of the four by the time it gets here.
+    const float wet = fx::shape_sample((fx::ShapeKind) ins.synth_dist, s, drive);
+    s += (wet - s) * mix;
+
+    // **The output stage is the house saturator, and it is load-bearing.** A
+    // ladder at maximum resonance has a peak gain in the tens; a saw's
+    // harmonic sitting on that peak, times an accent, leaves the voice well
+    // outside the range the mixer's scaling assumes. Bounding it here is both
+    // what the hardware does after its VCA and the reason "finite across the
+    // whole parameter grid" is a property rather than a hope.
+    sub[k] = fx::soft_clip(s * level);
+
+    ch->pos += half;
+    // A while rather than an if, for the reason the sample path's is: a high
+    // note at a low rate can step past a 32-frame cycle more than once.
+    while (ch->pos >= (double) kBuiltinWaveFrames)
+      ch->pos -= (double) kBuiltinWaveFrames;
+  }
+  const float s = fx::decim303_process(&ch->synth_decim, sub[0], sub[1]);
 
   // The -100 dB snap, not a denormal flush: this is the only thing that ends
   // the voice, and a multiplicative decay never reaches zero on its own. It is

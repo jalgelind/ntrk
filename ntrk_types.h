@@ -904,7 +904,8 @@ struct Channel {
   // which on the real instrument is the whole reason the filter can still be
   // sweeping under a note that has already got quiet.
   fx::Ladder303 synth_ladder;
-  float synth_venv = 0.f;      // VCA, exactly 0 once the voice is done
+  fx::Decim303 synth_decim;    // the voice runs at 2x; this brings it back
+  float synth_venv = 0.f;     // VCA, exactly 0 once the voice is done
   float synth_venv_fast = 0.f; // its coefficient above the knee
   float synth_venv_slow = 0.f; // and below it
   float synth_acc_vca = 0.f;   // accent's filter envelope, on its way to the VCA

@@ -1579,8 +1579,13 @@ test_everything_at_once() {
   // right: it *must* move. The discrimination: every centred-pan render is bit
   // for bit what it was (`test_send_modes_and_stereo_taps` proves the
   // `x * 1.f` claim), and test_ntrk.cc's fingerprints did not move.
+  //
+  // And when the bass voice left the 32-point table for a PolyBLEP saw at 2x
+  // behind a halfband decimator, with the pole table's constants rescaled from
+  // its 44.1 kHz fit to the rate it runs at. The tune has a bass line, so it *must* move;
+  // test_ntrk.cc's fingerprints play no bass and did not.
   check_hash("everything at once", hash_stream(g_ref, kBigFrames * 2),
-             0x800aaafc8a32d183ULL);
+             0x8d6fc28045a65ba8ULL);
 }
 
 // ---------------------------------------------------------------------------
