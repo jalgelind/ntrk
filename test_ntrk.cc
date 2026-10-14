@@ -3653,6 +3653,7 @@ static uint8_t g_syn[kSynSynths][kSynParams];
 
 struct SpecSyn {
   int note_instrument = 1;   // 1 kick, 3 snare, 4 hihat, 5 clap (2 is the PCM8)
+  int note = 25;             // the one note the pattern plays: C-3, where `tune` is defined
   bool synp = true;
   int synp_delta = 0;        // bytes added to the block's *declared* length
   bool synths = true;        // clear to make every instrument PCM8
@@ -3757,7 +3758,7 @@ build_syn(const SpecSyn &s) {
   }
 
   const size_t cell = syn_patterns_at();
-  g_bytes[cell + 0] = 25u;                    // C-3, where `tune` is defined
+  g_bytes[cell + 0] = (uint8_t) s.note;
   g_bytes[cell + 1] = (uint8_t) s.note_instrument;
 
   const size_t blob = syn_blob_at();
@@ -4271,12 +4272,18 @@ band_share(int first, int last, float hz, float rate) {
 
 // Instrument 5 is the bass; the other four instruments are left as they were,
 // so every one of these renders a bass line beside an untouched kit.
+//
+// **At C-1, which is C3**: the record carries no transpose, so the cell's note
+// is the note, and C-3 would be C5. A 303's knobs are ranged for the bass
+// register -- at C5 the stock cutoff range spans the fundamental and two
+// harmonics, and turning it measures the level far more than the filter.
 static void
 bass_render(const Bass &b, int frames) {
   syn_defaults();
   syn_bass(b);
   SpecSyn s;
   s.note_instrument = 5;
+  s.note = 1;
   build_syn(s);
   ntrk::Module m;
   CHECK(ntrk::module_load(&m, g_bytes, g_size));
@@ -4302,9 +4309,10 @@ test_bass_sounds() {
   //
   // **Auditioned rather than sequenced, because the tail outlasts the
   // pattern.** `decay` on this voice is the *filter* envelope; the VCA is fixed
-  // hardware -- a fast transient into a body of about a fifth of a second -- so
-  // even the shortest `decay` takes a couple of seconds to reach -100 dB, and a
-  // sixteen-row pattern would strike the note again long before then.
+  // hardware -- one 1.23 s decay -- so even the shortest `decay` takes some
+  // fourteen seconds to reach -100 dB, and a sixteen-row pattern would strike
+  // the note again long before then. An ungated 303 note is long: the gate is
+  // what a line shortens it with.
   // `player_preview` on a player that was never started is one note with
   // nothing after it, which is the only way "does it end" is answerable at all.
   syn_defaults();
@@ -4319,7 +4327,7 @@ test_bass_sounds() {
   CHECK(ntrk::player_preview(&p, 0, 25, 5, (double) kSynRate));
   const int kBassChunk = 4096;
   int rendered = 0;
-  while (p.channels[0].playing && rendered < 32 * kBassChunk) {
+  while (p.channels[0].playing && rendered < 96 * kBassChunk) {   // 17.8 s
     render_at(&p, kBassChunk, kSynRate);
     CHECK(all_finite(kBassChunk));
     rendered += kBassChunk;
@@ -4344,10 +4352,11 @@ static void
 test_bass_cutoff() {
   printf("the bass cutoff moves the spectrum\n");
 
-  // Env mod at zero throughout, so the filter is static and the only thing
-  // under test is where its corner sits.
+  // Env mod at zero throughout, so the filter is as near static as a 303's
+  // gets and the thing under test is where its corner sits. The knob's two
+  // ends: the stock range is under three octaves, 314 Hz to 2394 Hz.
   Bass low;
-  low.cutoff = 60u;
+  low.cutoff = 0u;
   bass_render(low, 4096);
   const double q_low = hf_ratio(512, 4096);
 
@@ -4391,8 +4400,9 @@ test_bass_env_mod() {
   printf("the bass env mod moves the spectrum over the life of a note\n");
 
   // Two windows in one note. With env mod the filter is wide open at the start
-  // and closing by the second window; with none it is where `cutoff` put it for
-  // the whole note, and the two windows have to agree.
+  // and closing by the second window; with none it still moves -- a 303's
+  // envelope reaches its cutoff at env mod 0 too, three quarters of an octave
+  // of it -- but by a fraction of what full env mod does.
   Bass modded;
   modded.cutoff = 100u;
   modded.env_mod = 255u;
@@ -4407,10 +4417,9 @@ test_bass_env_mod() {
   bass_render(flat, 16384);
   const double f_early = hf_ratio(256, 1024);
   const double f_late = hf_ratio(12288, 15360);
-  CHECK(f_early > 0.0);
-  // Within a fifth of each other, which for a static filter is the drift of the
-  // measure itself rather than anything moving.
-  CHECK(f_late > f_early * 0.9 && f_late < f_early * 1.1);
+  CHECK(f_early > 0.0 && f_late > 0.0);
+  CHECK(f_early >= f_late);
+  CHECK(m_early / m_late > 2.0 * (f_early / f_late));
 }
 
 // Four renders held side by side, so the comparison is of every sample rather
@@ -4729,7 +4738,10 @@ test_plane_accent() {
   render_at(&p, frames, kSynRate);
 
   CHECK(flat_energy > 0.0);
-  CHECK(energy_between(0, frames) > flat_energy * 1.5);
+  // Four times the energy, 6 dB: a 303's accent is the loudest thing in the
+  // line, not a nudge. It measures 8 dB here, where a VCA that only scaled the
+  // level by half gave under 3.
+  CHECK(energy_between(0, frames) > flat_energy * 4.0);
   // ...and it opens the filter envelope further, which is the half of an accent
   // a level measurement cannot see. A wide margin on purpose: the claim is that
   // the top comes up, not that a particular amount of it does.
@@ -4898,9 +4910,13 @@ test_plane_slide_ties() {
   render_at(&p, 128, kSynRate);
   const float strike_after = p.channels[0].synth_venv;
 
-  // **The amplitude envelope restarts**, which is what a struck note is.
-  CHECK(strike_before > 0.f && strike_before < 0.9f);
-  CHECK(strike_after > strike_before * 2.f);
+  // **The amplitude envelope restarts**, which is what a struck note is. A
+  // row into its 1.23 s decay the VCA is still near the top, so the claim is
+  // the restart itself -- back above where it had got to, and the note's age
+  // started again -- rather than a size.
+  CHECK(strike_before > 0.f && strike_before < 1.f);
+  CHECK(strike_after > strike_before);
+  CHECK(p.channels[0].synth_age < 128u);
 
   // And now the same two rows with a slide on the second.
   g_fx_plane[1].cmd = 0x31u;
@@ -4928,6 +4944,262 @@ test_plane_slide_ties() {
   render_at(&p, 1024, kSynRate);
   CHECK(p.channels[0].period < ntrk::period_for(13, 0));
   CHECK(p.channels[0].period > ntrk::period_for(25, 0));
+}
+
+// ---------------------------------------------------------------------------
+// The 303's converter, its ladder's low end, its square, its legato and its
+// glide -- each the place it used to differ audibly from the hardware.
+// ---------------------------------------------------------------------------
+
+static void
+test_303_primitives() {
+  printf("the 303's exp2 and tanh agree with libm across the ranges they serve\n");
+
+  double worst_exp2 = 0.0, worst_tanh = 0.0;
+  for (int i = -2000; i <= 2000; ++i) {
+    const float x = (float) i * 0.006f;                // -12 .. 12 octaves
+    const double want = pow(2.0, (double) x);
+    const double e = fabs((double) ntrk::fx::ntrk303_exp2(x) - want) / want;
+    if (e > worst_exp2)
+      worst_exp2 = e;
+    const float y = (float) i * 0.01f;                 // -20 .. 20, past both seams
+    const double t = fabs((double) ntrk::fx::ntrk303_tanh(y) - tanh((double) y));
+    if (t > worst_tanh)
+      worst_tanh = t;
+  }
+  CHECK(worst_exp2 < 5e-6);
+  CHECK(worst_tanh < 5e-6);
+  // Odd, and exactly 1 out where the float has nothing left to say.
+  CHECK(ntrk::fx::ntrk303_tanh(-0.3f) == -ntrk::fx::ntrk303_tanh(0.3f));
+  CHECK(ntrk::fx::ntrk303_tanh(30.f) == 1.f);
+}
+
+static void
+test_303_converter() {
+  printf("the 303's envelope moves its cutoff in octaves, and an accent adds more\n");
+
+  const ntrk::Env303 e = ntrk::synth303_env(100u, 200u);
+  const float base = ntrk::synth303_cutoff_hz(100u);
+  const double at0 = ntrk::synth303_cutoff_at(base, e, 0.f, 0.f, 0.f);
+  const double at5 = ntrk::synth303_cutoff_at(base, e, 0.5f, 0.f, 0.f);
+  const double at1 = ntrk::synth303_cutoff_at(base, e, 1.f, 0.f, 0.f);
+
+  // **Equal steps of the envelope are equal intervals of the cutoff**: the
+  // ratio from 0 to 0.5 is the ratio from 0.5 to 1. That is what an
+  // exponential converter is, and a hertz ramp has the second interval far
+  // smaller than the first -- which is a sweep that crawls at the top.
+  CHECK(fabs((at1 / at5) / (at5 / at0) - 1.0) < 1e-4);
+  CHECK(at5 / at0 > 2.0);                 // a sweep worth the name at this env mod
+  // A decayed envelope leaves the cutoff under the knob, by the law's offset.
+  CHECK(at0 < base);
+
+  // An accent's follower at full is one octave on top of wherever the
+  // envelope has the cutoff.
+  const double acc = ntrk::synth303_cutoff_at(base, e, 0.5f, 1.f, 1.f);
+  CHECK(fabs(acc / at5 - 2.0) < 1e-4);
+
+  // Env mod 0 still sweeps, three quarters of an octave, as the hardware's
+  // does; full sweeps several.
+  CHECK(ntrk::synth303_env(100u, 0u).scaler > 0.7f);
+  CHECK(ntrk::synth303_env(100u, 0u).scaler < 0.9f);
+  CHECK(ntrk::synth303_env(100u, 255u).scaler > 4.f);
+}
+
+// |H(f)| of an impulse response: one DFT bin, wherever `hz` is.
+static double
+ir_gain(const float *ir, int n, double hz, double rate) {
+  double re = 0.0, im = 0.0;
+  for (int i = 0; i < n; ++i) {
+    const double ph = 6.283185307179586 * hz * (double) i / rate;
+    re += (double) ir[i] * cos(ph);
+    im -= (double) ir[i] * sin(ph);
+  }
+  return sqrt(re * re + im * im);
+}
+
+static float g_ir[1 << 16];
+
+static void
+test_303_ladder_low_end() {
+  printf("the 303's ladder keeps its bass: flat with no resonance, shelved under a lot\n");
+
+  // The voice's own 2x at 48 kHz, and long enough for the sharpest ring to die.
+  const float rate = 96000.f;
+  const int n = 1 << 16;
+  for (int pass = 0; pass < 2; ++pass) {
+    ntrk::fx::Ladder303 f;
+    ntrk::fx::ladder303_reset(&f);
+    ntrk::fx::ladder303_set(&f, 1000.f, ntrk::synth303_reso(pass == 0 ? 0u : 255u), rate);
+    for (int i = 0; i < n; ++i)
+      g_ir[i] = ntrk::fx::ladder303_process(&f, i == 0 ? 1.f : 0.f);
+    const double g30 = ir_gain(g_ir, n, 30.0, rate);
+    const double g100 = ir_gain(g_ir, n, 100.0, rate);
+    const double g150 = ir_gain(g_ir, n, 150.0, rate);
+    if (pass == 0) {
+      // **No resonance, no feedback, no highpass on the signal.** The zero the
+      // feedback highpass leaves sits on its pole here, so 30 Hz is where
+      // 100 Hz is; a zero at DC put 30 Hz 6 dB under it.
+      CHECK(fabs(20.0 * log10(g30 / g100)) < 1.0);
+    } else {
+      // Under a lot of resonance the passband is pulled down and the bass under
+      // the highpass's corner is not: the shelf, more than 5 dB of it.
+      CHECK(g30 > g150 * 1.8);
+    }
+  }
+}
+
+// The peak the ladder raises over its passband, in dB: the most it reaches
+// within an octave and a half either side of the cutoff, over its level two
+// octaves under.
+static double
+ladder_peak_db(float fc, uint8_t reso_byte, float rate) {
+  const int n = 1 << 14;      // the sharpest ring here is gone in a few ms
+  ntrk::fx::Ladder303 f;
+  ntrk::fx::ladder303_reset(&f);
+  ntrk::fx::ladder303_set(&f, fc, ntrk::synth303_reso(reso_byte), rate);
+  for (int i = 0; i < n; ++i)
+    g_ir[i] = ntrk::fx::ladder303_process(&f, i == 0 ? 1.f : 0.f);
+  double pk = 0.0;
+  for (double hz = fc / 3.0; hz < fc * 3.0; hz *= 1.02) {
+    const double g = ir_gain(g_ir, n, hz, rate);
+    if (g > pk)
+      pk = g;
+  }
+  return 20.0 * log10(pk / ir_gain(g_ir, n, fc / 4.0, rate));
+}
+
+static void
+test_303_resonance_knob() {
+  printf("the 303's resonance knob does most of its work in its first half\n");
+
+  // At 1 kHz, the middle of where a line sweeps. **Most of the peak by half
+  // way**, as a 303's knob has it: a quadratic law gave 1.4 dB of 24 there,
+  // so the whole first half of the knob was decoration. And the top stops
+  // short of the rows where the ladder screams: that law reached 24 dB.
+  const float rate = 96000.f;
+  const double half = ladder_peak_db(1000.f, 128u, rate);
+  const double full = ladder_peak_db(1000.f, 255u, rate);
+  CHECK(half > 0.5 * full);
+  CHECK(full > 15.0 && full < 22.0);
+
+  // And it only ever adds: every step of the knob is more resonance.
+  double last = -100.0;
+  for (int b = 0; b <= 255; b += 17) {
+    const double p = ladder_peak_db(1000.f, (uint8_t) b, rate);
+    CHECK(p >= last - 0.05);
+    last = p;
+  }
+}
+
+static void
+test_303_square() {
+  printf("the 303's square is its saw through the shaper: off-centre, and DC-free\n");
+
+  // One cycle, finely sampled, at a step too small for the BLEP to matter.
+  const int n = 32000;
+  const double step = (double) ntrk::kBuiltinWaveFrames / (double) n;
+  double sum = 0.0;
+  int high = 0;
+  for (int i = 0; i < n; ++i) {
+    const float v = ntrk::synth303_osc((double) i * step, step, true);
+    sum += (double) v;
+    if (v > 0.f)
+      ++high;
+  }
+  CHECK(fabs(sum / (double) n) < 1e-3);          // its mean is taken out
+  // The shaper's rise lands a little before the half: about 53% high, where
+  // a square is 50% exactly.
+  const double duty = (double) high / (double) n;
+  CHECK(duty > 0.52 && duty < 0.56);
+}
+
+static void
+test_303_legato() {
+  printf("a note struck into a sounding 303 runs on from it; one out of silence is cold\n");
+
+  // Row 0 strikes, row 1 strikes the same note again with nothing between:
+  // the strike is the only thing that changes.
+  const int row = 2646;
+  fx_clear();
+  g_fx_pat[0].note = 13u;
+  g_fx_pat[0].instrument = 1u;
+  g_fx_pat[1].note = 13u;
+  g_fx_pat[1].instrument = 1u;
+  ntrk::Module m;
+  fx_module(&m, true);
+  ntrk::Player p;
+  ntrk::player_start(&p, &m);
+  render_at(&p, row + 2048, kSynRate);
+
+  // **No click.** The first difference's energy in the 2 ms after the strike
+  // against the 10 ms before it. Restarting the ladder, the decimator and the
+  // oscillator's phase under a sounding note put a burst there two hundred
+  // times the note's own; what is left is the envelope opening the filter.
+  double before = 0.0, after = 0.0;
+  for (int f = row - 220; f < row; ++f) {
+    const double dx = g_buffer[(size_t) f * 2u] - g_buffer[(size_t) (f - 1) * 2u];
+    before += dx * dx;
+  }
+  for (int f = row; f < row + 44; ++f) {
+    const double dx = g_buffer[(size_t) f * 2u] - g_buffer[(size_t) (f - 1) * 2u];
+    after += dx * dx;
+  }
+  CHECK(before > 0.0);
+  CHECK(after / 44.0 < (before / 220.0) * 4.0);
+
+  // **Out of silence it is cold**: a note struck after the voice has ended
+  // renders exactly what the same note renders on a player that never played,
+  // so nothing a long-gone note left behind reaches a new one.
+  ntrk::Player q;
+  q.module = &m;
+  CHECK(ntrk::player_preview(&q, 0, 13, 1, (double) kSynRate));
+  for (int done = 0; q.channels[0].playing && done < 96 * 4096; done += 4096)   // 17.8 s
+    render_at(&q, 4096, kSynRate);
+  CHECK(!q.channels[0].playing);
+  CHECK(ntrk::player_preview(&q, 0, 13, 1, (double) kSynRate));
+  render_at(&q, 4096, kSynRate);
+  memcpy(g_first, g_buffer, sizeof(double) * 4096u * 2u);
+
+  ntrk::Player fresh;
+  fresh.module = &m;
+  CHECK(ntrk::player_preview(&fresh, 0, 13, 1, (double) kSynRate));
+  render_at(&fresh, 4096, kSynRate);
+  CHECK(memcmp(g_first, g_buffer, sizeof(double) * 4096u * 2u) == 0);
+}
+
+static void
+test_303_slide_glides_every_frame() {
+  printf("a 303 slide moves the pitch every frame, not once a tick\n");
+
+  const int row = 2646;
+  fx_clear();
+  g_fx_pat[0].note = 13u;
+  g_fx_pat[0].instrument = 1u;
+  g_fx_pat[1].note = 25u;
+  g_fx_pat[1].instrument = 1u;
+  g_fx_plane[1].cmd = 0x31u;
+  g_fx_plane[1].param = 4u;           // four ticks of glide, 441 frames each
+  ntrk::Module m;
+  fx_module(&m, true);
+  ntrk::Player p;
+  ntrk::player_start(&p, &m);
+
+  // Inside tick 0 of the slid row, where the player's glide has not moved the
+  // period at all -- ProTracker does not slide on tick 0 -- the oscillator's
+  // own glide already has, and it moves between any two frames.
+  render_at(&p, row + 100, kSynRate);
+  const double s1 = p.channels[0].synth_step;
+  render_at(&p, 100, kSynRate);
+  const double s2 = p.channels[0].synth_step;
+  CHECK(p.channels[0].period == ntrk::period_for(13, 0));
+  CHECK(s2 > s1);
+  CHECK(s1 > 0.0);
+
+  // And when the player's last tick lands on the note, the oscillator's step
+  // is the player's again, exactly.
+  render_at(&p, 6 * 441, kSynRate);
+  CHECK(p.channels[0].period == ntrk::period_for(25, 0));
+  CHECK(p.channels[0].synth_step == p.channels[0].step);
 }
 
 // The gate a 303 line needs, and it is the ordinary instrument ADSR: a synth
@@ -7735,6 +8007,13 @@ main(void) {
   test_plane_slide();
   test_plane_slide_is_exponential();
   test_plane_slide_ties();
+  test_303_primitives();
+  test_303_converter();
+  test_303_ladder_low_end();
+  test_303_resonance_knob();
+  test_303_square();
+  test_303_legato();
+  test_303_slide_glides_every_frame();
   test_synth_note_off();
   test_plane_slide_crosses_a_row();
   test_tone_porta_stays_linear();

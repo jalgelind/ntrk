@@ -2747,6 +2747,14 @@ channel_trigger(const Module *m, Channel *ch, int note, double start_frame,
   if ((ch->trem_wave & 4u) == 0u)
     ch->trem_pos = 0;
 
+  // Whether the 303 was sounding right up to this note, asked before `playing`
+  // is overwritten below: a note struck into a sounding 303 runs on from its
+  // filters, and one out of silence -- or out of another voice, which left the
+  // 303's state wherever it stopped -- starts them cold. The 303 sets the flag
+  // again on its first frame.
+  const bool legato = ch->playing && ch->synth303_live;
+  ch->synth303_live = false;
+
   ch->playing = ch->instrument > 0;
 
   if (ch->instrument > 0) {
@@ -2755,7 +2763,7 @@ channel_trigger(const Module *m, Channel *ch, int note, double start_frame,
       // **A synth walks no sample, so the length test below does not apply to
       // it** — and a SYNTH instrument's length is legitimately zero, which
       // would silence every drum in the file if it did.
-      synth_trigger(ch, ins, sample_rate);
+      synth_trigger(ch, ins, sample_rate, legato);
     } else if (ch->pos >= (double) ins.length) {
       // An offset past the end is a note that does not sound, not a read off
       // the end of the buffer.
@@ -3227,6 +3235,13 @@ player_row(Player *player, double sample_rate) {
       const float ticks = (float) fx_slide;
       ch->slide_k = (double) -fx::ntrk303_expm1(-6.9f / ticks);
       ch->slide_ticks = (int) fx_slide;
+      // The same glide per output frame, for a voice that moves its pitch every
+      // frame rather than every tick -- the 303's, whose slide is an RC. Same
+      // time, same thousandth left at the end, so the two arrive together.
+      const float frames =
+          ticks * (float) frames_per_tick(player, sample_rate);
+      ch->synth_glide =
+          frames > 1.f ? (double) -fx::ntrk303_expm1(-6.9f / frames) : 1.0;
     }
 
     channel_set_step(ch, sample_rate);

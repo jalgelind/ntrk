@@ -44,7 +44,7 @@ Three rules a caller has to keep:
 | `ntrk.h` | header | the replayer: loading, the player, `render_add` |
 | `ntrk_types.h` | header | `Note`, `Instrument`, `Module`, `Channel`, `Player` |
 | `ntrk_synth.h` | header | the SYNTH instrument: the drum kit and the 303 |
-| `ntrk_303.h` | header | the 303's ladder: measured poles, realised as ZDF |
+| `ntrk_303.h` | header | the 303's ladder: measured poles, realised as ZDF, and the fixed filters around it |
 | `ntrk_dsp.h` | header | `flush_denorm` and `soft_clip`, defined once |
 | `ntrk_fx_shape.h` | header | the waveshapers and the state-variable filter |
 | `ntrk_fx_delay.h` / `.cc` | split | stereo delay |

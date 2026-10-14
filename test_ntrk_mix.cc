@@ -1584,8 +1584,18 @@ test_everything_at_once() {
   // behind a halfband decimator, with the pole table's constants rescaled from
   // its 44.1 kHz fit to the rate it runs at. The tune has a bass line, so it *must* move;
   // test_ntrk.cc's fingerprints play no bass and did not.
+  //
+  // And when the bass took Open303's envelope, VCA, accent, square and fixed filters:
+  // the cutoff driven in octaves through its RCs, the feedback highpass's zero moved from
+  // DC to its open-loop corner, the knob laws exponential, a legato note running on from
+  // the one before it and a slide gliding every frame. The tune has a bass line, so it
+  // *must* move; test_ntrk.cc's fingerprints play no bass and did not.
+  //
+  // And when its resonance knob was refitted to put most of the peak in the first half of
+  // its travel, stopping short of the self-oscillating rows, and its output clip moved in
+  // front of the VCA so an accent is no longer compressed. Bass again, so it *must* move.
   check_hash("everything at once", hash_stream(g_ref, kBigFrames * 2),
-             0x8d6fc28045a65ba8ULL);
+             0xf308a86822397524ULL);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
-// ntrk_303 -- the TB-303 ladder: a1k0n's measured poles, realised as ZDF.
+// ntrk_303 -- the TB-303 ladder: a1k0n's measured poles, realised as ZDF, and
+// the fixed filters Open303 puts around it.
 //
 // This is the filter, not *a* filter. A 303's voice is a saw through a diode
 // ladder and the ladder is most of what the machine sounds like, so the two-pole
@@ -15,6 +16,12 @@
 // two conjugate pairs for the ladder -- five poles, and the pair-of-pairs is
 // where the 18 dB comes from. Nothing here derives a cutoff from a circuit; the
 // table already did.
+//
+// **The feedback highpass is a pole and a zero, not a highpass.** In the loop
+// it leaves the closed-loop response a zero at its own open-loop corner, which
+// the table records in its reso-0 row: so at no resonance the stage is flat,
+// and under a lot the bass below 100 Hz stays while the passband is pulled
+// down -- the low shelf a squelching 303 keeps under it. See `ladder303_set`.
 //
 // **ZDF/TPT realisation, and the reason is modulation.** The poles could be run
 // as two direct-form biquads, which is what the measurement is naturally
@@ -49,15 +56,17 @@
 // project pins hashes over rendered audio and requires ARM64 and wasm to
 // produce identical floats; `std::exp` and `std::cos` are not correctly rounded
 // and Apple's libm and emscripten's musl are free to disagree in the last bits.
-// The three primitives below are arithmetic -- range reduction and a Taylor
-// series, Newton's method from a bit-twiddled guess -- so they cannot disagree.
-// Measured against `<cmath>` over the whole operating range the filter can
-// reach: exp 2.6e-6 relative, cos 6.2e-7 absolute, sqrt 1.2e-7 relative (about
-// one ulp). That is four orders better than the 2.8% error that ruins a
-// high-Q pole radius, which is the accuracy bar this path actually has.
+// The primitives below are arithmetic -- range reduction and a Taylor series,
+// Newton's method from a bit-twiddled guess, and exp2 and tanh built on the
+// first -- so they cannot disagree. Measured against `<cmath>` over the whole
+// operating range the voice can reach: exp 2.6e-6 relative, cos 6.2e-7
+// absolute, sqrt 1.2e-7 relative (about one ulp), exp2 and tanh under 5e-6.
+// That is four orders better than the 2.8% error that ruins a high-Q pole
+// radius, which is the accuracy bar this path actually has.
 //
 // Public domain / CC0. Written for the no2 project. The pole table is from
-// a1k0n's 303.js, which is MIT.
+// a1k0n's 303.js, and the fixed filters' corners from Open303 (Robin Schmidt);
+// both are MIT.
 
 #ifndef NTRK_303_H_
 #define NTRK_303_H_
@@ -147,6 +156,56 @@ ntrk303_sqrt(float x) {
   y = 0.5f * (y + x / y);
   y = 0.5f * (y + x / y);
   return y;
+}
+
+// 2^x: the cutoff's exponential converter and the knob laws. Split at the
+// integer above x, so the fraction lands in (-1, 0] -- the side `ntrk303_expm1`
+// is defined on -- and the integer power is built from the float's own
+// exponent bits, which is exact. Relative error is expm1's, 2.6e-6 at worst.
+// Clamped to +-24, which no law here comes near.
+inline float
+ntrk303_exp2(float x) {
+  if (!(x > -24.f))            // false for NaN as well
+    x = -24.f;
+  if (x > 24.f)
+    x = 24.f;
+  int n = (int) x;             // toward zero, so one up for a positive fraction
+  if ((float) n < x)
+    ++n;
+  union { float f; uint32_t u; } p;
+  p.u = (uint32_t) (n + 127) << 23;
+  return p.f * (1.f + ntrk303_expm1((x - (float) n) * 0.693147181f));
+}
+
+// tanh(x), for the 303's square, which is its saw through a transistor shaper.
+// Up to |x| = 4 it is `-t / (2 + t)` with `t = expm1(-2|x|)`, which keeps the
+// small end from cancelling; beyond that the argument would leave expm1's
+// range, so the tail is `1 - 2e / (1 + e)` with `e = exp(-2|x|)` squared up
+// from `exp(-|x|)`. Past 8 it is 1 to within the float's last bit.
+inline float
+ntrk303_tanh(float x) {
+  const float a = x < 0.f ? -x : x;
+  float y = 1.f;               // and NaN lands here, finite rather than NaN
+  if (a <= 4.f) {
+    const float t = ntrk303_expm1(-2.f * a);
+    y = -t / (2.f + t);
+  } else if (a < 8.f) {
+    const float e1 = 1.f + ntrk303_expm1(-a);
+    const float e = e1 * e1;
+    y = 1.f - 2.f * e / (1.f + e);
+  }
+  return x < 0.f ? -y : y;
+}
+
+// The integrator gain of a TPT one-pole whose pole sits exactly where the
+// analog corner's does under the matched z-transform, `tanh(pi f / fs)` --
+// the same reading of a pole the feedback highpass below takes, through the
+// same `-t / (2 + t)`. For the fixed corners around the ladder, all far below
+// any rate this runs at.
+inline float
+ntrk303_corner_g(float hz, float rate) {
+  const float t = ntrk303_expm1(-6.28318531f * hz / (rate > 1.f ? rate : 1.f));
+  return -t / (2.f + t);
 }
 
 // ----------------------------------------------------------------------------
@@ -313,6 +372,8 @@ struct Ladder303 {
   float hp_s = 0.f;  // feedback highpass state
   float hp_g = 0.f;  // its resolved integrator gain, g/(1+g)
   float hp_g_i = 0.f;
+  float hp_c = 1.f;  // its lowpass tap's weight: where the zero sits (see below)
+  float hp_c_i = 0.f;
   float gain = 1.f;  // the resonance gain compensation
   float gain_i = 0.f;
   bool primed = false;  // false until the first `ladder303_set`, which snaps
@@ -501,6 +562,28 @@ ladder303_set(Ladder303 *f, float cutoff_hz, float reso, float sample_rate) {
   const float hg = -t0 / (2.f + t0);
   const float hp_g = hg / (1.f + hg);
 
+  // **The zero sits at the highpass's open-loop corner, not at DC.** A
+  // highpass in a feedback path is not a highpass on the signal: the loop is
+  // `G / (1 + k HP G)`, and with `HP = s / (s + a)` that is
+  // `G (s + a) / ((s + a) + k s G)` -- the table's five poles over a zero at
+  // `-a`, the corner the highpass has with the loop open. The table records
+  // that corner in its reso-0 row, where the loop *is* open and the pole
+  // cancels the zero: 100 Hz exactly, with no slope in `w`. So at resonance 0
+  // this stage is flat, and as the resonance rises its pole walks down past
+  // the zero and the bass stays where the mids are pulled from -- the low
+  // shelf that keeps a squelching 303 full underneath. A zero at DC instead
+  // took 9 dB off 30 Hz with the resonance at nothing.
+  //
+  // As a TPT one-pole that is `hp + c * lp`, whose zero lands at the matched
+  // position of the corner whose gain is `c * g` -- so `c` is the ratio of the
+  // corner's gain to the pole's. The cap is unreachable from the table, whose
+  // highpass pole never comes within a sixth of the corner; it is there for a
+  // pole the guard above has clamped.
+  const float ta = ntrk303_expm1(k * kNtrk303Poles[0][0]);
+  float hp_c = (-ta / (2.f + ta)) / hg;
+  if (hp_c > 16.f)
+    hp_c = 16.f;
+
   // Resonance gain compensation, the same law the measurement was taken with:
   // the ladder's passband loses level as the feedback rises, and this is what
   // puts it back without letting a resonant peak run away.
@@ -508,28 +591,141 @@ ladder303_set(Ladder303 *f, float cutoff_hz, float reso, float sample_rate) {
 
   if (snap) {
     f->hp_g = hp_g; f->hp_g_i = 0.f;
+    f->hp_c = hp_c; f->hp_c_i = 0.f;
     f->gain = gain; f->gain_i = 0.f;
     f->primed = true;
   } else {
     const float k = 1.f / (float) kLadder303Stride;
     f->hp_g_i = (hp_g - f->hp_g) * k;
+    f->hp_c_i = (hp_c - f->hp_c) * k;
     f->gain_i = (gain - f->gain) * k;
   }
 }
 
-// Input -> feedback highpass -> gain -> the two ladder pairs. Eighteen dB an
-// octave and a highpass in the loop, which between them are the sound.
+// Input -> the feedback highpass's pole and zero -> gain -> the two ladder
+// pairs. Eighteen dB an octave and a highpass in the loop, which between them
+// are the sound.
 inline float
 ladder303_process(Ladder303 *f, float x) {
   f->hp_g += f->hp_g_i;
+  f->hp_c += f->hp_c_i;
   f->gain += f->gain_i;
 
   const float v = (x - f->hp_s) * f->hp_g;
   const float lp = v + f->hp_s;
   f->hp_s = flush_denorm(lp + v);
-  const float y = f->gain * (x - lp);
+  const float y = f->gain * (x - lp + f->hp_c * lp);
 
   return section303_process(&f->b, section303_process(&f->a, y));
+}
+
+// ----------------------------------------------------------------------------
+// -- The fixed filters around the ladder
+// ----------------------------------------------------------------------------
+
+// Open303's (Robin Schmidt, MIT), corner for corner: a one-pole highpass at
+// 44.5 Hz on the oscillator before the ladder, at the voice's 2x; and after
+// the decimator a 14 Hz allpass, a 24 Hz highpass and a notch at 7.5 Hz 4.7
+// octaves wide -- the hardware's coupling, which is what bends a 303's saw
+// into the shape it has on a scope and holds its sub-bass where the
+// hardware's is. With the shelf the feedback zero leaves under a resonant
+// note, these are what decide how much of it reaches the output.
+//
+// Beside them, the VCA's de-clicker: a 200 Hz two-pole Butterworth on the
+// amplitude, not the audio. A note strikes its VCA from wherever it was to
+// full in one sample, and this is what turns that step into a millisecond's
+// rise rather than a click.
+struct OnePole303 {
+  float s = 0.f;
+  float g = 0.f;     // resolved, g/(1+g)
+};
+
+struct Svf303 {
+  float s1 = 0.f, s2 = 0.f;
+  float g = 0.f, r = 0.f, dr = 1.f;   // prewarp, damping (1/Q), 1/denominator
+};
+
+struct Fixed303 {
+  OnePole303 pre_hp;    // 2x, into the ladder
+  OnePole303 ap, hp;    // 1x, after the decimator
+  Svf303 notch;         // 1x, after those
+  Svf303 declick;       // 1x, on the VCA
+};
+
+inline float
+onepole303_lp(OnePole303 *p, float x) {
+  const float v = (x - p->s) * p->g;
+  const float lp = v + p->s;
+  p->s = flush_denorm(lp + v);
+  return lp;
+}
+
+// The same tick as `section303_process`, with the three taps handed back.
+inline void
+svf303_tick(Svf303 *s, float x, float *hp, float *bp, float *lp) {
+  const float h = (x - (s->r + s->g) * s->s1 - s->s2) * s->dr;
+  const float v1 = s->g * h;
+  const float b = v1 + s->s1;
+  const float v2 = s->g * b;
+  const float l = v2 + s->s2;
+  s->s1 = flush_denorm(b + v1);
+  s->s2 = flush_denorm(l + v2);
+  *hp = h;
+  *bp = b;
+  *lp = l;
+}
+
+inline void
+svf303_set(Svf303 *s, float g, float r) {
+  s->g = g;
+  s->r = r;
+  s->dr = 1.f / (1.f + r * g + g * g);
+}
+
+// Every coefficient here is a function of the rate alone, so this is the one
+// thing a cold note and a legato one both redo -- cheaply, a few expm1s.
+inline void
+fixed303_set(Fixed303 *f, float rate) {
+  const float g_pre = ntrk303_corner_g(44.486f, 2.f * rate);
+  const float g_ap = ntrk303_corner_g(14.008f, rate);
+  const float g_hp = ntrk303_corner_g(24.167f, rate);
+  f->pre_hp.g = g_pre / (1.f + g_pre);
+  f->ap.g = g_ap / (1.f + g_ap);
+  f->hp.g = g_hp / (1.f + g_hp);
+  // A bandwidth of 4.7 octaves is a Q of sqrt(2^4.7) / (2^4.7 - 1) = 0.204.
+  svf303_set(&f->notch, ntrk303_corner_g(7.5164f, rate), 4.90220f);
+  svf303_set(&f->declick, ntrk303_corner_g(200.f, rate), 1.41421356f);
+}
+
+inline void
+fixed303_reset(Fixed303 *f) {
+  f->pre_hp.s = 0.f;
+  f->ap.s = 0.f;
+  f->hp.s = 0.f;
+  f->notch.s1 = 0.f; f->notch.s2 = 0.f;
+  f->declick.s1 = 0.f; f->declick.s2 = 0.f;
+}
+
+inline float
+fixed303_pre(Fixed303 *f, float x) {
+  return x - onepole303_lp(&f->pre_hp, x);
+}
+
+// Allpass (lowpass minus highpass), highpass, notch, in Open303's order.
+inline float
+fixed303_post(Fixed303 *f, float x) {
+  const float a = 2.f * onepole303_lp(&f->ap, x) - x;
+  const float h = a - onepole303_lp(&f->hp, a);
+  float hp, bp, lp;
+  svf303_tick(&f->notch, h, &hp, &bp, &lp);
+  return h - f->notch.r * bp;
+}
+
+inline float
+fixed303_declick(Fixed303 *f, float amp) {
+  float hp, bp, lp;
+  svf303_tick(&f->declick, amp, &hp, &bp, &lp);
+  return lp;
 }
 
 // ----------------------------------------------------------------------------

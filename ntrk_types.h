@@ -905,11 +905,24 @@ struct Channel {
   // sweeping under a note that has already got quiet.
   fx::Ladder303 synth_ladder;
   fx::Decim303 synth_decim;    // the voice runs at 2x; this brings it back
-  float synth_venv = 0.f;     // VCA, exactly 0 once the voice is done
-  float synth_venv_fast = 0.f; // its coefficient above the knee
-  float synth_venv_slow = 0.f; // and below it
-  float synth_acc_vca = 0.f;   // accent's filter envelope, on its way to the VCA
-  float synth_acc_rc = 0.f;
+  fx::Fixed303 synth_fixed;    // the filters around the ladder, and the VCA's de-clicker
+  float synth_venv = 0.f;      // VCA, exactly 0 once the voice is done
+  float synth_venv_coef = 0.f;
+  float synth_rc1 = 0.f;       // the filter envelope through 3 ms: what opens the cutoff
+  float synth_rc2 = 0.f;       // and through 15 ms, while accented: what an accent adds
+  float synth_rc1_a = 0.f;     // their per-frame coefficients
+  float synth_rc2_a = 0.f;
+  // The oscillator's own step. The player's `step` moves once a tick, which is
+  // right for a vibrato and wrong for a slide: a 303 glides on an RC, and a
+  // glide sampled at the tick rate arrives as a jump. So while a slide runs
+  // this walks to the slide's destination every frame, at `synth_glide`, and
+  // otherwise it is `step`.
+  double synth_step = 0.0;
+  double synth_glide = 0.0;    // per frame, 0 when no slide is running
+  // Where the oscillator's phase had got to, which a legato note runs on from:
+  // `channel_trigger` has already put the note's start into `pos` by then.
+  double synth_pos = 0.0;
+  bool synth303_live = false;  // the 303 rendered this channel's last frame
 };
 
 struct Player {

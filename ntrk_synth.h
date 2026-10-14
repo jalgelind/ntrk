@@ -237,8 +237,9 @@ synth_voice_defaults(Instrument *ins, SynthVoice voice) {
       break;
     case SynthVoice::kBass:
       // Enough resonance and env mod that the ladder is doing the work, and tape on the end.
+      // Cutoff 60 is 507 Hz and decay 150 a 0.35 s sweep: a line that squelches as it plays.
       ins->synth_cutoff = 60; ins->synth_reso = 205; ins->synth_env_mod = 160;
-      ins->synth_decay = 90; ins->synth_accent = 200; ins->synth_drive = 70;
+      ins->synth_decay = 150; ins->synth_accent = 200; ins->synth_drive = 70;
       ins->synth_dist = 2; ins->synth_dist_mix = 110; ins->synth_wave = 0;
       break;
   }
@@ -308,30 +309,55 @@ synth_noise_sample(Channel *ch) {
 //
 // - **The oscillator walks the wavetable path's phase**, the same 32-frame
 //   cycle and the same `pos`/`step` a WAVE_BUILTIN instrument takes, but
-//   computes a PolyBLEP saw or square from it rather than reading the 8-bit
-//   table -- so vibrato, tone
-//   portamento and arpeggio reach the bass line for nothing, which for a 303 is
-//   most of what playing one *is*. Saw and square only: that is what the
-//   instrument has, and a triangle option would be a different synth wearing
-//   its name.
+//   computes a PolyBLEP saw or the 303's shaped square from it rather than
+//   reading the 8-bit table -- so vibrato, tone portamento and arpeggio reach
+//   the bass line for nothing, which for a 303 is most of what playing one
+//   *is*. Saw and square only: that is what the instrument has, and a
+//   triangle option would be a different synth wearing its name.
 // - **The filter is `fx::Ladder303`**, which is a1k0n's measured x0xb0x poles
-//   realised as two ZDF sections with a one-pole highpass in front. It is not
-//   the SVF the drums use, and swapping the SVF for it is the single largest
-//   thing that makes this voice sound like the instrument: a 303 is four
-//   ladder poles and a highpass in the feedback path, and a two-pole
-//   state-variable filter is not a near miss for that, it is a different
-//   filter. See `ntrk_303.h`.
+//   realised as two ZDF sections behind the feedback highpass's pole and zero,
+//   inside Open303's fixed filters (`fx::Fixed303`). See `ntrk_303.h`.
 // - **The distortion is `fx::shape_sample`**, the four shapers, with `drive` 0
 //   an exact bypass and a dry/wet after it.
 //
 // **Two envelopes, because a 303 has two.** The VCF envelope is what `decay`
-// sets and what `env_mod` scales; the VCA envelope is fixed hardware, a fast
-// transient into a slower body. Driving both from one envelope locks the
-// filter movement to the amplitude, and the whole character of an acid line is
-// that they are *not* locked -- a long filter sweep under a note that has
-// already dropped to a third of its peak is the sound. `decay` therefore no
-// longer decides how long a note lasts; the VCA does, and the sequencer's next
-// note does.
+// sets and what `env_mod` scales; the VCA is fixed hardware, one long decay
+// that a struck note restarts. Driving both from one envelope locks the filter
+// movement to the amplitude, and the whole character of an acid line is that
+// they are *not* locked. The VCF envelope does reach the level too -- 0.45 of
+// it rides on the VCA, and an accent adds four more -- which is where a
+// plucked note gets its pluck and an accented one its punch. How long a note
+// lasts is the gate's: the instrument's own envelope and the next note.
+//
+// **The envelope opens the cutoff in octaves.** The 303's filter takes its
+// cutoff through an exponential converter, so an exponentially decaying
+// envelope is a sweep that falls fastest at its top -- the "pew" of every
+// acid line. Driving the cutoff in hertz instead, `cutoff * (1 + mod * env)`,
+// falls in octaves *slowest* at the top: measured on the same decay, that
+// left a note 2.7 octaves up after 400 ms, where the converter has it
+// 0.6 above the knob. The envelope reaches the converter through a
+// 3 ms RC, which is the attack the hardware's sweep has rather than a step,
+// and how far it swings and where the knob sits in that swing is Open303's
+// measured law, `synth303_env` -- under which even env mod 0 sweeps three
+// quarters of an octave, because the hardware does.
+//
+// **Accent** is a 303's one dynamic: it shortens the filter envelope to
+// 200 ms, adds the envelope through a 15 ms RC on top of the cutoff, and adds
+// it four times over to the level. The RC is not cleared between notes, so a
+// run of accents opens the filter further each time -- the accent sweep.
+//
+// **A note struck while one is sounding keeps the filter warm.** The ladder,
+// the decimator, the fixed filters, the two RCs and the oscillator's phase all
+// run on into it, as they do on the hardware, and only a note out of silence
+// starts them cold. Resetting them under a sounding note cut its resonance and
+// its waveform mid-cycle, which is a click on every legato note.
+//
+// **A slide glides every frame.** The player moves the pitch once a tick, and
+// a 303's slide is an RC on the pitch voltage: at three ticks a slide closed
+// 90% of its interval on the first one, which is a jump. So while one runs the
+// oscillator walks its own step to the destination at the slide's rate,
+// `synth_glide`, which the player sets from the same time the tick-rate glide
+// is set from. See `ntrk_types.h`.
 //
 // **The coefficients are recomputed once every sixteen samples and glided in
 // between.** The pole maths costs three exponentials, two cosines and two
@@ -350,64 +376,131 @@ synth_noise_sample(Channel *ch) {
 // nonlinearities from folding back as grit. This voice is the exception to the
 // no-oversampling policy; nothing else in the player is oversampled.
 //
-// ponytail: three things from the reference are deliberately not here. The
-// in-loop saturator (drive into the resonant state, so overdrive interacts
-// with resonance) would need a byte of its own, since `drive` already names
-// the post-filter shaper. The onset Q-dip is anti-ring for a retrigger, and a
-// struck note resets the ladder outright instead. The accent capacitor that
-// makes consecutive accents pump is per-note history; accent here is what the
-// row wrote and nothing else. Each is additive if the voice wants it.
+// The envelope law, the VCA, the accent's shape, the square and the fixed
+// filters are Open303's (Robin Schmidt, https://sourceforge.net/projects/open303,
+// MIT), whose numbers this takes and whose code it does not.
+//
+// ponytail: the in-loop saturator is not here. The ladder is placed from
+// measured poles rather than built from stages, so there is no loop to put
+// one in; drive into resonance would need a ladder built from its circuit.
 
-// The VCF envelope's range of time constants -- what `decay` picks from. This
-// is the filter's decay, not the note's length.
-const float kSynth303TauMin = 0.040f;
-const float kSynth303TauMax = 1.200f;
+// The cutoff knob's range, the stock 303's: 314 Hz to 2394 Hz, exponentially,
+// which is the range the envelope law below was measured over.
+const float kSynth303CutoffHz = 314.f;
+const float kSynth303CutoffOctaves = 2.930586688f;   // log2(2394 / 314)
+// Where the converter may take it: Open303's bounds.
+const float kSynth303CutoffFloor = 200.f;
+const float kSynth303CutoffCeiling = 20000.f;
 
-// The VCA, which is not a knob on the instrument and is not one here. Two
-// stages: a fast drop to the knee, which is the pluck, then a much slower body
-// under it. One coefficient would give either a note that stops dead or one
-// with no attack; the knee is what makes it a bass line.
-const float kSynth303VcaTauFast = 0.02211f;
-const float kSynth303VcaTauSlow = 0.2171f;
-const float kSynth303VcaKnee = 0.65f;
+// The VCF envelope's time constant, `decay`'s: 30 ms (the Devilfish's floor)
+// to 2 s (the stock top), exponentially. This is the filter's decay, not the
+// note's length.
+const float kSynth303DecayMin = 0.030f;
+const float kSynth303DecayOctaves = 6.058894f;       // log2(2 / 0.03)
 
-// An accented note's filter envelope is forced toward a fixed, short decay --
+// The VCA: one decay, restarted by a struck note, and the VCF envelope riding
+// on it -- 0.45 of it always, and four more at full accent.
+const float kSynth303VcaTau = 1.230f;
+const float kSynth303AmpEnv = 0.45f;
+const float kSynth303AmpAccent = 4.f;
+// The VCA's full swing, a full accent's strike: 1 + 0.45 + 4. The level is
+// divided by it, so the VCA runs 0..1 and can sit *after* the output's clip.
+const float kSynth303AmpFull = 5.45f;
+
+// How hard the ladder drives the output's soft clip. **The clip sits before
+// the VCA**: its job is to bound the ladder's resonant peaks, which is a
+// property of the filter rather than of the note, so every note meets it at
+// the same drive and an accent is then exactly as much louder as the VCA
+// makes it. Behind the VCA it ate the accent instead -- the harder the note,
+// the more it compressed -- and took 2.6 dB of it. In the clip's linear range
+// a plain note is as loud at this drive as it was there; its resonant peaks,
+// clipped now as an accent's are, come out a little lower. More drive is more
+// level for every note and more saturation, and costs the accents nothing.
+const float kSynth303Drive = 0.763f;
+
+// An accented note's filter envelope is moved toward a fixed, short decay --
 // the accent circuit does not scale the decay, it replaces it. `accent` at
-// full moves the VCF decay all the way here whatever `decay` says.
+// full moves it all the way here whatever `decay` says.
 const float kSynth303AccentTau = 0.200f;
 
-// The accent circuit's other half: the filter envelope, lowpassed by an RC and
-// added to the VCA. This is what gives an accent a shape of its own rather
-// than making it simply louder -- the level follows the filter for a moment,
-// so an accented note punches where its filter is opening.
-const float kSynth303AccentRcTau = 0.00155f;
-const float kSynth303AccentVca = 0.3f;    // how much of it reaches the VCA
-const float kSynth303AccentLevel = 0.5f;  // and the flat level boost beside it
-const float kSynth303AccentMod = 1.5f;    // accent's lift on the env-mod depth
+// The two RCs the envelope reaches the converter through.
+const float kSynth303EnvRcTau = 0.003f;
+const float kSynth303AccentRcTau = 0.015f;
 
-// Cutoff in Hz for a 0..255 byte, cubic so the knob spends most of its travel
-// where a 303's does -- under a kilohertz, where the resonance is the sound.
-// A linear map would put nine tenths of the range above the point the filter
-// stops being interesting.
+// Cutoff in Hz for a 0..255 byte, exponential across the stock knob's range.
 inline float
 synth303_cutoff_hz(uint8_t v) {
-  const float t = (float) v * (1.f / 255.f);
-  return 30.f + 7970.f * t * t * t;
+  return kSynth303CutoffHz *
+         fx::ntrk303_exp2((float) v * (kSynth303CutoffOctaves / 255.f));
 }
 
-// How far the envelope may open the cutoff, at env mod 255 before accent.
-// Sixteen octaves is not the claim -- `ladder303_set` caps at 0.45 of the rate
-// long before this does, and that cap is what a fully open filter means.
-const float kSynth303EnvModMax = 15.f;
+// The VCF envelope's time constant for a `decay` byte, in seconds.
+inline float
+synth303_decay_tau(uint8_t v) {
+  return kSynth303DecayMin *
+         fx::ntrk303_exp2((float) v * (kSynth303DecayOctaves / 255.f));
+}
 
-// The `reso` byte, mapped onto the 64 rows of the pole table. Quadratic, the
-// same law the measurement was taken with, so the knob spends its travel where
-// the resonance is doing something; 255 lands on the last row, which is where
-// the real ladder stops moving and starts self-oscillating.
+// Open303's measured env-mod law (`calculateEnvModScalerAndOffset`): how many
+// octaves the envelope's full swing spans, and how far below the knob a
+// decayed envelope leaves the cutoff -- both straight lines in the env mod
+// knob and in where the cutoff knob sits across its range, `c`, 0 to 1.
+struct Env303 {
+  float scaler;   // octaves per unit of envelope
+  float offset;   // the envelope value the knob's cutoff corresponds to
+};
+
+inline Env303
+synth303_env(uint8_t cutoff, uint8_t env_mod) {
+  // log2(cutoff / 313.815) / log2(2394 / 313.815), the law's own axis; 314 is
+  // not quite its corner, which is the 0.00085.
+  const float c = ((float) cutoff * (kSynth303CutoffOctaves / 255.f) + 0.00084896f) *
+                  (1.f / 2.931683907f);
+  const float e = (float) env_mod * (1.f / 255.f);
+  const float lo = 3.773996325f * e + 0.736965594f;
+  const float hi = 4.194548788f * e + 0.864344901f;
+  Env303 out;
+  out.scaler = (1.f - c) * lo + c * hi;
+  out.offset = 0.048292931f * c + 0.294391201f;
+  return out;
+}
+
+// The converter: the knob's cutoff moved by the envelope's RC in octaves, and
+// by an accent's on top. Equal steps of the envelope are equal intervals here,
+// which is the whole difference between a 303's sweep and a hertz ramp.
+inline float
+synth303_cutoff_at(float base_hz, const Env303 &e, float rc1, float accent,
+                   float rc2) {
+  float fc = base_hz * fx::ntrk303_exp2(e.scaler * (rc1 - e.offset) + accent * rc2);
+  if (!(fc > kSynth303CutoffFloor))      // false for NaN too
+    fc = kSynth303CutoffFloor;
+  if (fc > kSynth303CutoffCeiling)
+    fc = kSynth303CutoffCeiling;
+  return fc;
+}
+
+// The `reso` byte, mapped onto the pole table's rows -- at the knob's eighths,
+// linearly between. **Fitted, not a formula.** Each row is placed so the peak
+// the ladder raises over its passband follows a 303's knob: most of the
+// resonance in the first half of the travel and a slower climb after, least
+// squares at 300 Hz, 1 kHz and 3 kHz against Open303's measured law. A
+// quadratic law put under 2 dB of peak in the first half of the knob and then
+// overshot the top by 7, because it ran to row 63, where the ladder
+// self-oscillates; the knob stops short of that now.
+const float kSynth303ResoRows[9] = {
+    0.f, 17.85f, 30.15f, 39.45f, 46.25f, 51.05f, 54.60f, 57.10f, 58.85f,
+};
+
+// The table's mapped resonance, `row / 25`, which is what `ladder303_set` reads.
 inline float
 synth303_reso(uint8_t v) {
-  const float t = (float) v * (1.f / 255.f);
-  return 2.52f * t * t;
+  const float x = (float) v * (8.f / 255.f);
+  int i = (int) x;
+  if (i > 7)
+    i = 7;
+  const float t = x - (float) i;
+  return (kSynth303ResoRows[i] +
+          t * (kSynth303ResoRows[i + 1] - kSynth303ResoRows[i])) * (1.f / 25.f);
 }
 
 // PolyBLEP's correction for a downward step of 2 at phase 0, `dt` the phase
@@ -426,9 +519,20 @@ synth303_blep(float t, float dt) {
   return 0.f;
 }
 
+// The 303's square, which is not a square. The hardware makes it from the saw
+// with a one-transistor shaper, `tanh(F (2t - 1) + O)` with F = 36.9 dB and
+// O = 4.37 (Open303's fillWithSquare303): one edge is the saw's own hard drop
+// at the wrap, which gets the PolyBLEP, and the other is the shaper's steep
+// but continuous rise a little before the half -- a duty of about 53% and one
+// rounded corner, which is the hollow, nasal thing a 303's square sounds like
+// and a 50% square does not. Its mean, O / F, is taken out, and it runs at
+// half the saw's level, both as Open303 does.
+const float kSquare303F = 69.9841996f;
+const float kSquare303O = 4.37f;
+const float kSquare303Mean = 0.0624427f;
+
 // The oscillator at phase `pos` of a `kBuiltinWaveFrames` cycle: a rising saw,
-// or a square high for the first half -- the shapes the builtin table held,
-// band-limited.
+// or the shaped square.
 inline float
 synth303_osc(double pos, double step, bool square) {
   const float t = (float) (pos * (1.0 / (double) kBuiltinWaveFrames));
@@ -437,17 +541,23 @@ synth303_osc(double pos, double step, bool square) {
     dt = 0.5f;
   if (!square)
     return 2.f * t - 1.f - synth303_blep(t, dt);
-  float t2 = t + 0.5f;
-  if (t2 >= 1.f)
-    t2 -= 1.f;
-  return (t < 0.5f ? 1.f : -1.f) + synth303_blep(t, dt) -
-         synth303_blep(t2, dt);
+  return 0.5f * (fx::ntrk303_tanh(kSquare303F * (2.f * t - 1.f) + kSquare303O) -
+                 kSquare303Mean - synth303_blep(t, dt));
 }
 
+// `legato`: the channel was sounding this voice right up to the note, so the
+// note runs on from its state rather than starting it cold. See above.
 inline void
-synth303_trigger(Channel *ch, const Instrument &ins, float rate) {
-  fx::ladder303_reset(&ch->synth_ladder);
-  fx::decim303_reset(&ch->synth_decim);
+synth303_trigger(Channel *ch, const Instrument &ins, float rate, bool legato) {
+  (void) ins;
+  if (!legato) {
+    fx::ladder303_reset(&ch->synth_ladder);
+    fx::decim303_reset(&ch->synth_decim);
+    fx::fixed303_reset(&ch->synth_fixed);
+    ch->synth_rc1 = 0.f;
+    ch->synth_rc2 = 0.f;
+  }
+  fx::fixed303_set(&ch->synth_fixed, rate);
 
   // The drums' state, put back rather than left where it was. A row that
   // changes the instrument without playing a note hands this channel's next
@@ -465,41 +575,37 @@ synth303_trigger(Channel *ch, const Instrument &ins, float rate) {
   ch->synth_age = 0u;
   ch->synth_env = 1.f;
   ch->synth_venv = 1.f;
-  ch->synth_acc_vca = 0.f;
-  (void) ins;
+  ch->synth_venv_coef = synth_decay_coef(kSynth303VcaTau, rate);
+  // A one-pole's per-sample coefficient as `dt / (tau + dt)`, which needs no
+  // exponential and is what the reference's RC network uses.
+  ch->synth_rc1_a = 1.f / (kSynth303EnvRcTau * rate + 1.f);
+  ch->synth_rc2_a = 1.f / (kSynth303AccentRcTau * rate + 1.f);
+  ch->synth_glide = 0.0;
 
   // **9xx has already written a sample offset into `pos`.** On a 32-frame cycle
   // that is an arbitrary starting phase rather than an offset into anything, so
   // it is dropped here -- a bass note whose waveform starts somewhere different
-  // depending on an effect nobody aimed at it is not a feature.
-  ch->pos = 0.0;
+  // depending on an effect nobody aimed at it is not a feature. A legato note
+  // takes the phase the oscillator had reached, which is what keeps its wave
+  // continuous across the strike.
+  ch->pos = legato ? ch->synth_pos : 0.0;
 }
 
 // Everything the voice needs that is a function of the instrument and the
-// trigger rather than of the sample. It runs on the coefficient boundary, not
-// at the trigger, and that is deliberate: **a slid note never reaches the
+// note rather than of the sample. It runs on the coefficient boundary, not at
+// the trigger, and that is deliberate: **a slid note never reaches the
 // trigger.** A slide ties the previous note and only glides its pitch, so a
-// coefficient computed once at the strike would leave the tied note's accent,
-// decay and envelope shape belonging to the note before it.
+// coefficient computed once at the strike would leave the tied note's accent
+// and decay belonging to the note before it.
 inline void
 synth303_recoef(Channel *ch, const Instrument &ins, float accent) {
-  const float rate = ch->synth_rate;
-  float tau = synth_param_tau(ins.synth_decay, kSynth303TauMin, kSynth303TauMax);
+  float tau = synth303_decay_tau(ins.synth_decay);
   tau += (kSynth303AccentTau - tau) * accent;
-  ch->synth_env_coef = synth_decay_coef(tau, rate);
-  ch->synth_venv_fast = synth_decay_coef(kSynth303VcaTauFast, rate);
-  ch->synth_venv_slow = synth_decay_coef(kSynth303VcaTauSlow, rate);
-  // A one-pole's per-sample coefficient as `dt / (tau + dt)`, which needs no
-  // exponential and is what the reference's RC network uses.
-  const float n = kSynth303AccentRcTau * rate;
-  ch->synth_acc_rc = n > 0.f ? 1.f / (n + 1.f) : 1.f;
+  ch->synth_env_coef = synth_decay_coef(tau, ch->synth_rate);
 }
 
 inline float
 synth303_sample(Channel *ch, const Instrument &ins) {
-  // Accent is a 303's one dynamic: it lifts the level and opens the filter
-  // further in the same gesture, which is why it is one knob and not two.
-  //
   // **Two things are called accent, and they are a product rather than
   // alternatives.** `ins.synth_accent` is the SYNP record's byte: the
   // instrument's accent *depth*, how much an accent does to this voice.
@@ -511,38 +617,66 @@ synth303_sample(Channel *ch, const Instrument &ins) {
   const float accent =
       (float) ins.synth_accent * (1.f / 255.f) * ch->accent;
 
+  // The envelope through its two RCs, before the converter reads them. The
+  // accent's only charges while the note is accented, and otherwise lets go.
+  ch->synth_rc1 += (ch->synth_env - ch->synth_rc1) * ch->synth_rc1_a;
+  ch->synth_rc2 += ((accent > 0.f ? ch->synth_env : 0.f) - ch->synth_rc2) *
+                   ch->synth_rc2_a;
+
   // The amortised coefficient update. The ladder walks toward what this
   // computes over the next `kLadder303Stride` of its own samples rather than
   // stepping to it, so a sweep is a sweep and not a stair; see `ntrk_303.h`.
   // The ladder runs at 2x, so that is every half-stride output frames.
   if ((ch->synth_age & (fx::kLadder303Stride / 2u - 1u)) == 0u) {
     synth303_recoef(ch, ins, accent);
-    const float mod = (float) ins.synth_env_mod * (1.f / 255.f) *
-                      kSynth303EnvModMax * (1.f + kSynth303AccentMod * accent);
-    fx::ladder303_set(&ch->synth_ladder,
-                      synth303_cutoff_hz(ins.synth_cutoff) *
-                          (1.f + mod * ch->synth_env),
-                      synth303_reso(ins.synth_reso), 2.f * ch->synth_rate);
+    fx::ladder303_set(
+        &ch->synth_ladder,
+        synth303_cutoff_at(synth303_cutoff_hz(ins.synth_cutoff),
+                           synth303_env(ins.synth_cutoff, ins.synth_env_mod),
+                           ch->synth_rc1, accent, ch->synth_rc2),
+        synth303_reso(ins.synth_reso), 2.f * ch->synth_rate);
   }
 
-  // The accent circuit's shape: the filter envelope through an RC, added to
-  // the VCA. Run unconditionally and scaled by `accent` at the use site rather
-  // than gated on it, so there is no discontinuity between an accent of 0.01
-  // and one of 0 -- and the term is exactly nothing when the row wrote nothing.
-  ch->synth_acc_vca += (ch->synth_env - ch->synth_acc_vca) * ch->synth_acc_rc;
-  const float level =
-      (ch->synth_venv + kSynth303AccentVca * accent * ch->synth_acc_vca) *
-      (1.f + kSynth303AccentLevel * accent);
+  // The level: the VCA with the filter envelope riding on it, through the
+  // de-clicker, 0..1. Run unconditionally and scaled by `accent` rather than
+  // gated on it, so there is no discontinuity between an accent of 0.01 and
+  // one of 0 -- and the accent's term is exactly nothing when the row wrote
+  // nothing. Capped at 1 because a Butterworth's step overshoots by 4%, and the
+  // VCA is what keeps the clip's bound the voice's bound.
+  float level = fx::fixed303_declick(
+      &ch->synth_fixed,
+      (ch->synth_venv +
+       (kSynth303AmpEnv + kSynth303AmpAccent * accent) * ch->synth_env) *
+          (1.f / kSynth303AmpFull));
+  if (level > 1.f)
+    level = 1.f;
+
+  // The pitch, per frame: a slide's own glide while one runs, the player's
+  // step otherwise. Glissando asked for semitone steps, so it keeps the
+  // player's.
+  double step = ch->step;
+  if (ch->synth_glide > 0.0 && ch->slide_ticks > 0 && !ch->glissando &&
+      ch->target_period > 0.0 && ch->period > 0.0) {
+    const double want = ch->step * ch->period / ch->target_period;
+    ch->synth_step += (want - ch->synth_step) * ch->synth_glide;
+    step = ch->synth_step;
+  } else {
+    // The tick-rate glide's last tick lands on the destination, where this
+    // one has a thousandth of the interval left: under two cents an octave.
+    ch->synth_glide = 0.0;
+    ch->synth_step = step;
+  }
 
   // The record's wave 0 is the saw, because a saw is what a 303 is for.
   const bool square = ins.synth_wave != 0u;
   const float drive = (float) ins.synth_drive * (1.f / 255.f);
   const float mix = (float) ins.synth_dist_mix * (1.f / 255.f);
-  const double half = ch->step * 0.5;
+  const double half = step * 0.5;
   float sub[2];
   for (int k = 0; k < 2; ++k) {
-    float s = fx::ladder303_process(&ch->synth_ladder,
-                                    synth303_osc(ch->pos, half, square));
+    float s = fx::ladder303_process(
+        &ch->synth_ladder,
+        fx::fixed303_pre(&ch->synth_fixed, synth303_osc(ch->pos, half, square)));
 
     // Exactly a passthrough at drive 0 whatever the mix says, which is what
     // `shape_sample` guarantees -- so the four kinds collapse to one signal
@@ -554,11 +688,12 @@ synth303_sample(Channel *ch, const Instrument &ins) {
 
     // **The output stage is the house saturator, and it is load-bearing.** A
     // ladder at maximum resonance has a peak gain in the tens; a saw's
-    // harmonic sitting on that peak, times an accent, leaves the voice well
-    // outside the range the mixer's scaling assumes. Bounding it here is both
-    // what the hardware does after its VCA and the reason "finite across the
-    // whole parameter grid" is a property rather than a hope.
-    sub[k] = fx::soft_clip(s * level);
+    // harmonic sitting on that peak leaves the voice well outside the range the
+    // mixer's scaling assumes. Bounding it here, and the VCA's 0..1 after it,
+    // are the reason "finite across the whole parameter grid" is a property
+    // rather than a hope. Before the VCA, so it bounds the filter the same for
+    // every note; see `kSynth303Drive`.
+    sub[k] = fx::soft_clip(s * kSynth303Drive) * level;
 
     ch->pos += half;
     // A while rather than an if, for the reason the sample path's is: a high
@@ -566,34 +701,35 @@ synth303_sample(Channel *ch, const Instrument &ins) {
     while (ch->pos >= (double) kBuiltinWaveFrames)
       ch->pos -= (double) kBuiltinWaveFrames;
   }
-  const float s = fx::decim303_process(&ch->synth_decim, sub[0], sub[1]);
+  const float s = fx::fixed303_post(
+      &ch->synth_fixed, fx::decim303_process(&ch->synth_decim, sub[0], sub[1]));
 
   // The -100 dB snap, not a denormal flush: this is the only thing that ends
   // the voice, and a multiplicative decay never reaches zero on its own. It is
   // also stricter than `flush_denorm` and subsumes it -- the state cannot reach
   // denormal range without passing through the snap first.
   //
-  // **The VCA ends the voice and the VCF does not.** A filter envelope that has
-  // run out leaves the cutoff at its base, which is a duller note; a level that
-  // has run out is silence, and only silence should stop the channel being
-  // mixed.
+  // **Both envelopes end the voice**, because both reach the level: a VCA that
+  // has run out under a filter envelope still riding on it is not silence.
   ch->synth_env = synth_env_step(ch->synth_env, ch->synth_env_coef);
-  ch->synth_venv = synth_env_step(
-      ch->synth_venv,
-      ch->synth_venv > kSynth303VcaKnee ? ch->synth_venv_fast
-                                        : ch->synth_venv_slow);
+  ch->synth_venv = synth_env_step(ch->synth_venv, ch->synth_venv_coef);
   ++ch->synth_age;
-  if (ch->synth_venv == 0.f)
+  ch->synth_pos = ch->pos;
+  ch->synth303_live = true;
+  if (ch->synth_venv == 0.f && ch->synth_env == 0.f)
     ch->playing = false;
 
   return s * 100.f;
 }
 
+// `legato`: the channel was sounding the 303 right up to this note. Only the
+// 303 has state worth running on; a drum is struck cold every time.
 inline void
-synth_trigger(Channel *ch, const Instrument &ins, double sample_rate) {
+synth_trigger(Channel *ch, const Instrument &ins, double sample_rate,
+              bool legato) {
   const float rate = (float) (sample_rate > 1.0 ? sample_rate : 48000.0);
   if (ins.synth_voice == (uint8_t) SynthVoice::kBass) {
-    synth303_trigger(ch, ins, rate);
+    synth303_trigger(ch, ins, rate, legato);
     return;
   }
   const int vi = (int) ins.synth_voice < kSynthDrumCount
