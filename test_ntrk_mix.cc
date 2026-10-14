@@ -1594,8 +1594,13 @@ test_everything_at_once() {
   // And when its resonance knob was refitted to put most of the peak in the first half of
   // its travel, stopping short of the self-oscillating rows, and its output clip moved in
   // front of the VCA so an accent is no longer compressed. Bass again, so it *must* move.
+  //
+  // And when the 303's de-clicker went to the control rate, a slide's last thousandth was
+  // closed at the glide's rate instead of snapped, and a note out of a silenced or replaced
+  // 303 started cold. This tune slides its bass, so it *must* move. The decimator's mirrored
+  // ring, the cached zero and the flushed followers moved nothing, and were checked to.
   check_hash("everything at once", hash_stream(g_ref, kBigFrames * 2),
-             0xf308a86822397524ULL);
+             0x98d5cdd4d02ce4faULL);
 }
 
 // ---------------------------------------------------------------------------

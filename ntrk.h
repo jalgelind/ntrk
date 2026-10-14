@@ -2750,10 +2750,9 @@ channel_trigger(const Module *m, Channel *ch, int note, double start_frame,
   // Whether the 303 was sounding right up to this note, asked before `playing`
   // is overwritten below: a note struck into a sounding 303 runs on from its
   // filters, and one out of silence -- or out of another voice, which left the
-  // 303's state wherever it stopped -- starts them cold. The 303 sets the flag
-  // again on its first frame.
+  // 303's state wherever it stopped, or out of a cut -- starts them cold. The
+  // flag is `channel_sample`'s, and says exactly that of the last frame.
   const bool legato = ch->playing && ch->synth303_live;
-  ch->synth303_live = false;
 
   ch->playing = ch->instrument > 0;
 
@@ -2824,9 +2823,11 @@ player_preview(Player *player, int channel, int note, int instrument,
   ch->volume = (float) ins.volume;
   ch->trem_offset = 0.f;
   // An audition is one note on its own, so it inherits neither the accent nor
-  // the glide of whatever row last played on this channel.
+  // the glide of whatever row last played on this channel -- nor a 303's
+  // filters: it is struck cold, never legato.
   ch->accent = 0.f;
   ch->slide_ticks = 0;
+  ch->synth303_live = false;
 
   channel_trigger(m, ch, note, 0.0, sample_rate);
   return true;
@@ -3233,18 +3234,28 @@ player_row(Player *player, double sample_rate) {
     // in float that is most of its significant digits gone.
     if (tie) {
       const float ticks = (float) fx_slide;
-      ch->slide_k = (double) -fx::ntrk303_expm1(-6.9f / ticks);
+      ch->slide_rate = 6.9f / ticks;
+      ch->slide_k = (double) -fx::ntrk303_expm1(-ch->slide_rate);
       ch->slide_ticks = (int) fx_slide;
-      // The same glide per output frame, for a voice that moves its pitch every
-      // frame rather than every tick -- the 303's, whose slide is an RC. Same
-      // time, same thousandth left at the end, so the two arrive together.
-      const float frames =
-          ticks * (float) frames_per_tick(player, sample_rate);
-      ch->synth_glide =
-          frames > 1.f ? (double) -fx::ntrk303_expm1(-6.9f / frames) : 1.0;
     }
 
     channel_set_step(ch, sample_rate);
+  }
+
+  // **The glide per output frame, for a voice that moves its pitch every frame
+  // rather than every tick** -- the 303's, whose slide is an RC. It closes the
+  // same `slide_rate` of the remaining interval per tick that `slide_k` does,
+  // spread over the tick's frames, so the two arrive together. After the
+  // channel loop, because a tick's length is the row's tempo and an Fxx on any
+  // channel of this row sets it; and on every row a glide runs through, so a
+  // tempo change halfway through a long slide is followed rather than missed.
+  const float frames = (float) frames_per_tick(player, sample_rate);
+  for (int c = 0; c < m->channels; ++c) {
+    Channel *ch = &player->channels[c];
+    if (ch->slide_ticks > 0)
+      ch->synth_glide = frames > 1.f
+                            ? (double) -fx::ntrk303_expm1(-ch->slide_rate / frames)
+                            : 1.0;
   }
 }
 
@@ -3670,6 +3681,7 @@ channel_sample2(Channel *ch, const Instrument &ins, float *l, float *r) {
     *l = *r = channel_sample(ch, ins);
     return;
   }
+  ch->synth303_live = false;    // a stereo sample is not the 303; see channel_sample
   *l = *r = 0.f;
   if (!ch->playing || ins.data == nullptr || ins.length == 0)
     return;
@@ -3691,15 +3703,34 @@ channel_sample2(Channel *ch, const Instrument &ins, float *l, float *r) {
   channel_gain_apply2(ch, ins, l, r);
 }
 
+// Whether a channel's gain lets anything through: a cut, a volume of zero or an
+// envelope at its floor all make the voice under it silence, whatever it renders.
+inline bool
+channel_gain_open(const Channel *ch) {
+  return ch->volume + ch->trem_offset > 0.f &&
+         (ch->env_stage == EnvStage::kOff || ch->env_level > 0.f);
+}
+
 inline float
 channel_sample(Channel *ch, const Instrument &ins) {
+  // **The one writer of `synth303_live`**, which is what `channel_trigger` asks
+  // when it decides a 303 note is legato: whether this frame was a 303 that
+  // could be heard. Cleared on every frame and set only by one, so another
+  // voice taking the channel, or a 303 a cut or a zero volume has silenced,
+  // leaves the next note to strike cold rather than run on from a filter that
+  // stopped rows ago or from a level nobody heard.
+  ch->synth303_live = false;
   if (!ch->playing)
     return 0.f;
 
   // Checked before the sample fields are, because a synth has none of them: it
   // owns no blob, its `length` is normally zero, and it stops itself.
-  if (ins.type == (uint8_t) InstrumentType::kSynth)
-    return channel_gain_apply(ch, ins, synth_sample(ch, ins));
+  if (ins.type == (uint8_t) InstrumentType::kSynth) {
+    const float out = channel_gain_apply(ch, ins, synth_sample(ch, ins));
+    ch->synth303_live = ins.synth_voice == (uint8_t) SynthVoice::kBass &&
+                        ch->playing && channel_gain_open(ch);
+    return out;
+  }
 
   if (ins.data == nullptr || ins.length == 0)
     return 0.f;

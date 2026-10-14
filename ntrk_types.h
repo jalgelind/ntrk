@@ -912,6 +912,8 @@ struct Channel {
   float synth_rc2 = 0.f;       // and through 15 ms, while accented: what an accent adds
   float synth_rc1_a = 0.f;     // their per-frame coefficients
   float synth_rc2_a = 0.f;
+  float synth_level = 0.f;     // the de-clicked VCA, walked toward at the control rate
+  float synth_level_i = 0.f;   // and its per-frame step
   // The oscillator's own step. The player's `step` moves once a tick, which is
   // right for a vibrato and wrong for a slide: a 303 glides on an RC, and a
   // glide sampled at the tick rate arrives as a jump. So while a slide runs
@@ -919,10 +921,11 @@ struct Channel {
   // otherwise it is `step`.
   double synth_step = 0.0;
   double synth_glide = 0.0;    // per frame, 0 when no slide is running
+  float slide_rate = 0.f;      // the slide's exponent per tick, 6.9 / its ticks
   // Where the oscillator's phase had got to, which a legato note runs on from:
   // `channel_trigger` has already put the note's start into `pos` by then.
   double synth_pos = 0.0;
-  bool synth303_live = false;  // the 303 rendered this channel's last frame
+  bool synth303_live = false;  // the last frame was an audible 303; channel_sample's alone
 };
 
 struct Player {

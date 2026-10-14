@@ -50,16 +50,16 @@ namespace ntrk {
 // |-----|---|-------|-------|
 // | 0 | 1 | `voice` | 0 kick, 1 snare, 2 hihat, 3 clap, 4 bass; above refused |
 // | 1 | 1 | `tune` | body frequency, 0.5x..2x the voice's own, at note 25 |
-// | 2 | 1 | `decay` | the VCA, over the voice's own range; the bass: the VCF |
+// | 2 | 1 | `decay` | the VCA, over the voice's own range; the bass: the VCF, 30 ms..2 s exponential |
 // | 3 | 1 | `sweep` | pitch sweep depth, 0..4x over the first 20 ms |
 // | 4 | 1 | `tone` | noise band cutoff, 0.5x..2x the voice's own |
 // | 5 | 1 | `noise` | noise against body, 0 body only .. 255 noise only |
 // | 6 | 1 | `noise_decay` | noise VCA, the voice's own range |
 // | 7 | 1 | `drive` | saturation, 0 is an exact bypass |
-// | 8 | 1 | `cutoff` | bass: the ladder's own cutoff, cubic over 30..8000 Hz |
-// | 9 | 1 | `reso` | bass: quadratic onto the 64 measured ladder settings |
-// | 10 | 1 | `env_mod` | bass: how far the envelope opens the cutoff, 0..16x |
-// | 11 | 1 | `accent` | bass: level and env-mod boost together, as a 303's is |
+// | 8 | 1 | `cutoff` | bass: the ladder's cutoff, exponential over 314..2394 Hz |
+// | 9 | 1 | `reso` | bass: a fitted taper onto the measured ladder settings |
+// | 10 | 1 | `env_mod` | bass: how many octaves the envelope sweeps, measured law |
+// | 11 | 1 | `accent` | bass: accent depth -- level, a shorter sweep and more of it |
 // | 12 | 1 | `dist` | bass: shaper kind, 0 warm 1 crunch 2 tape 3 fold |
 // | 13 | 1 | `dist_mix` | bass: dry against shaped; `drive` 0 is still a bypass |
 // | 14 | 1 | `wave` | bass: 0 saw, 1 square -- what a 303 has, and no more |
@@ -356,8 +356,9 @@ synth_noise_sample(Channel *ch) {
 // a 303's slide is an RC on the pitch voltage: at three ticks a slide closed
 // 90% of its interval on the first one, which is a jump. So while one runs the
 // oscillator walks its own step to the destination at the slide's rate,
-// `synth_glide`, which the player sets from the same time the tick-rate glide
-// is set from. See `ntrk_types.h`.
+// `synth_glide`, which the player sets from the same glide time the tick-rate
+// glide is set from, at the row's own tempo -- and plays it under any vibrato
+// or arpeggio on the period. See `ntrk_types.h` and `player_row`.
 //
 // **The coefficients are recomputed once every sixteen samples and glided in
 // between.** The pole maths costs three exponentials, two cosines and two
@@ -411,11 +412,12 @@ const float kSynth303AmpFull = 5.45f;
 // the VCA**: its job is to bound the ladder's resonant peaks, which is a
 // property of the filter rather than of the note, so every note meets it at
 // the same drive and an accent is then exactly as much louder as the VCA
-// makes it. Behind the VCA it ate the accent instead -- the harder the note,
-// the more it compressed -- and took 2.6 dB of it. In the clip's linear range
-// a plain note is as loud at this drive as it was there; its resonant peaks,
-// clipped now as an accent's are, come out a little lower. More drive is more
-// level for every note and more saturation, and costs the accents nothing.
+// makes it: about 10 dB at full accent. A clip behind the VCA would compress a
+// note the harder it was struck, which is the accent it would eat. The cost is
+// headroom: under one ceiling an accent's ten decibels come out of the plain
+// notes, which sit 4-7 dB under where a VCA that barely accented put them. More
+// drive is more level for every note and more saturation, and costs the
+// accents nothing.
 const float kSynth303Drive = 0.763f;
 
 // An accented note's filter envelope is moved toward a fixed, short decay --
@@ -556,6 +558,8 @@ synth303_trigger(Channel *ch, const Instrument &ins, float rate, bool legato) {
     fx::fixed303_reset(&ch->synth_fixed);
     ch->synth_rc1 = 0.f;
     ch->synth_rc2 = 0.f;
+    ch->synth_level = 0.f;
+    ch->synth_level_i = 0.f;
   }
   fx::fixed303_set(&ch->synth_fixed, rate);
 
@@ -619,9 +623,14 @@ synth303_sample(Channel *ch, const Instrument &ins) {
 
   // The envelope through its two RCs, before the converter reads them. The
   // accent's only charges while the note is accented, and otherwise lets go.
-  ch->synth_rc1 += (ch->synth_env - ch->synth_rc1) * ch->synth_rc1_a;
-  ch->synth_rc2 += ((accent > 0.f ? ch->synth_env : 0.f) - ch->synth_rc2) *
-                   ch->synth_rc2_a;
+  // Flushed at the store like every other state here: once the envelope has
+  // snapped to zero they decay into denormal range and would sit there for
+  // the rest of the note, at half again the voice's cost.
+  ch->synth_rc1 = fx::flush_denorm(
+      ch->synth_rc1 + (ch->synth_env - ch->synth_rc1) * ch->synth_rc1_a);
+  ch->synth_rc2 = fx::flush_denorm(
+      ch->synth_rc2 +
+      ((accent > 0.f ? ch->synth_env : 0.f) - ch->synth_rc2) * ch->synth_rc2_a);
 
   // The amortised coefficient update. The ladder walks toward what this
   // computes over the next `kLadder303Stride` of its own samples rather than
@@ -643,26 +652,48 @@ synth303_sample(Channel *ch, const Instrument &ins) {
   // one of 0 -- and the accent's term is exactly nothing when the row wrote
   // nothing. Capped at 1 because a Butterworth's step overshoots by 4%, and the
   // VCA is what keeps the clip's bound the voice's bound.
-  float level = fx::fixed303_declick(
-      &ch->synth_fixed,
-      (ch->synth_venv +
-       (kSynth303AmpEnv + kSynth303AmpAccent * accent) * ch->synth_env) *
-          (1.f / kSynth303AmpFull));
+  //
+  // **The de-clicker runs at the control rate**, every `kDeclick303Stride`
+  // frames, and the level walks to it in between: a 200 Hz lowpass on an
+  // envelope has nothing above a few hundred hertz to keep, and running it per
+  // frame was a seventh of the voice. Keyed on `synth_age`, so a note renders
+  // the same whatever the buffer size.
+  if ((ch->synth_age & (fx::kDeclick303Stride - 1u)) == 0u) {
+    const float target = fx::fixed303_declick(
+        &ch->synth_fixed,
+        (ch->synth_venv +
+         (kSynth303AmpEnv + kSynth303AmpAccent * accent) * ch->synth_env) *
+            (1.f / kSynth303AmpFull));
+    ch->synth_level_i =
+        (target - ch->synth_level) * (1.f / (float) fx::kDeclick303Stride);
+  }
+  ch->synth_level = fx::flush_denorm(ch->synth_level + ch->synth_level_i);
+  float level = ch->synth_level;
   if (level > 1.f)
     level = 1.f;
 
-  // The pitch, per frame: a slide's own glide while one runs, the player's
-  // step otherwise. Glissando asked for semitone steps, so it keeps the
-  // player's.
+  // The pitch, per frame. While a slide runs, the oscillator walks its own
+  // step to the slide's destination every frame, at the slide's rate -- and
+  // plays it under whatever vibrato or arpeggio the player has put on the
+  // period, which is the ratio of the period it modulated to the one it
+  // glided. When the slide ends, or a tone portamento or a note-less row
+  // cancels it, the glide closes what is left at that rate rather than
+  // jumping there, and lets go once it has. Glissando asked for semitone
+  // steps, so it keeps the player's.
   double step = ch->step;
-  if (ch->synth_glide > 0.0 && ch->slide_ticks > 0 && !ch->glissando &&
-      ch->target_period > 0.0 && ch->period > 0.0) {
-    const double want = ch->step * ch->period / ch->target_period;
+  if (ch->synth_glide > 0.0 && !ch->glissando && ch->period > 0.0 &&
+      ch->base_period > 0.0) {
+    const bool sliding = ch->slide_ticks > 0 && ch->target_period > 0.0;
+    // The unmodulated pitch to glide to: the destination while sliding, and
+    // the player's own glided period once it is not.
+    const double want =
+        ch->step * ch->period / (sliding ? ch->target_period : ch->base_period);
     ch->synth_step += (want - ch->synth_step) * ch->synth_glide;
-    step = ch->synth_step;
+    step = ch->synth_step * (ch->base_period / ch->period);
+    const double gap = want - ch->synth_step;
+    if (!sliding && (gap < 0.0 ? -gap : gap) <= want * 1e-6)
+      ch->synth_glide = 0.0;    // arrived: a millionth, under a fiftieth of a cent
   } else {
-    // The tick-rate glide's last tick lands on the destination, where this
-    // one has a thousandth of the interval left: under two cents an octave.
     ch->synth_glide = 0.0;
     ch->synth_step = step;
   }
@@ -715,7 +746,6 @@ synth303_sample(Channel *ch, const Instrument &ins) {
   ch->synth_venv = synth_env_step(ch->synth_venv, ch->synth_venv_coef);
   ++ch->synth_age;
   ch->synth_pos = ch->pos;
-  ch->synth303_live = true;
   if (ch->synth_venv == 0.f && ch->synth_env == 0.f)
     ch->playing = false;
 

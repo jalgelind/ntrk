@@ -374,6 +374,8 @@ struct Ladder303 {
   float hp_g_i = 0.f;
   float hp_c = 1.f;  // its lowpass tap's weight: where the zero sits (see below)
   float hp_c_i = 0.f;
+  float zero_rate = 0.f;  // the rate `zero_g` was computed for
+  float zero_g = 0.f;     // the zero's corner gain, a function of the rate alone
   float gain = 1.f;  // the resonance gain compensation
   float gain_i = 0.f;
   bool primed = false;  // false until the first `ladder303_set`, which snaps
@@ -579,8 +581,12 @@ ladder303_set(Ladder303 *f, float cutoff_hz, float reso, float sample_rate) {
   // corner's gain to the pole's. The cap is unreachable from the table, whose
   // highpass pole never comes within a sixth of the corner; it is there for a
   // pole the guard above has clamped.
-  const float ta = ntrk303_expm1(k * kNtrk303Poles[0][0]);
-  float hp_c = (-ta / (2.f + ta)) / hg;
+  if (f->zero_rate != sr) {     // once per rate, not once per update
+    const float ta = ntrk303_expm1(k * kNtrk303Poles[0][0]);
+    f->zero_g = -ta / (2.f + ta);
+    f->zero_rate = sr;
+  }
+  float hp_c = f->zero_g / hg;
   if (hp_c > 16.f)
     hp_c = 16.f;
 
@@ -682,6 +688,12 @@ svf303_set(Svf303 *s, float g, float r) {
   s->dr = 1.f / (1.f + r * g + g * g);
 }
 
+// How many frames one de-clicker step is spread over: it runs at the control
+// rate, its coefficients set for that rate. A power of two, so the caller's
+// test is a mask. 8 keeps the control rate at 1 kHz even at 8 kHz, well above
+// the de-clicker's 200 Hz.
+const uint32_t kDeclick303Stride = 8u;
+
 // Every coefficient here is a function of the rate alone, so this is the one
 // thing a cold note and a legato one both redo -- cheaply, a few expm1s.
 inline void
@@ -694,7 +706,9 @@ fixed303_set(Fixed303 *f, float rate) {
   f->hp.g = g_hp / (1.f + g_hp);
   // A bandwidth of 4.7 octaves is a Q of sqrt(2^4.7) / (2^4.7 - 1) = 0.204.
   svf303_set(&f->notch, ntrk303_corner_g(7.5164f, rate), 4.90220f);
-  svf303_set(&f->declick, ntrk303_corner_g(200.f, rate), 1.41421356f);
+  svf303_set(&f->declick,
+             ntrk303_corner_g(200.f, rate * (1.f / (float) kDeclick303Stride)),
+             1.41421356f);
 }
 
 inline void
@@ -752,14 +766,14 @@ const float kDecim303Coef[kDecim303Taps] = {
 const float kDecim303Centre = 0.499995397f;
 
 struct Decim303 {
-  float even[2 * kDecim303Taps] = {};  // the second sub-sample of each frame
+  float even[4 * kDecim303Taps] = {};  // 24 frames, each written twice: see below
   float odd[kDecim303Taps] = {};       // the first; only the centre reads it
   uint32_t at = 0u;
 };
 
 inline void
 decim303_reset(Decim303 *d) {
-  for (int i = 0; i < 2 * kDecim303Taps; ++i)
+  for (int i = 0; i < 4 * kDecim303Taps; ++i)
     d->even[i] = 0.f;
   for (int i = 0; i < kDecim303Taps; ++i)
     d->odd[i] = 0.f;
@@ -767,18 +781,26 @@ decim303_reset(Decim303 *d) {
 }
 
 // One output frame from its two sub-samples, `first` earlier in time.
+//
+// **A mirrored ring, so no tap wraps.** Each frame lands at `at` and again at
+// `at + 24`, so the 24 frames before `at + 24` sit contiguous behind it and
+// the window reads straight back with no modulo -- which, indexed modulo 24,
+// was 24 integer divisions a frame and most of the decimator's cost. Same
+// values, same order of adds: the output is bit for bit what it was.
 inline float
 decim303_process(Decim303 *d, float first, float second) {
   const uint32_t n = 2u * (uint32_t) kDecim303Taps;   // 24, a multiple of 12
-  d->at = (d->at + 1u) % n;
+  if (++d->at == n)
+    d->at = 0u;
   d->even[d->at] = second;
+  d->even[d->at + n] = second;
   d->odd[d->at % (uint32_t) kDecim303Taps] = first;
+  const float *w = d->even + d->at + n;    // w[-j] is the frame j back
   // The coefficients run from the centre outward: tap i pairs the frames
   // 11 - i and 12 + i back, which straddle the centre symmetrically.
   float y = 0.f;
   for (uint32_t i = 0; i < (uint32_t) kDecim303Taps; ++i)
-    y += kDecim303Coef[i] * (d->even[(d->at + n - (11u - i)) % n] +
-                             d->even[(d->at + n - (12u + i)) % n]);
+    y += kDecim303Coef[i] * (w[-(int) (11u - i)] + w[-(int) (12u + i)]);
   // The centre is the first sub-sample eleven frames back.
   return y + kDecim303Centre * d->odd[(d->at + 1u) % (uint32_t) kDecim303Taps];
 }

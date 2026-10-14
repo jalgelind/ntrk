@@ -5167,6 +5167,30 @@ test_303_legato() {
   CHECK(memcmp(g_first, g_buffer, sizeof(double) * 4096u * 2u) == 0);
 }
 
+// Frame by frame through a slide's arrival: the largest relative move of the
+// oscillator's step in the 256 frames after the player's last glide tick, and
+// how far it ends from the player's own step. No arrival in `frames` is a fail.
+static double
+arrival_jump(ntrk::Player *p, int frames, double *end_gap) {
+  double prev = p->channels[0].synth_step, worst = 0.0;
+  int after = -1;
+  for (int f = 0; f < frames; ++f) {
+    render_at(p, 1, kSynRate);
+    const double s = p->channels[0].synth_step;
+    if (after < 0 && p->channels[0].slide_ticks == 0)
+      after = 0;
+    if (after >= 0 && after < 256) {
+      const double d = fabs(s / prev - 1.0);
+      if (d > worst)
+        worst = d;
+      ++after;
+    }
+    prev = s;
+  }
+  *end_gap = fabs(p->channels[0].synth_step / p->channels[0].step - 1.0);
+  return after >= 0 ? worst : 1.0;
+}
+
 static void
 test_303_slide_glides_every_frame() {
   printf("a 303 slide moves the pitch every frame, not once a tick\n");
@@ -5195,11 +5219,169 @@ test_303_slide_glides_every_frame() {
   CHECK(s2 > s1);
   CHECK(s1 > 0.0);
 
-  // And when the player's last tick lands on the note, the oscillator's step
-  // is the player's again, exactly.
-  render_at(&p, 6 * 441, kSynRate);
+  // **And it arrives without a jump.** The player's last tick lands on the note
+  // exactly; the oscillator, a thousandth short of it there, closes the rest at
+  // its own rate. Snapping it to the player's step at that frame moved it 0.1%
+  // of the interval at once, and this would see it.
+  double gap = 1.0;
+  CHECK(arrival_jump(&p, 9 * 441, &gap) < 1e-4);
   CHECK(p.channels[0].period == ntrk::period_for(25, 0));
-  CHECK(p.channels[0].synth_step == p.channels[0].step);
+  CHECK(gap < 1e-5);
+}
+
+// A two-channel version of `fx_module`'s rows, for a row whose tempo another
+// channel sets.
+static const int kTempoRows = 4;
+static ntrk::Note g_tempo_pat[kTempoRows * 2];
+static ntrk::FxCell g_tempo_plane[kTempoRows * 2];
+
+static void
+test_303_slide_follows_the_tempo() {
+  printf("a 303 slide keeps time with a tempo change another channel makes\n");
+
+  // Channel 0: C-2, then a five-tick slide two octaves up to C-4. Channel 1:
+  // an F to 250 BPM on the slid row, which halves every tick from there on --
+  // and which the player meets *after* channel 0's row, so a glide timed from
+  // the tempo as channel 0 found it is twice too slow. It then had 3% of the
+  // interval left when the player's last tick landed: a 42-cent jump.
+  memset(g_tempo_pat, 0, sizeof g_tempo_pat);
+  memset(g_tempo_plane, 0, sizeof g_tempo_plane);
+  g_tempo_pat[0].note = 13u;
+  g_tempo_pat[0].instrument = 1u;
+  g_tempo_pat[2].note = 37u;
+  g_tempo_pat[2].instrument = 1u;
+  g_tempo_plane[2].cmd = 0x31u;
+  g_tempo_plane[2].param = 5u;
+  g_tempo_pat[3].effect = 0xFu;
+  g_tempo_pat[3].param = 250u;
+  ntrk::Module m;
+  fx_module(&m, true);
+  m.channels = 2;
+  m.rows = kTempoRows;
+  m.patterns = g_tempo_pat;
+  m.fx = g_tempo_plane;
+  ntrk::Player p;
+  ntrk::player_start(&p, &m);
+
+  // Into the slide, then through its arrival -- short of the pattern's loop,
+  // three rows of 1323 frames on at the new tempo.
+  render_at(&p, 2646 + 100, kSynRate);
+  CHECK(p.channels[0].slide_ticks > 0);
+  double gap = 1.0;
+  CHECK(arrival_jump(&p, 2600, &gap) < 1e-4);
+  CHECK(p.channels[0].period == ntrk::period_for(37, 0));
+  CHECK(gap < 1e-5);
+}
+
+static void
+test_303_slide_keeps_vibrato() {
+  printf("vibrato on a slid 303 row is heard through the slide\n");
+
+  // The slide test's two rows, with and without a vibrato on the slid row,
+  // rendered only as far as the slide's third tick -- inside the glide. A glide
+  // that aimed the oscillator at the bare destination dropped the vibrato for
+  // the length of the slide, and the two renders came out the same.
+  const int frames = 2646 + 3 * 441;
+  fx_clear();
+  g_fx_pat[0].note = 13u;
+  g_fx_pat[0].instrument = 1u;
+  g_fx_pat[1].note = 25u;
+  g_fx_pat[1].instrument = 1u;
+  g_fx_plane[1].cmd = 0x31u;
+  g_fx_plane[1].param = 4u;
+  ntrk::Module plain;
+  fx_module(&plain, true);
+  ntrk::Player p;
+  ntrk::player_start(&p, &plain);
+  render_at(&p, frames, kSynRate);
+  memcpy(g_first, g_buffer, sizeof(double) * (size_t) frames * 2u);
+
+  g_fx_pat[1].effect = 0x4u;
+  g_fx_pat[1].param = 0x8Fu;          // fast and deep
+  ntrk::Module vib;
+  fx_module(&vib, true);
+  ntrk::player_start(&p, &vib);
+  render_at(&p, frames, kSynRate);
+  CHECK(memcmp(g_first, g_buffer, sizeof(double) * (size_t) frames * 2u) != 0);
+}
+
+static void
+test_303_legato_only_out_of_a_sounding_303() {
+  printf("a 303 note is legato only out of a 303 that could be heard\n");
+
+  // The reference: the same note on row 2 with nothing before it, struck cold.
+  // Each case below strikes it on row 2 after something that leaves the 303
+  // rendering, or its state lying about, without it being heard -- and each
+  // must render that note bit for bit as the reference does. A flag that only
+  // a new note cleared ran each of them on from that state instead.
+  const int row = 2646;
+  const int frames = 2048;
+  const size_t at = (size_t) (2 * row) * 2u;
+  fx_clear();
+  g_fx_pat[2].note = 13u;
+  g_fx_pat[2].instrument = 1u;
+  ntrk::Module cold;
+  fx_module(&cold, true);
+  ntrk::Player p;
+  ntrk::player_start(&p, &cold);
+  render_at(&p, 2 * row + frames, kSynRate);
+  static double ref[2048 * 2];
+  memcpy(ref, g_buffer + at, sizeof ref);
+
+  // A volume of zero: the 303 runs on underneath, inaudible.
+  fx_clear();
+  g_fx_pat[0].note = 13u;
+  g_fx_pat[0].instrument = 1u;
+  g_fx_pat[1].effect = 0xCu;
+  g_fx_pat[1].param = 0u;
+  g_fx_pat[2].note = 13u;
+  g_fx_pat[2].instrument = 1u;
+  ntrk::Module muted;
+  fx_module(&muted, true);
+  ntrk::player_start(&p, &muted);
+  render_at(&p, 2 * row + frames, kSynRate);
+  CHECK(memcmp(ref, g_buffer + at, sizeof ref) == 0);
+
+  // Another voice: row 1 hands the channel to a sample, with no note, and the
+  // 303's state stays wherever it stopped.
+  g_fx_pat[1].effect = 0u;
+  g_fx_pat[1].instrument = 2u;
+  ntrk::Module other;
+  fx_module(&other, true);
+  other.instrument_count = 2;
+  ntrk::Instrument &wave = other.instruments[1];
+  wave.volume = 64u;
+  wave.data = ntrk::builtin_wave(0);
+  wave.length = (uint32_t) ntrk::kBuiltinWaveFrames;
+  wave.loop_start = 0u;
+  wave.loop_len = (uint32_t) ntrk::kBuiltinWaveFrames;
+  ntrk::player_start(&p, &other);
+  render_at(&p, 2 * row + frames, kSynRate);
+  CHECK(memcmp(ref, g_buffer + at, sizeof ref) == 0);
+
+  // And an audition into a sounding 303 is one note on its own: the same
+  // audition, at the same frame, into a player whose pattern is empty. Both are
+  // started players, so the channel's pan and the tick clock agree; the 303
+  // under the first is the only difference, and must make none.
+  fx_clear();
+  ntrk::Module empty;
+  fx_module(&empty, true);
+  ntrk::player_start(&p, &empty);
+  render_at(&p, row / 2, kSynRate);
+  CHECK(ntrk::player_preview(&p, 0, 13, 1, (double) kSynRate));
+  render_at(&p, frames, kSynRate);
+  memcpy(ref, g_buffer, sizeof ref);
+
+  g_fx_pat[0].note = 13u;
+  g_fx_pat[0].instrument = 1u;
+  ntrk::Module line;
+  fx_module(&line, true);
+  ntrk::player_start(&p, &line);
+  render_at(&p, row / 2, kSynRate);
+  CHECK(p.channels[0].playing);
+  CHECK(ntrk::player_preview(&p, 0, 13, 1, (double) kSynRate));
+  render_at(&p, frames, kSynRate);
+  CHECK(memcmp(ref, g_buffer, sizeof ref) == 0);
 }
 
 // The gate a 303 line needs, and it is the ordinary instrument ADSR: a synth
@@ -8014,6 +8196,9 @@ main(void) {
   test_303_square();
   test_303_legato();
   test_303_slide_glides_every_frame();
+  test_303_slide_follows_the_tempo();
+  test_303_slide_keeps_vibrato();
+  test_303_legato_only_out_of_a_sounding_303();
   test_synth_note_off();
   test_plane_slide_crosses_a_row();
   test_tone_porta_stays_linear();
