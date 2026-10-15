@@ -2414,7 +2414,7 @@ plane_fixed_table(int *count) {
       {0x02, "PNS", "Pan slide", ParamShape::Continuous, 0, nullptr},
       {0x03, "VOL", "Set master gain", ParamShape::Continuous, 0, nullptr},
       {0x04, "VLS", "Master gain slide", ParamShape::Continuous, 0, nullptr},
-      {0x05, "CUT", "Set cutoff", ParamShape::Continuous, 0, nullptr},
+      {0x05, "CTF", "Set cutoff", ParamShape::Continuous, 0, nullptr},
       {0x06, "CTS", "Cutoff slide", ParamShape::Continuous, 0, nullptr},
       {0x07, "RES", "Set resonance", ParamShape::Continuous, 0, nullptr},
       {0x08, "RSS", "Resonance slide", ParamShape::Continuous, 0, nullptr},
@@ -2428,7 +2428,7 @@ plane_fixed_table(int *count) {
       {0x16, "SS3", "Send 3 slide", ParamShape::Continuous, 0, nullptr},
       {0x17, "SS4", "Send 4 slide", ParamShape::Continuous, 0, nullptr},
       {0x30, "ACC", "Accent", ParamShape::Continuous, 0, nullptr},
-      {0x31, "GLI", "Glide", ParamShape::Continuous, 0, nullptr},
+      {0x31, "SLD", "Slide", ParamShape::Continuous, 0, nullptr},
   };
   if (count != nullptr)
     *count = 19;

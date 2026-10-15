@@ -3503,7 +3503,7 @@ test_fxpl_mnemonic() {
   cell.cmd = 0u;              ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "...") == 0);
   cell.cmd = 0x01u;           ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "PAN") == 0);
   cell.cmd = 0x02u;           ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "PNS") == 0);
-  cell.cmd = 0x05u;           ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "CUT") == 0);
+  cell.cmd = 0x05u;           ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "CTF") == 0);
   // Sends are numbered, not named after the effect in the slot: the kind is a
   // mixer setting, and names that moved when a send was reassigned would make
   // the grid unreadable.
@@ -3511,7 +3511,7 @@ test_fxpl_mnemonic() {
   cell.cmd = 0x13u;           ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "SN4") == 0);
   cell.cmd = 0x14u;           ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "SS1") == 0);
   cell.cmd = 0x30u;           ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "ACC") == 0);
-  cell.cmd = 0x31u;           ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "GLI") == 0);
+  cell.cmd = 0x31u;           ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "SLD") == 0);
   // Slot set and slide, `slot << 3 | param`: slot 1 param 2, both ranges.
   cell.cmd = (uint8_t) (0x40u + (1u << 3 | 2u));
   ntrk::mix::fxpl_mnemonic(cell, m); CHECK(strcmp(m, "S12") == 0);
@@ -3528,6 +3528,33 @@ test_fxpl_mnemonic() {
       all_three = false;
   }
   CHECK(all_three);
+}
+
+static void
+test_mnemonics_name_one_thing() {
+  printf("a mnemonic names one command across the note column and the plane\n");
+  // PAN and VOL are the same act on another target -- a channel's pan or volume in
+  // the note column, a bus's in the plane -- and read right either way. Every other
+  // name the two tables shared made one grid say two things: GLI was a tone
+  // portamento and a 303 slide, CUT a note cut and a filter cutoff, FLT a no-op LED
+  // filter and the filter type.
+  int n = 0;
+  const ntrk::CmdInfo *note = ntrk::note_fx_table(&n);
+  ntrk::FxCell cell;
+  char m[4];
+  bool clash = false;
+  for (int c = 1; c < 0x40; ++c) {    // the fixed range; slot names are numbered
+    cell.cmd = (uint8_t) c;
+    ntrk::mix::fxpl_mnemonic(cell, m);
+    if (strcmp(m, "???") == 0 || strcmp(m, "PAN") == 0 || strcmp(m, "VOL") == 0)
+      continue;
+    for (int i = 0; i < n; ++i)
+      if (strcmp(note[i].mnemonic, m) == 0) {
+        printf("  %s is note 0x%02X and plane 0x%02X\n", m, note[i].cmd, c);
+        clash = true;
+      }
+  }
+  CHECK(!clash);
 }
 
 // ---------------------------------------------------------------------------
@@ -4896,6 +4923,7 @@ main(void) {
   test_describe_macro();
   test_describe_command_space();
   test_fxpl_mnemonic();
+  test_mnemonics_name_one_thing();
   test_reverb_slot_late_knobs();
   test_shaper_dry();
   test_command_enumeration();
