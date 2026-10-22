@@ -1270,6 +1270,15 @@ bool command_at(Lane lane, int index, const Mixer *mx, CommandInfo *out,
 bool command_lookup(Lane lane, uint8_t cmd, const Mixer *mx, CommandInfo *out,
                     int channel = -1);
 
+// The same two, resolved against a MODULE's saved `MIXR` block instead of a live mixer.
+// **What an editor has**: the mixer belongs to the audio thread, and the block holds the
+// same kinds -- "Send 2 (Reverb) Diffusion" and "Set send 2 (Reverb) level" without
+// building a mixer to read them. A null module is the index form.
+bool command_at_in(Lane lane, int index, const Module *m, CommandInfo *out,
+                   int channel = -1);
+bool command_lookup_in(Lane lane, uint8_t cmd, const Module *m, CommandInfo *out,
+                       int channel = -1);
+
 // **The value alone** — "centre", "+0.12/tick", "1024 frames", "square" — and
 // not a sentence about the cell. That is `fxpl_describe`'s job, and the two do
 // not overlap: this is what goes beside a knob or in a column, where the name

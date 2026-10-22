@@ -3421,9 +3421,9 @@ test_describe_slot_params() {
   mix::fxpl_describe(&g_mixer, nullptr, 0, desc_cell(0x02, 0x00), b, sizeof b);
   CHECK(strcmp(b, "Pan slide (last step)") == 0);
   mix::fxpl_describe(&g_mixer, nullptr, 0, desc_cell(0x12, 0xff), b, sizeof b);
-  CHECK(strcmp(b, "Set send 3 level -> 1.00") == 0);
+  CHECK(strcmp(b, "Set send 3 (None) level -> 1.00") == 0);
   mix::fxpl_describe(&g_mixer, nullptr, 0, desc_cell(0x17, 0x01), b, sizeof b);
-  CHECK(strcmp(b, "Send 4 slide +0.00/tick") == 0);
+  CHECK(strcmp(b, "Send 4 (None) slide +0.00/tick") == 0);
   mix::fxpl_describe(&g_mixer, nullptr, 0, desc_cell(0x09, 0x02), b, sizeof b);
   CHECK(strcmp(b, "Set filter type -> bandpass") == 0);
 
@@ -3433,6 +3433,33 @@ test_describe_slot_params() {
   ntrk::fxpl_player_describe(0x31, 0x08, p, sizeof p);
   mix::fxpl_describe(&g_mixer, nullptr, 0, desc_cell(0x31, 0x08), b, sizeof b);
   CHECK(strcmp(b, p) == 0);
+}
+
+static void
+test_send_commands_name_their_effect() {
+  printf("a send command names the effect the send holds, from a mixer or a module\n");
+  Module m;
+  mix::config_set_slot_kind(m.mix, 1, mix::FxKind::kReverb);
+  char b[96];
+  mix::fxpl_describe(nullptr, &m, 0, desc_cell(0x11, 0x80), b, sizeof b);
+  CHECK(strcmp(b, "Set send 2 (Reverb) level -> 0.50") == 0);
+  mix::fxpl_describe(nullptr, &m, 0, desc_cell(0x15, 0x40), b, sizeof b);
+  CHECK(strcmp(b, "Send 2 (Reverb) slide +0.25/tick") == 0);
+  mix::fxpl_describe(nullptr, nullptr, 0, desc_cell(0x11, 0x80), b, sizeof b);
+  CHECK(strcmp(b, "Set send 2 level -> 0.50") == 0);   // nothing to ask: the bare number
+
+  // The completion row is the same words, through the same wording function.
+  mix::CommandInfo ci;
+  CHECK(mix::command_lookup_in(mix::Lane::PlaneChannel, 0x11, &m, &ci, 0));
+  CHECK(strcmp(ci.name, "Set send 2 (Reverb) level") == 0);
+  CHECK(strcmp(ci.mnemonic, "SN2") == 0);
+  CHECK(mix::command_lookup(mix::Lane::PlaneChannel, 0x11, nullptr, &ci));
+  CHECK(strcmp(ci.name, "Set send 2 level") == 0);
+  // And a send's own parameter rows (meta lane) name the kind from the module.
+  CHECK(mix::command_lookup_in(mix::Lane::PlaneMeta, 0x49, &m, &ci));
+  CHECK(strncmp(ci.name, "Send 2 (Reverb) ", 16) == 0);
+  // The note column has no sends: its rows are untouched.
+  CHECK(mix::command_lookup_in(mix::Lane::NoteEffect, 0x01, &m, &ci));
 }
 
 static void
@@ -3450,17 +3477,27 @@ test_describe_macro() {
                "Send 2 (Reverb) Damping [global] -> 0.25, "
                "Insert (Filter) Cutoff [ch2] -> 0.50") == 0);
 
-  // No mixer: every slot target degrades, and the `fxpl_val` ones do not —
+  // No mixer, no module: every slot target degrades, and the `fxpl_val` ones do not --
   // those the format does know.
+  Module bare = g_desc_mod;
+  memset(bare.mix, 0, sizeof bare.mix);          // a module with no readable MIXR
+  mix::macro_describe(nullptr, &bare, 1, 128, b, sizeof b);
+  CHECK(strstr(b, "Send 2 param 1 [global]") != nullptr);
+
+  // **No mixer but the module's own `MIXR`: the same words the live mixer gives.** An editor
+  // holds the module, and the saved kinds are the ones the mixer is built from.
+  mix::config_set_slot_kind(g_desc_mod.mix, 1, mix::FxKind::kReverb);
+  mix::config_set_channel_insert_kind(g_desc_mod.mix, 2, mix::FxKind::kFilter);
   mix::macro_describe(nullptr, &g_desc_mod, 1, 128, b, sizeof b);
   CHECK(strcmp(b,
                "Macro 1 (absolute), input 128: Pan [all] -> 0.50, "
-               "Send 2 param 1 [global] -> 0.25, "
-               "Insert param 1 [ch2] -> 0.50") == 0);
+               "Send 2 (Reverb) Damping [global] -> 0.25, "
+               "Insert (Filter) Cutoff [ch2] -> 0.50") == 0);
 
-  // A delta macro is a slide, so its targets read as per-tick steps.
+  // A delta macro is a slide, so its targets read as per-tick steps -- and a send level
+  // target names the effect that send holds.
   mix::macro_describe(&g_mixer, &g_desc_mod, 2, 200, b, sizeof b);
-  CHECK(strcmp(b, "Macro 2 (delta), input 200: Send 2 level [self] "
+  CHECK(strcmp(b, "Macro 2 (delta), input 200: Send 2 (Reverb) level [self] "
                   "-0.10/tick") == 0);
 
   // Reached through the entry point, which is how an editor gets here: a meta
@@ -4921,6 +4958,7 @@ main(void) {
   test_slot_slide_steps_a_shaper_through_its_kinds();
   test_describe_slot_params();
   test_describe_macro();
+  test_send_commands_name_their_effect();
   test_describe_command_space();
   test_fxpl_mnemonic();
   test_mnemonics_name_one_thing();

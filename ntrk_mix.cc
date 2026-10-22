@@ -2243,8 +2243,42 @@ slot_const_at(const Mixer *mx, int slot, int channel) {
   return nullptr;
 }
 
+// Where a slot's kind is read from. **A live mixer when the caller has one, else the module's
+// saved `MIXR` block** -- the same kinds, since the mixer is built from the block, and an editor
+// holds the module and never the audio thread's mixer. Both null is the index form.
+struct KindSource {
+  const Mixer *mx;
+  const Module *m;
+};
+
+static bool
+slot_kind_in(const KindSource &src, int slot, int channel, FxKind *kind) {
+  if (const Slot *s = slot_const_at(src.mx, slot, channel)) {
+    *kind = s->kind;
+    return true;
+  }
+  // A block the reader would refuse names no kind: `kNone` from it would read as "an empty
+  // slot", which is a claim about a tune that has no mixer config at all.
+  if (src.m == nullptr || !config_readable(src.m->mix))
+    return false;
+  if (slot >= kSlotSend && slot < kSlotSend + kSends) {
+    *kind = config_slot_kind(src.m->mix, slot);
+    return true;
+  }
+  const int mi = slot_master_index(slot);
+  if (mi >= 0) {
+    *kind = config_slot_kind(src.m->mix, kSends + mi);
+    return true;
+  }
+  if (slot == kSlotInsert && channel >= 0 && channel < kMaxChannels) {
+    *kind = config_channel_insert_kind(src.m->mix, channel);
+    return true;
+  }
+  return false;
+}
+
 static void
-slot_param_text(TextOut *t, const Mixer *mx, int slot, int param, int channel) {
+slot_param_text(TextOut *t, const KindSource &src, int slot, int param, int channel) {
   const char *sn = fxpl_slot_name(slot);
   if (sn != nullptr) {
     text_add(t, sn);
@@ -2253,15 +2287,16 @@ slot_param_text(TextOut *t, const Mixer *mx, int slot, int param, int channel) {
     text_int(t, (long) slot);
   }
 
-  const Slot *s = slot_const_at(mx, slot, channel);
+  FxKind kind = FxKind::kNone;
+  const bool known = slot_kind_in(src, slot, channel, &kind);
 
   const char *pn = nullptr;
-  if (s != nullptr) {
-    const char *kn = fx_kind_name(s->kind);
+  if (known) {
+    const char *kn = fx_kind_name(kind);
     text_add(t, " (");
     text_add(t, kn != nullptr ? kn : "unknown kind");
     text_add(t, ")");
-    pn = fx_param_name(s->kind, param);
+    pn = fx_param_name(kind, param);
   }
 
   if (pn != nullptr) {
@@ -2271,6 +2306,33 @@ slot_param_text(TextOut *t, const Mixer *mx, int slot, int param, int channel) {
     text_add(t, " param ");
     text_int(t, (long) param);
   }
+}
+
+// " (Reverb)" after a send's number when its kind is to hand, nothing when it is not.
+// **A level command names the effect it feeds**, because "Set send 2 level" is a sentence the
+// person has to look up, and the kind loaded in the slot is the answer. Unlike `slot_param_text`
+// the unresolved form stays the bare number: that is what the format knows, said once.
+static void
+text_send_kind(TextOut *t, const KindSource &src, int send) {
+  FxKind kind = FxKind::kNone;
+  if (!slot_kind_in(src, kSlotSend + send, -1, &kind))
+    return;
+  const char *kn = fx_kind_name(kind);
+  text_add(t, " (");
+  text_add(t, kn != nullptr ? kn : "unknown kind");
+  text_add(t, ")");
+}
+
+// "Set send 2 (Reverb) level" / "Send 2 (Reverb) slide": **the one wording**, for the status
+// line and the completion list both.
+static void
+send_command_text(TextOut *t, const KindSource &src, int cmd) {
+  const bool slide = cmd >= kFxplSendSlide;
+  const int send = cmd - (slide ? kFxplSendSlide : kFxplSendSet);
+  text_add(t, slide ? "Send " : "Set send ");
+  text_int(t, (long) (send + 1));
+  text_send_kind(t, src, send);
+  text_add(t, slide ? " slide" : " level");
 }
 
 // The mixer range's "parameter zero means the last one" memory, said rather
@@ -2341,11 +2403,17 @@ macro_describe(const Mixer *mx, const Module *m, int macro, int input,
       // Only a scope naming one channel can resolve an insert's kind; "all" and
       // "self" reach several slots or none, so the index form is the honest
       // answer for both.
-      slot_param_text(&t, mx, slot, param,
+      slot_param_text(&t, KindSource{mx, m}, slot, param,
                       mt.scope < (uint8_t) kMaxChannels ? (int) mt.scope : -1);
     } else {
       const char *vn = fxpl_value_name((int) mt.target);
-      if (vn != nullptr) {
+      if (mt.target >= kFxplSend && mt.target < kFxplSend + kSends) {
+        // The kind goes after the number, as a send level command's does.
+        text_add(&t, "Send ");
+        text_int(&t, (long) (mt.target - kFxplSend + 1));
+        text_send_kind(&t, KindSource{mx, m}, mt.target - kFxplSend);
+        text_add(&t, " level");
+      } else if (vn != nullptr) {
         text_add(&t, vn);
       } else {
         text_add(&t, "target 0x");
@@ -2484,7 +2552,7 @@ fxpl_describe(const Mixer *mx, const Module *m, int channel, FxCell cell,
   int param = 0;
   bool slide = false;
   if (fxpl_slot_decode(cmd, &slot, &param, &slide)) {
-    slot_param_text(&t, mx, slot, param, channel);
+    slot_param_text(&t, KindSource{mx, m}, slot, param, channel);
     if (slide) {
       text_char(&t, ' ');
       text_step(&t, cell.param);
@@ -2507,16 +2575,12 @@ fxpl_describe(const Mixer *mx, const Module *m, int channel, FxCell cell,
   }
 
   if (cmd >= kFxplSendSet && cmd < kFxplSendSet + kSends) {
-    text_add(&t, "Set send ");
-    text_int(&t, (long) (cmd - kFxplSendSet + 1));
-    text_add(&t, " level");
+    send_command_text(&t, KindSource{mx, m}, cmd);
     text_mixer_value(&t, cell.param, false);
     return t.len;
   }
   if (cmd >= kFxplSendSlide && cmd < kFxplSendSlide + kSends) {
-    text_add(&t, "Send ");
-    text_int(&t, (long) (cmd - kFxplSendSlide + 1));
-    text_add(&t, " slide");
+    send_command_text(&t, KindSource{mx, m}, cmd);
     text_mixer_value(&t, cell.param, true);
     return t.len;
   }
@@ -2580,7 +2644,7 @@ static const int kMetaSlotIds[kMixrFxSlots] = {kSlotSend + 0, kSlotSend + 1, kSl
 static const int kMetaSetCount = kMixrFxSlots * 8;
 
 static bool
-command_from_row(Lane lane, const CmdInfo &row, CommandInfo *out) {
+command_from_row(Lane lane, const CmdInfo &row, const KindSource &src, CommandInfo *out) {
   out->lane = lane;
   out->cmd = row.cmd;
   for (int i = 0; i < 3; ++i)
@@ -2588,7 +2652,10 @@ command_from_row(Lane lane, const CmdInfo &row, CommandInfo *out) {
   out->mnemonic[3] = '\0';
   TextOut t;
   text_init(&t, out->name, sizeof out->name);
-  text_add(&t, row.name);
+  if (lane != Lane::NoteEffect && row.cmd >= kFxplSendSet && row.cmd < kFxplSendSlide + kSends)
+    send_command_text(&t, src, row.cmd);     // names the effect the send holds
+  else
+    text_add(&t, row.name);
   out->shape = row.shape;
   out->choice_count = row.choice_count;
   out->choice = row.choice;
@@ -2599,7 +2666,7 @@ command_from_row(Lane lane, const CmdInfo &row, CommandInfo *out) {
 // **The name is `slot_param_text`'s, called rather than copied**, so the
 // completion list and the status bar say the same words about the same cell.
 static bool
-command_slot_fill(Lane lane, uint8_t cmd, const Mixer *mx, CommandInfo *out,
+command_slot_fill(Lane lane, uint8_t cmd, const KindSource &src, CommandInfo *out,
                   int channel) {
   static const char *const kShapeKinds[4] = {"warm", "crunch", "tape", "fold"};
   static const char *const kFilterModes[3] = {"lowpass", "highpass",
@@ -2621,15 +2688,15 @@ command_slot_fill(Lane lane, uint8_t cmd, const Mixer *mx, CommandInfo *out,
   slot_cmd_mnemonic(cmd, out->mnemonic);
   TextOut t;
   text_init(&t, out->name, sizeof out->name);
-  slot_param_text(&t, mx, slot, param, channel);
+  slot_param_text(&t, src, slot, param, channel);
   out->shape = ParamShape::Continuous;
   out->choice_count = 0;
   out->choice = nullptr;
 
-  const Slot *s = slot_const_at(mx, slot, channel);
-  if (s == nullptr)
+  FxKind kind = FxKind::kNone;
+  if (!slot_kind_in(src, slot, channel, &kind))
     return true;      // no kind to hand: a byte is all the format itself knows
-  if (fx_param_name(s->kind, param) == nullptr) {
+  if (fx_param_name(kind, param) == nullptr) {
     // A spare index of a known kind, or a slot switched off. Nothing reads the
     // byte, and `Unused` says so rather than offering a range that does nothing.
     out->shape = ParamShape::Unused;
@@ -2641,15 +2708,15 @@ command_slot_fill(Lane lane, uint8_t cmd, const Mixer *mx, CommandInfo *out,
   // wrong thing to offer for the step that does it.
   if (slide)
     return true;
-  if (s->kind == FxKind::kShape && param == 0) {
+  if (kind == FxKind::kShape && param == 0) {
     out->shape = ParamShape::Choice;
     out->choice_count = 4;
     out->choice = kShapeKinds;
-  } else if (s->kind == FxKind::kFilter && param == 0) {
+  } else if (kind == FxKind::kFilter && param == 0) {
     out->shape = ParamShape::Choice;
     out->choice_count = 3;
     out->choice = kFilterModes;
-  } else if (s->kind == FxKind::kDelay && param == 4) {
+  } else if (kind == FxKind::kDelay && param == 4) {
     out->shape = ParamShape::Choice;
     out->choice_count = 2;
     out->choice = kOnOff;
@@ -2673,24 +2740,22 @@ command_count(Lane lane) {
   return 0;
 }
 
-bool
-command_at(Lane lane, int index, const Mixer *mx, CommandInfo *out,
-           int channel) {
+static bool
+command_at_src(Lane lane, int index, const KindSource &src, CommandInfo *out, int channel) {
   if (out == nullptr || index < 0 || index >= command_count(lane))
     return false;
 
   if (lane == Lane::NoteEffect)
-    return command_from_row(lane, note_fx_table(nullptr)[index], out);
+    return command_from_row(lane, note_fx_table(nullptr)[index], src, out);
 
   if (lane == Lane::PlaneChannel) {
     int n = 0;
     const CmdInfo *tab = plane_fixed_table(&n);
     if (index < n)
-      return command_from_row(lane, tab[index], out);
+      return command_from_row(lane, tab[index], src, out);
     const int k = index - n;                 // 0..7 the sets, 8..15 the slides
     const int base = k < 8 ? kFxplSlotSet : kFxplSlotSlide - 8;
-    return command_slot_fill(lane, (uint8_t) (base + kSlotInsert * 8 + k), mx,
-                             out, channel);
+    return command_slot_fill(lane, (uint8_t) (base + kSlotInsert * 8 + k), src, out, channel);
   }
 
   // Meta: every global slot's eight sets in slot order, then its eight slides.
@@ -2701,17 +2766,17 @@ command_at(Lane lane, int index, const Mixer *mx, CommandInfo *out,
     return false;
   return command_slot_fill(lane,
                            (uint8_t) ((slide ? kFxplSlotSlide : kFxplSlotSet) + id * 8 + k % 8),
-                           mx, out, channel);
+                           src, out, channel);
 }
 
-bool
-command_lookup(Lane lane, uint8_t cmd, const Mixer *mx, CommandInfo *out,
-               int channel) {
+static bool
+command_lookup_src(Lane lane, uint8_t cmd, const KindSource &src, CommandInfo *out,
+                   int channel) {
   if (out == nullptr)
     return false;
   if (lane != Lane::NoteEffect && cmd >= (uint8_t) kFxplSlotSet &&
       cmd < (uint8_t) kFxplSlotEnd)
-    return command_slot_fill(lane, cmd, mx, out, channel);
+    return command_slot_fill(lane, cmd, src, out, channel);
   // **A meta lane's bytes below 0x40 are macro indices, not commands.** A
   // macro's name and targets belong to the module, so there is no row to find
   // and `macro_describe` is what reads one.
@@ -2723,9 +2788,29 @@ command_lookup(Lane lane, uint8_t cmd, const Mixer *mx, CommandInfo *out,
       lane == Lane::NoteEffect ? note_fx_table(&n) : plane_fixed_table(&n);
   for (int i = 0; i < n; ++i) {
     if (tab[i].cmd == cmd)
-      return command_from_row(lane, tab[i], out);
+      return command_from_row(lane, tab[i], src, out);
   }
   return false;
+}
+
+bool
+command_at(Lane lane, int index, const Mixer *mx, CommandInfo *out, int channel) {
+  return command_at_src(lane, index, KindSource{mx, nullptr}, out, channel);
+}
+
+bool
+command_at_in(Lane lane, int index, const Module *m, CommandInfo *out, int channel) {
+  return command_at_src(lane, index, KindSource{nullptr, m}, out, channel);
+}
+
+bool
+command_lookup(Lane lane, uint8_t cmd, const Mixer *mx, CommandInfo *out, int channel) {
+  return command_lookup_src(lane, cmd, KindSource{mx, nullptr}, out, channel);
+}
+
+bool
+command_lookup_in(Lane lane, uint8_t cmd, const Module *m, CommandInfo *out, int channel) {
+  return command_lookup_src(lane, cmd, KindSource{nullptr, m}, out, channel);
 }
 
 size_t
