@@ -31,7 +31,9 @@ function updateState(s) {
 function adopt(result,name) {
   const decoder=new TextDecoder();
   result.instruments=result.instruments.map(ins=>({name:decoder.decode(ins.nameBytes),volume:ins.volume}));
-  m.snapshot=result;m.state=result.state;m.order=m.row=m.channel=m.field=0;m.nibble='';
+  // Keep this load's channel list stable through edits, including clearing its
+  // final cell. Reopening recomputes usage without changing the stored channels.
+  m.snapshot=result;m.state=result.state;m.order=m.row=m.field=0;m.channel=result.channels[0];m.nibble='';
   m.instrument=m.state[4]?1:0;m.name=name;m.dirty=false;
   view.sx=view.sy=view.orderScroll=view.insScroll=0;
   document.title=`ntrk · ${name}`;view.invalidate();
@@ -102,16 +104,16 @@ canvas.addEventListener('keydown',event=>{
   }
   if(['arrowup','arrowdown','arrowleft','arrowright','pageup','pagedown','home','end','tab'].includes(key)) {
     event.preventDefault();m.nibble='';
-    const rows=m.state[1],channels=m.state[0];
+    const rows=m.state[1],ids=m.snapshot.channels,channels=ids.length,slot=ids.indexOf(m.channel);
     if(key==='arrowup')m.row=(m.row+rows-1)%rows;
     if(key==='arrowdown')m.row=(m.row+1)%rows;
     if(key==='pageup')m.row=Math.max(0,m.row-16);
     if(key==='pagedown')m.row=Math.min(rows-1,m.row+16);
     if(key==='home')m.row=0;if(key==='end')m.row=rows-1;
-    if(key==='tab')m.channel=(m.channel+channels+(event.shiftKey?-1:1))%channels;
+    if(key==='tab')m.channel=ids[(slot+channels+(event.shiftKey?-1:1))%channels];
     if(key==='arrowleft'||key==='arrowright') {
-      const pos=(m.channel*4+m.field+(key==='arrowleft'?channels*4-1:1))%(channels*4);
-      m.channel=Math.floor(pos/4);m.field=pos%4;
+      const pos=(slot*4+m.field+(key==='arrowleft'?channels*4-1:1))%(channels*4);
+      m.channel=ids[Math.floor(pos/4)];m.field=pos%4;
     }
     view.reveal();return;
   }

@@ -118,16 +118,6 @@ try {
   await cell(2,0,0);await page.keyboard.press('Enter');await wait(()=>!view.m.busy&&view.m.row===3);assert.equal(await value(2,0,0),97);
   await cell(3,0,3);await page.keyboard.press('Delete');await wait(()=>!view.m.busy&&view.m.row===4);assert.equal(await value(3,0,3),0);
   await cell(4,0,1);await page.keyboard.type('ff');await wait(()=>!view.m.busy);assert.match((await model()).message,/out of range/);
-  // Wheel and pointer scrollbars both address real geometry; scrolling does not edit.
-  const scrollStart=await pixels('grid');
-  await page.mouse.move(600,330);await page.mouse.wheel(230,240);await wait(()=>view.sx>0&&view.sy>0);
-  assert.notEqual((await pixels('grid')).hash,scrollStart.hash);
-  const target=await page.evaluate(()=>{const b=view.xbar;return {x:b.r.x+b.r.w-10,y:b.r.y+5};});
-  await click(target.x,target.y);await wait(()=>view.sx>800);
-  const c=await page.evaluate(()=>Math.ceil(view.sx/view.channelW));
-  const r=await page.evaluate(()=>Math.ceil(view.sy/view.pitch));
-  await cell(r,c,2);await page.keyboard.press('Home');await page.keyboard.press('ArrowLeft');
-  await wait(()=>view.m.row===0&&view.sy===0);
   // Drawn Help is modal, scrollable, and leaves cells intact.
   const headerBefore=await pixels('header');await button('help');await wait(()=>view.m.help);
   assert.notEqual((await pixels('header')).hash,headerBefore.hash);
@@ -151,6 +141,65 @@ try {
   await button('demo');await wait(()=>!!view.m.confirm);await click(367,123);
   await wait(()=>view.m.name===document.title.slice(7)&&view.m.name!=='edited.ntrk');
   assert.equal((await model()).name,demoName);assert.deepEqual(await download(),initialBytes);
+  const fixtureRoot=fileURLToPath(new URL('../out/web-fixtures/',import.meta.url));
+  const loadBytes=async(name,buffer)=>{
+    await page.locator('#open').setInputFiles({name,mimeType:'application/octet-stream',buffer});
+    await page.waitForFunction(name=>!view.m.busy&&view.m.name===name,name);
+    assert.equal((await model()).name,name);
+    await page.evaluate(()=>new Promise(requestAnimationFrame));
+  };
+  const loadFixture=async name=>loadBytes(name+'.ntrk',await readFile(path.join(fixtureRoot,name+'.ntrk')));
+  const visible=()=>page.evaluate(()=>view.m.snapshot.channels);
+  assert.deepEqual(await visible(),demo?[0,1,2,3]:[0,1,2]);
+  await loadFixture('sparse');
+  assert.deepEqual(await visible(),[0,3,11,14]);
+  assert.equal((await snapshot()).usedMask,(1<<0)|(1<<3)|(1<<11)|(1<<14));
+  assert.deepEqual(await page.evaluate(()=>view.hits.filter(h=>h.id.startsWith('mute')).map(h=>h.id)),['mute0','mute3','mute11','mute14']);
+  assert.equal(await value(0,14,0),0,'FXPL-only track has no primary note');
+  if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.sparse.png'});
+  assert(await page.evaluate(()=>['CH 01','CH 04','CH 0C','CH 0F'].every(label=>painted.includes(label))),'original IDs drawn compactly');
+  await cell(0,3,1);await page.keyboard.type('02');await wait(()=>!view.m.busy&&view.m.row===1);
+  assert.equal(await value(0,3,1),2);assert.equal(await value(0,1,1),0,'compact slot never edits its numeric slot index');
+  await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>view.m.channel),11);
+  await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>view.m.channel),14);
+  await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>view.m.channel),0);
+  await page.keyboard.press('Shift+Tab');assert.equal(await page.evaluate(()=>view.m.channel),14);
+  await cell(0,3,3);await page.keyboard.press('ArrowRight');
+  assert.deepEqual(await page.evaluate(()=>[view.m.channel,view.m.field]),[11,0]);
+  await page.keyboard.press('ArrowLeft');assert.deepEqual(await page.evaluate(()=>[view.m.channel,view.m.field]),[3,3]);
+  const sparseMute=await page.evaluate(()=>({x:view.cell(0,11,0).x+35,y:view.grid.y-14}));
+  await click(sparseMute.x,sparseMute.y);await wait(()=>view.m.state[11]===(1<<11));
+  assert.equal((await page.evaluate(()=>engineCommand('state')))[11],1<<11);
+  // Clearing a track's only cell must not make the cursor jump or strand it.
+  await cell(0,0,0);await page.keyboard.press('Delete');await wait(()=>!view.m.busy&&view.m.row===1);
+  assert.deepEqual(await visible(),[0,3,11,14]);assert.equal(await page.evaluate(()=>view.m.channel),0);
+  const sparseSaved=await download();await loadBytes('sparse-cleared.ntrk',sparseSaved);
+  assert.deepEqual(await visible(),[3,11,14]);assert.equal(await page.evaluate(()=>view.m.channel),3,'new load clamps cursor to first visible original ID');
+  assert.equal(await value(0,3,1),2);assert.equal((await model()).state[0],16);
+  await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>view.m.channel),11);
+  await page.keyboard.press('Shift+Tab');assert.equal(await page.evaluate(()=>view.m.channel),3);
+  assert.deepEqual(await download(),sparseSaved,'save keeps original channel count, FXPL and unreferenced patterns');
+  await loadFixture('empty');assert.deepEqual(await visible(),[0]);assert.equal((await snapshot()).usedMask,0);
+  assert.equal((await model()).state[0],16,'empty module keeps its actual channel count');
+  const emptyBlank=await page.evaluate(()=>({x:view.raster.x+view.channelW+30,y:view.grid.y+10}));
+  await click(emptyBlank.x,emptyBlank.y);assert.equal(await page.evaluate(()=>view.m.channel),0,'empty raster space is not an unused channel');
+  await cell(0,0,0);await page.keyboard.press('x');await wait(()=>!view.m.busy&&view.m.row===1);assert.equal(await value(0,0,0),15);
+  await cell(0,0,0);await page.keyboard.press('Delete');await wait(()=>!view.m.busy&&view.m.row===1);
+  await cell(0,0,1);await page.keyboard.press('Delete');await wait(()=>!view.m.busy&&view.m.row===1);
+  assert.equal((await snapshot()).usedMask,0);assert.deepEqual(await visible(),[0]);
+  await download();await loadFixture('wide');assert.deepEqual(await visible(),[0,1,3,4,6,7,9,11,13,15]);
+  // Wheel and pointer scrollbars both address real geometry; scrolling does not edit.
+  const scrollStart=await pixels('grid');
+  await page.mouse.move(600,330);await page.mouse.wheel(230,240);await wait(()=>view.sx>0&&view.sy>0);
+  assert.notEqual((await pixels('grid')).hash,scrollStart.hash);
+  const target=await page.evaluate(()=>{const b=view.xbar;return {x:b.r.x+b.r.w-10,y:b.r.y+5};});
+  await click(target.x,target.y);await wait(()=>view.sx>view.maxX*.8);
+  const c=await page.evaluate(()=>view.m.snapshot.channels[Math.ceil(view.sx/view.channelW)]);
+  const r=await page.evaluate(()=>Math.ceil(view.sy/view.pitch));
+  await cell(r,c,2);await page.keyboard.press('Home');await page.keyboard.press('ArrowLeft');
+  await wait(()=>view.m.row===0&&view.sy===0);
+  await button('demo');await wait(()=>view.m.name===document.title.slice(7)&&!view.m.name.endsWith('.ntrk'));
+  assert.deepEqual(await visible(),demo?[0,1,2,3]:[0,1,2]);
   if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.desktop.png'});
   await page.setViewportSize({width:390,height:844});await wait(()=>view.w===390);
   assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
@@ -161,8 +210,9 @@ try {
   await click(328,31);await wait(()=>!view.m.help);
   const mobileHeader=await page.evaluate(()=>({x:view.raster.x+25,y:view.grid.y-13}));
   await click(mobileHeader.x,mobileHeader.y);await wait(()=>!!(view.m.state[11]&1));
+  await loadFixture('wide');
   await page.mouse.move(250,400);await page.mouse.wheel(360,220);await wait(()=>view.sx>0&&view.sy>0);
-  const mobileC=await page.evaluate(()=>Math.ceil(view.sx/view.channelW)),mobileR=await page.evaluate(()=>Math.ceil(view.sy/view.pitch));
+  const mobileC=await page.evaluate(()=>view.m.snapshot.channels[Math.ceil(view.sx/view.channelW)]),mobileR=await page.evaluate(()=>Math.ceil(view.sy/view.pitch));
   await cell(mobileR,mobileC,0);
   // Touch-style pointer drag pans without changing the selected cell.
   const selected=await page.evaluate(()=>[view.m.row,view.m.channel,view.m.field]);
@@ -170,7 +220,9 @@ try {
   assert.deepEqual(await page.evaluate(()=>[view.m.row,view.m.channel,view.m.field]),selected);
   if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.mobile-scrolled.png'});
   await click(54,114);await wait(()=>view.m.follow);await click(54,114);await wait(()=>!view.m.follow);
+  await button('demo');await wait(()=>!view.m.name.endsWith('.ntrk'));
   await page.evaluate(()=>{view.sx=view.sy=0;view.invalidate();});await cell(0,0,0);
+  assert.deepEqual(await visible(),demo?[0,1,2,3]:[0,1,2]);
   if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.mobile.png'});
   if(demo) {
     await page.route(`**/${demo.url}`,route=>route.fulfill({status:404,body:'missing'}));
@@ -184,7 +236,7 @@ try {
     assert(await failed.evaluate(()=>!failedView.hits.some(h=>h.id==='play')));await failed.close();
   }
   await page.evaluate(()=>testContext.close());assert.deepEqual(errors,[]);
-  console.log(`browser: ${demoName}; exact demo bytes; real worklet peak ${peak.toFixed(3)}; canvas pixels/DPR; pointer fields/mutes/orders/instruments/steppers; keyboard edits/bounds; save/reopen; failed loads; modal help/discard; wheel/scrollbars/pan; desktop/mobile resize/focus passed`);
+  console.log(`browser: ${demoName}; exact demo bytes; real worklet peak ${peak.toFixed(3)}; canvas pixels/DPR; pointer fields/mutes/orders/instruments/steppers; keyboard edits/bounds; save/reopen; failed loads; modal help/discard; sparse IDs/FXPL-only/meta-only/empty/stable visibility; wide fixture wheel/scrollbars/pan; desktop/mobile resize/focus passed`);
 } finally {
   if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));
 }

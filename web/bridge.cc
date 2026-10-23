@@ -115,6 +115,28 @@ int web_save() {
   return ntrk::module_save(&song, web_input(), kFileCap, &size) ? static_cast<int>(size) : 0;
 }
 
+// Musical use across every stored pattern, including patterns outside the order
+// list. Mixer defaults and row-wide meta automation do not occupy a channel.
+int web_used_channels() {
+  unsigned mask = 0;
+  for (int p = 0; p < song.pattern_count; ++p) {
+    for (int r = 0; r < song.rows; ++r) {
+      for (int c = 0; c < song.channels; ++c) {
+        const auto &note = song.patterns[(p * song.rows + r) * song.channels + c];
+        bool used = note.note || note.instrument || note.effect || note.param;
+        if (song.fx) {
+          const auto *fx = song.fx + (p * song.rows + r) * ntrk::module_lanes(&song)
+                                  + c * song.fx_columns;
+          for (int col = 0; col < song.fx_columns; ++col)
+            used = used || fx[col].cmd || fx[col].param;
+        }
+        if (used) mask |= 1u << c;
+      }
+    }
+  }
+  return static_cast<int>(mask);
+}
+
 // Fixed numeric metadata ABI, consumed by engine.js.
 int web_info(int field) {
   switch (field) {

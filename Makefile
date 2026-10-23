@@ -113,7 +113,7 @@ WEB_OUT := $(OUT)/web
 # Optional host-owned song. No parent checkout dependency in the standalone build.
 WEB_DEMO ?=
 WEB_DEMO_NAME ?=
-WEB_EXPORTS := web_capacity web_input web_patterns web_orders web_audio web_demo web_load web_save web_info web_edit web_transport web_mute web_render web_instrument_name web_instrument_volume
+WEB_EXPORTS := web_capacity web_input web_patterns web_orders web_audio web_demo web_load web_save web_info web_edit web_transport web_mute web_render web_instrument_name web_instrument_volume web_used_channels
 .PHONY: web test-web
 web: $(WEB_OUT)/ntrk.wasm $(addprefix $(WEB_OUT)/,index.html style.css app.js canvas.js engine.js worklet.js) web-demo
 
@@ -140,4 +140,5 @@ $(OUT)/test_web: web/bridge_tests.cc web/bridge.cc $(HDRS) $(LIB_CC)
 	$(CXX) $(CXXFLAGS) -Werror -O2 -I. -o $@ web/bridge_tests.cc
 
 test-web: $(OUT)/test_web
-	$(OUT)/test_web
+	@mkdir -p $(OUT)/web-fixtures
+	$(OUT)/test_web $(OUT)/web-fixtures

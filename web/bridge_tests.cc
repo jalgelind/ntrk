@@ -2,8 +2,66 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <algorithm>
 
-int main() {
+void save_fixture(const char *directory, const char *name, int mask) {
+  assert(web_used_channels() == mask);
+  const int size = web_save(); assert(size > 0);
+  const std::vector<uint8_t> before(web_input(), web_input() + size);
+  if (directory) {
+    const std::string path = std::string(directory) + "/" + name + ".ntrk";
+    FILE *file = std::fopen(path.c_str(), "wb"); assert(file);
+    assert(std::fwrite(before.data(), 1, before.size(), file) == before.size());
+    assert(std::fclose(file) == 0);
+  }
+  assert(web_load(size) && web_info(0) == 16 && web_used_channels() == mask);
+  assert(web_save() == size && !std::memcmp(before.data(), web_input(), size));
+}
+
+void test_channel_usage(const char *directory) {
+  assert(web_demo(48000) && web_used_channels() == 7);
+  std::memset(notes, 0, sizeof(ntrk::Note) * 2 * 32 * song.channels);
+  assert(web_used_channels() == 0); // Default gain/pan are not musical use.
+  // Every primary byte matters, including a parameter with no command.
+  for (int field = 0; field < 4; ++field) {
+    assert(web_edit(1, 31, 8, field, 1)); assert(web_used_channels() == (1 << 8));
+    assert(web_edit(1, 31, 8, field, 0)); assert(web_used_channels() == 0);
+  }
+  song.fx_columns = 2; song.meta_columns = 1; song.macro_count = 1;
+  std::vector<ntrk::FxCell> fx(2 * 32 * ntrk::module_lanes(&song));
+  song.fx = fx.data();
+  // Row-wide macro automation must not turn every track into a used track.
+  fx[16 * 2].cmd = 1; fx[16 * 2].param = 64;
+  assert(web_used_channels() == 0);
+  save_fixture(directory, "empty", 0);
+
+  // The second pattern is stored but not referenced by the order list.
+  assert(web_demo(48000));
+  std::memset(notes, 0, sizeof(ntrk::Note) * 2 * 32 * song.channels);
+  song.order_count = 1; song.hidden_channels = 0xffff;
+  notes[0].note = 25;
+  notes[3].instrument = 1;
+  notes[(1 * 32 + 31) * 16 + 11].param = 127;
+  song.fx_columns = 2; song.meta_columns = 1; song.macro_count = 1;
+  std::fill(fx.begin(), fx.end(), ntrk::FxCell()); song.fx = fx.data();
+  const int automation = (1 * 32 + 31) * ntrk::module_lanes(&song) + 14 * 2 + 1;
+  fx[automation].param = 64; assert(web_used_channels() == ((1<<0)|(1<<3)|(1<<11)|(1<<14)));
+  fx[automation].param = 0; fx[automation].cmd = ntrk::mix::kFxplSendSet;
+  fx[16 * 2].cmd = 1; fx[16 * 2].param = 64;
+  save_fixture(directory, "sparse", (1<<0)|(1<<3)|(1<<11)|(1<<14));
+
+  assert(web_demo(48000));
+  std::memset(notes, 0, sizeof(ntrk::Note) * 2 * 32 * song.channels);
+  int mask = 0;
+  for (int channel : {0, 1, 3, 4, 6, 7, 9, 11, 13, 15}) {
+    notes[channel].note = 25; mask |= 1 << channel;
+  }
+  save_fixture(directory, "wide", mask);
+  std::puts("web channel usage: primary fields, sparse IDs, unreferenced patterns, multi-column FXPL, meta exclusion, empty/default mixer, exact save/load passed");
+}
+
+int main(int argc, char **argv) {
   assert(!web_demo(0));
   assert(web_demo(48000));
   assert(web_info(0) == ntrk::kMaxChannels && web_info(1) == 32 && web_info(3) == 2);
@@ -86,5 +144,6 @@ int main() {
   assert(web_load(static_cast<int>(with_samples.size())));
   assert(web_save() == static_cast<int>(with_samples.size()));
   assert(!std::memcmp(with_samples.data(), web_input(), with_samples.size()));
+  test_channel_usage(argc > 1 ? argv[1] : nullptr);
   std::puts("web bridge: bounds, roundtrip, transactional load, transport, mute, finite audio, effect allocation passed");
 }

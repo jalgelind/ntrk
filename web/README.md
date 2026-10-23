@@ -44,7 +44,7 @@ or music asset is required for the standalone build.
 
 By default the original, generated **Night circuit** demo opens without
 shipping a music asset. It has two 32-row patterns, a bass, kick and hat, with
-the remaining channels free for editing. Press Play to resume the browser's
+only those three populated tracks shown. Press Play to resume the browser's
 audio context through a user gesture. Pause holds voices and timing; Stop
 silences tails and rewinds. Playback loops at the module's restart order.
 The order/row display follows the sequencer with a 40 ms polling interval,
@@ -67,8 +67,16 @@ settings and editor metadata are carried through even though this small page
 only edits the four primary cell fields. Files using unsupported format
 versions are refused by the same loader as native ntrk. MOD/XM import,
 instrument creation, undo, structural pattern/order editing and persistent
-browser storage are outside this editor's scope. All sixteen channels are
-shown, including channels hidden by other editors.
+browser storage are outside this editor's scope. Track visibility comes from
+primary note, instrument,
+effect or parameter cells and channel FXPL data across all stored patterns,
+including patterns outside the order list. Mixer gain/pan defaults and meta
+lanes do not mark tracks used. The grid compacts used tracks while preserving
+their original numbers and full stored channel data, regardless of visibility
+settings from other editors. The visible list stays fixed until loading a file
+or demo, so clearing a track's last cell leaves it editable. Reopening recomputes
+the list and places the cursor on its first track. An empty song shows track 01.
+Adding another unused track is outside this editor's scope.
 
 All visible controls, lists, status, help and discard confirmation are drawn on one
 canvas; HTML only hosts the canvas and hidden local file plumbing. The row gutter
@@ -98,7 +106,8 @@ worklet owner. The canvas host never touches live WASM state.
 `make test-web` checks the same bridge natively: bounds and defaults, failed
 load preservation, repeated save/load, note-off, transport/seek, mute, effect
 memory, and finite non-silent generated audio. `make test` runs ntrk's existing
-native suite. With a local Playwright installation and Chromium, run the
+native suite. `make test-web` also generates sparse, wide and meta-only empty
+module fixtures under `out/web-fixtures/` for the browser checks. With a local Playwright installation and Chromium, run the
 browser smoke test (the script starts and terminates its own server/browser):
 
 ```sh
@@ -107,7 +116,8 @@ NTRK_PLAYWRIGHT=/absolute/path/to/node_modules/playwright node web/browser_test.
 
 It checks real worklet audio, editing, transport, order selection, mutes,
 downloads and reopening, rejected files, canvas pixels/DPR, actual pointer hit
-geometry, help, focus, scrolling and narrow-window resizing. Test logs and
+geometry, sparse channel IDs, automation-only tracks, empty songs, help, focus,
+scrolling and narrow-window resizing. Test logs and
 screenshots belong outside Git. The page requires a modern browser with
 WebAssembly, ES modules, Web Audio and AudioWorklet. Only Chromium is covered
 by the automated browser check; Safari/Firefox and mobile audio need manual

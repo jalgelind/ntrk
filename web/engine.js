@@ -20,7 +20,11 @@ export class Engine {
       return {nameBytes: bytes.subarray(0, end < 0 ? bytes.length : end).slice(),
         volume: this.api.web_instrument_volume(i + 1)};
     });
-    return {state, instruments,
+    const usedMask = this.api.web_used_channels();
+    const channels = Array.from({length: state[0]}, (_, c) => c).filter(c => usedMask & (1 << c));
+    // An empty song still needs a place to enter its first note.
+    if (!channels.length) channels.push(0);
+    return {state, instruments, usedMask, channels,
       orders: new Uint8Array(this.api.memory.buffer, this.api.web_orders(), state[3]).slice(),
       cells: new Uint8Array(this.api.memory.buffer, this.api.web_patterns(),
         state[0] * state[1] * state[2] * 4).slice()};

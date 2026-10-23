@@ -14,7 +14,7 @@ const help = [
   ['PATTERN EDITING', 'Click a field; arrows move the cursor. Page Up / Down move 16 rows. Home / End jump to the first / last row. Tab moves between channels. Enable Edit to write. Successful entries advance one row.'],
   ['PIANO KEYS', 'Z S X D C V G B H N J M = one octave. Q 2 W 3 E R 5 T 6 Y 7 U = the next. Octave and instrument controls set note entry. Enter writes note-off. Delete / Backspace clears a field. Notes are not auditioned while stopped.'],
   ['HEX FIELDS', 'Instrument, effect and parameter take two hexadecimal digits. Values outside the module range are refused. Only the four primary cell fields are editable here.'],
-  ['NAVIGATION', 'Order rows browse a pattern and seek playback, disabling Follow. Follow tracks the playing row. Click a channel header to mute monitoring (not saved). Wheel or drag the scrollbars to scroll; Shift + wheel scrolls channels. Touch-drag the pattern to pan. Lists scroll separately.'],
+  ['NAVIGATION', 'Order rows browse a pattern and seek playback, disabling Follow. Follow tracks the playing row. Click a channel header to mute monitoring (not saved). Wheel or drag the scrollbars to scroll; Shift + wheel scrolls channels. Touch-drag the pattern to pan. Lists scroll separately. Only tracks with primary cells or channel automation are shown, keeping their original numbers. The track list stays fixed until another file or demo is loaded. An empty song keeps track 01 editable.'],
   ['INSTRUMENTS', 'Select a module instrument in the list to use it for note entry. Names and volume are read from the module. Unnamed slots are labeled explicitly. Parameters, secondary effect planes and mixer settings are preserved in files but have no editor here.'],
   ['LIMITATIONS', 'No MOD/XM import, undo, instrument creation, structural song editing or browser storage. Large file operations can interrupt audio: pause first. A hardware keyboard is needed for note entry on touch screens. F1 or Escape closes this help.'],
 ];
@@ -60,7 +60,7 @@ export class TrackerCanvas {
   // One field geometry, including its trailing gap, for both paint and selection.
   cell(r,c,f) {
     const offsets=[0,4,7,10],widths=[4,3,3,3];
-    return rect(this.grid.x+this.gutter+c*this.channelW+offsets[f]*this.advance-this.sx,
+    return rect(this.grid.x+this.gutter+this.m.snapshot.channels.indexOf(c)*this.channelW+offsets[f]*this.advance-this.sx,
       this.grid.y+r*this.pitch-this.sy,widths[f]*this.advance,this.pitch);
   }
   setEntry(id,value) {
@@ -75,7 +75,7 @@ export class TrackerCanvas {
   }
   limits() {
     const s=this.m.state;
-    this.maxX=Math.max(0,(s?.[0]||0)*this.channelW-this.raster.w);
+    this.maxX=Math.max(0,(this.m.snapshot?.channels.length||0)*this.channelW-this.raster.w);
     this.maxY=Math.max(0,(s?.[1]||0)*this.pitch-this.grid.h);
     this.sx=clamp(this.sx,this.maxX);this.sy=clamp(this.sy,this.maxY);
   }
@@ -100,7 +100,7 @@ export class TrackerCanvas {
     const buttons=[['open','Open',()=>this.action('open')],['save','Save',()=>this.action('save')],
       ['demo','Demo',()=>this.action('demo')],['help','? Help',()=>{m.help=!m.help;this.helpScroll=0;this.invalidate();}]];
     for(const [id,label,fn] of buttons) { this.button(id,label,rect(x,y,65,26),fn,id==='help'&&m.help,id==='help'||ready);x+=70; }
-    if(!narrow) this.label(s?`${s[0]} channels · ${s[1]} rows · ${s[4]} instruments`:'PATTERN EDITOR',rect(x+5,y,w-x-10,26),ink.dim,11);
+    if(!narrow) this.label(s?`${m.snapshot.channels.length} tracks · ${s[1]} rows · ${s[4]} instruments`:'PATTERN EDITOR',rect(x+5,y,w-x-10,26),ink.dim,11);
     y+=32;x=5;
     for(const [id,label,cmd] of [['play','Play',1],['pause','Pause',2],['stop','Stop',0]]) {
       this.button(id,label,rect(x,y,65,28),()=>this.action('transport',cmd),id==='play'&&!!s?.[8],ready);x+=70;
@@ -172,7 +172,7 @@ export class TrackerCanvas {
   pattern() {
     const m=this.m,s=m.state,g=this.grid;
     const firstRow=Math.floor(this.sy/this.pitch),lastRow=Math.min(s[1],Math.ceil((this.sy+g.h)/this.pitch));
-    const firstCh=Math.floor(this.sx/this.channelW),lastCh=Math.min(s[0],Math.ceil((this.sx+this.raster.w)/this.channelW));
+    const firstCh=Math.floor(this.sx/this.channelW),lastCh=Math.min(m.snapshot.channels.length,Math.ceil((this.sx+this.raster.w)/this.channelW));
     this.clip(g,()=>{
       for(let r=firstRow;r<lastRow;r++) {
         const y=g.y+r*this.pitch-this.sy;
@@ -183,7 +183,8 @@ export class TrackerCanvas {
       }
     });
     this.clip(this.raster,()=>{
-      for(let c=firstCh;c<lastCh;c++) {
+      for(let slot=firstCh;slot<lastCh;slot++) {
+        const c=m.snapshot.channels[slot];
         const muted=!!(s[11]&(1<<c));
         for(let r=firstRow;r<lastRow;r++) for(let f=0;f<4;f++) {
           const box=this.cell(r,c,f),v=m.snapshot.cells[((m.snapshot.orders[m.order]*s[1]+r)*s[0]+c)*4+f];
@@ -198,7 +199,8 @@ export class TrackerCanvas {
     const header=rect(this.raster.x,g.y-28,this.raster.w,27);
     this.fill(rect(g.x,g.y-28,g.w,27),ink.panel);this.label('ROW',rect(g.x,g.y-28,this.gutter,27),ink.dim,10);
     this.clip(header,()=>{
-      for(let c=firstCh;c<lastCh;c++) {
+      for(let slot=firstCh;slot<lastCh;slot++) {
+        const c=m.snapshot.channels[slot];
         const x=this.cell(0,c,0).x,muted=!!(s[11]&(1<<c));
         const b=rect(x,g.y-27,this.channelW-2,25);
         this.fill(b,muted?'#3a292b':ink.panel);this.label(`CH ${hex(c+1)}${muted?' MUTE':''}`,b,muted?ink.warn:ink.dim,11);
@@ -278,9 +280,10 @@ export class TrackerCanvas {
     const p=this.point(e),hit=this.at(p.x,p.y);
     if(hit&&hit.id===d.hit?.id)hit.fn();
     else if(!this.m.help&&!this.m.confirm&&!this.m.busy&&this.m.snapshot&&contains(this.raster,p.x,p.y)) {
-      const c=Math.floor((p.x-this.raster.x+this.sx)/this.channelW);
+      const slot=Math.floor((p.x-this.raster.x+this.sx)/this.channelW);
+      const c=this.m.snapshot.channels[slot];
       const r=Math.floor((p.y-this.grid.y+this.sy)/this.pitch);
-      if(c>=this.m.state[0]||r>=this.m.state[1])return;
+      if(c===undefined||r>=this.m.state[1])return;
       const local=p.x-this.cell(r,c,0).x;
       const f=local<4*this.advance?0:local<7*this.advance?1:local<10*this.advance?2:3;
       this.m.row=r;this.m.channel=c;this.m.field=f;this.m.nibble='';this.invalidate();
