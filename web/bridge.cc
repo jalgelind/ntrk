@@ -1,0 +1,167 @@
+// Standalone browser host. Only this adapter owns memory; ntrk stays a view.
+// Public domain / CC0, like ntrk. No browser headers or desktop dependencies.
+#include "../ntrk_unity.h"
+#include <cstring>
+#include <vector>
+
+namespace {
+const int kFileCap = 16 * 1024 * 1024;
+uint8_t files[2][kFileCap];
+int active = 0;
+ntrk::Module song;
+ntrk::Note notes[ntrk::kMaxPatterns * ntrk::kMaxRows * ntrk::kMaxChannels];
+ntrk::Player player;
+ntrk::mix::Mixer mixer;
+std::vector<float> tanks[ntrk::kMaxChannels + ntrk::mix::kSends + ntrk::kMixrMasterSlots];
+double audio[128 * 2];
+float rate = 48000;
+bool running = false;
+uint8_t demo_order[] = {0, 1};
+
+void reset() {
+  ntrk::player_start(&player, &song);
+  ntrk::mix::mixer_reset(&mixer);
+  ntrk::mix::fxpl_sync(&mixer, &player);
+}
+
+void configure() {
+  running = false;
+  mixer = ntrk::mix::Mixer();
+  ntrk::mix::mixer_config_read(&mixer, &song);
+  for (int i = 0; i < ntrk::kMaxChannels + ntrk::mix::kSends + ntrk::kMixrMasterSlots; ++i) {
+    auto *slot = i < ntrk::kMaxChannels ? &mixer.insert[i] :
+        i < ntrk::kMaxChannels + ntrk::mix::kSends ?
+        &mixer.send[i - ntrk::kMaxChannels] :
+        &mixer.master_fx[i - ntrk::kMaxChannels - ntrk::mix::kSends];
+    auto &mem = tanks[i];
+    if (slot->kind == ntrk::mix::FxKind::kDelay) {
+      size_t bytes = ntrk::fx::delay_bytes_needed(ntrk::mix::kSlotDelayMaxSeconds, rate);
+      mem.resize((bytes + sizeof(float) - 1) / sizeof(float));
+      ntrk::fx::delay_init(&slot->delay, mem.data(), bytes, rate,
+                           ntrk::mix::kSlotDelayMaxSeconds);
+    } else if (slot->kind == ntrk::mix::FxKind::kReverb) {
+      size_t bytes = ntrk::fx::reverb_bytes_needed(rate, ntrk::mix::kSlotPredelayMaxSeconds);
+      mem.resize((bytes + sizeof(float) - 1) / sizeof(float));
+      ntrk::fx::reverb_init(&slot->reverb, mem.data(), bytes, rate,
+                            ntrk::mix::kSlotPredelayMaxSeconds);
+    }
+  }
+  for (int c = 0; c < ntrk::kMaxChannels; ++c) player.muted[c] = false;
+  reset();
+}
+}
+
+extern "C" {
+int web_capacity() { return kFileCap; }
+uint8_t *web_input() { return files[1 - active]; }
+const uint8_t *web_patterns() { return reinterpret_cast<uint8_t *>(notes); }
+const uint8_t *web_orders() { return song.order; }
+double *web_audio() { return audio; }
+
+int web_demo(int sample_rate) {
+  if (sample_rate < 8000 || sample_rate > 96000) return 0;
+  rate = static_cast<float>(sample_rate);
+  song = ntrk::Module();
+  song.channels = ntrk::kMaxChannels; song.rows = 32; song.pattern_count = 2;
+  song.order_count = 2; song.instrument_count = 3; song.note_max = 96;
+  song.bpm = 128; song.order = demo_order; song.patterns = notes;
+  std::memset(notes, 0, sizeof(ntrk::Note) * 2 * 32 * song.channels);
+  const ntrk::SynthVoice voices[] = {ntrk::SynthVoice::kBass,
+      ntrk::SynthVoice::kKick, ntrk::SynthVoice::kHihat};
+  const char *names[] = {"Night circuit / bass", "Kick", "Closed hat"};
+  for (int i = 0; i < 3; ++i) {
+    auto &ins = song.instruments[i];
+    ins.type = static_cast<uint8_t>(ntrk::InstrumentType::kSynth);
+    ntrk::synth_voice_defaults(&ins, voices[i]);
+    ins.volume = i == 0 ? 40 : i == 1 ? 48 : 22;
+    std::strncpy(ins.name, names[i], ntrk::kNameBytes);
+  }
+  const int riff[] = {13, 13, 25, 20, 16, 13, 23, 20};
+  for (int p = 0; p < 2; ++p) for (int r = 0; r < 32; ++r) {
+    auto *row = notes + (p * 32 + r) * song.channels;
+    if (r % 2 == 0) { row[0].note = riff[(r / 2 + p * 3) % 8]; row[0].instrument = 1; }
+    if (r % 8 == 0) { row[1].note = 25; row[1].instrument = 2; }
+    if (r % 4 == 2) { row[2].note = 25; row[2].instrument = 3; }
+  }
+  configure();
+  return 1;
+}
+
+int web_load(int size) {
+  if (size <= 0 || size > kFileCap) return 0;
+  ntrk::Module candidate;
+  if (!ntrk::module_load(&candidate, web_input(), size)) return 0;
+  ntrk::mix::Mixer checked;
+  if (!ntrk::mix::mixer_config_read(&checked, &candidate)) return 0;
+  // Failed loads leave the playing module and all its backing storage intact.
+  active = 1 - active;
+  song = candidate;
+  const size_t count = song.pattern_count * song.rows * song.channels;
+  std::memcpy(notes, song.patterns, count * sizeof(ntrk::Note));
+  song.patterns = notes;
+  configure();
+  return 1;
+}
+
+int web_save() {
+  size_t size = 0;
+  return ntrk::module_save(&song, web_input(), kFileCap, &size) ? static_cast<int>(size) : 0;
+}
+
+// Fixed numeric metadata ABI, consumed by engine.js.
+int web_info(int field) {
+  switch (field) {
+    case 0: return song.channels; case 1: return song.rows;
+    case 2: return song.pattern_count; case 3: return song.order_count;
+    case 4: return song.instrument_count; case 5: return song.note_max;
+    case 6: return player.order; case 7: return player.row;
+    case 8: return running; case 9: return player.bpm;
+    case 10: return player.speed;
+    case 11: {
+      int bits = 0;
+      for (int c = 0; c < song.channels; ++c)
+        if (player.muted[c]) bits |= 1 << c;
+      return bits;
+    }
+    default: return -1;
+  }
+}
+
+int web_edit(int pattern, int row, int channel, int field, int value) {
+  if (pattern < 0 || pattern >= song.pattern_count || row < 0 || row >= song.rows ||
+      channel < 0 || channel >= song.channels || field < 0 || field > 3 || value < 0)
+    return 0;
+  if ((field == 0 && value > song.note_max && value != ntrk::kNoteOff) ||
+      (field == 1 && value > song.instrument_count) ||
+      (field == 2 && value > ntrk::kFxLast) || value > 255) return 0;
+  auto &cell = notes[(pattern * song.rows + row) * song.channels + channel];
+  switch (field) {
+    case 0: cell.note = value; break; case 1: cell.instrument = value; break;
+    case 2: cell.effect = value; break; case 3: cell.param = value; break;
+  }
+  return 1;
+}
+
+int web_transport(int command, int order, int row) {
+  if (command == 0) { running = false; reset(); }
+  else if (command == 1) running = true;
+  else if (command == 2) running = false;
+  else if (command == 3) {
+    if (order < 0 || order >= song.order_count || row < 0 || row >= song.rows) return 0;
+    ntrk::mix::mixer_reset(&mixer);
+    ntrk::player_seek(&player, order, row);
+    ntrk::mix::fxpl_sync(&mixer, &player);
+  } else return 0;
+  return 1;
+}
+int web_mute(int channel) {
+  if (channel < 0 || channel >= song.channels) return 0;
+  player.muted[channel] = !player.muted[channel]; return 1;
+}
+int web_render(int frames) {
+  if (frames < 1 || frames > 128) return 0;
+  std::memset(audio, 0, frames * 2 * sizeof(double));
+  if (running) ntrk::mix::mixer_render_add(&mixer, &player, audio, frames, 2, rate);
+  return 1;
+}
+}

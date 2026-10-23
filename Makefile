@@ -106,3 +106,28 @@ test-ntrk-hdr: $(HDR_OBJS)
 
 clean:
 	rm -rf $(OUT)
+
+# Static browser build: source ~/emsdk/emsdk_env.sh first, or set EMXX.
+EMXX ?= em++
+WEB_OUT := $(OUT)/web
+WEB_EXPORTS := web_capacity web_input web_patterns web_orders web_audio web_demo web_load web_save web_info web_edit web_transport web_mute web_render
+.PHONY: web test-web
+web: $(WEB_OUT)/ntrk.wasm $(addprefix $(WEB_OUT)/,index.html style.css app.js engine.js worklet.js)
+
+$(WEB_OUT)/ntrk.wasm: web/bridge.cc $(HDRS) $(LIB_CC)
+	@mkdir -p $(WEB_OUT)
+	$(EMXX) -std=c++11 -O2 -Wall -Wextra -ffp-contract=off web/bridge.cc -o $@ \
+	  --no-entry -sSTANDALONE_WASM -sFILESYSTEM=0 -sINITIAL_MEMORY=134217728 \
+	  -sSTACK_SIZE=1048576 -sALLOW_MEMORY_GROWTH=0 \
+	  $(foreach fn,$(WEB_EXPORTS),-Wl,--export=$(fn))
+
+$(WEB_OUT)/%: web/%
+	@mkdir -p $(WEB_OUT)
+	cp $< $@
+
+$(OUT)/test_web: web/bridge_tests.cc web/bridge.cc $(HDRS) $(LIB_CC)
+	@mkdir -p $(OUT)
+	$(CXX) $(CXXFLAGS) -Werror -O2 -I. -o $@ web/bridge_tests.cc
+
+test-web: $(OUT)/test_web
+	$(OUT)/test_web

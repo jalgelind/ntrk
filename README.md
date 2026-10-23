@@ -906,6 +906,12 @@ plays without it, which is an audible gap rather than a wrong note:
   is not trying to be.
 - Up to 16 channels and 64 instruments, at 256 rows a pattern.
 
+## Standalone browser page
+
+`make web` builds the static WebAssembly tracker page with Emscripten.
+See [web/README.md](web/README.md) for building, local hosting, keyboard editing,
+file open/save, playback and checks. The core library has no new dependencies.
+
 ## Licence
 
 Public domain / CC0. Written for the no2 project. The format, the player and the

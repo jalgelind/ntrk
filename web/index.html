@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ntrk · Night circuit</title>
+<link rel="stylesheet" href="style.css">
+<body>
+<header><div><small>STANDALONE / WASM</small><h1>ntrk<span>■</span></h1></div>
+<div class="title"><strong id="filename">Night circuit</strong><div>REPLAYER + PATTERN EDITOR</div></div>
+<label class="file">Open .ntrk<input id="open" type="file" accept=".ntrk" disabled></label>
+<button id="save" disabled>Save .ntrk</button><button id="demo" disabled>Demo</button></header>
+<main aria-busy="true">
+<section class="transport" aria-label="Transport">
+<button id="play" disabled>▶ Play</button><button id="pause" disabled>Ⅱ Pause</button><button id="stop" disabled>■ Stop</button>
+<output id="position">ORDER 00 / ROW 00</output><output id="tempo">128 BPM · 6 TICKS</output>
+<label><input id="follow" type="checkbox" checked> Follow</label></section>
+<nav id="orders" aria-label="Order list"></nav>
+<section class="editorbar" aria-label="Cell editor">
+<label>Octave <input id="octave" type="number" min="1" max="8" value="2"></label>
+<label>Instrument <input id="instrument" type="number" min="0" max="64" value="1"></label>
+<label><input id="edit" type="checkbox"> Record edits</label>
+<span id="selection">ROW 00 · CH 01 · NOTE</span></section>
+<div id="viewport"><table id="grid" tabindex="0" aria-label="Tracker pattern. Arrow keys select fields; enable Record edits to type notes or hexadecimal values."></table></div>
+<footer><span id="status" role="status">Loading WebAssembly…</span><span id="dirty"></span></footer>
+<details><summary>Keyboard &amp; file help</summary>
+<p>Click a field, then use arrows to move. Space plays/pauses. Enable Record edits to write.
+Z S X D C V G B H N J M = one piano octave; Q 2 W 3 E R 5 T 6 Y 7 U = the next.
+Notes use the chosen instrument; Enter writes a note-off, Delete clears the selected field.
+Instrument / effect / parameter fields take two hexadecimal digits. Notes and completed values advance one row.</p>
+<p>Order buttons select a pattern and seek playback to its first row. Click a channel header to mute it.
+Save downloads the full module, including edits. Mutes are listening controls and are not saved.
+Open accepts ntrk only (16 MiB maximum). Existing effect planes and mixer settings are preserved but have no editor here.</p>
+</details></main>
+<script type="module" src="app.js"></script>
+</body></html>
