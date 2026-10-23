@@ -857,7 +857,7 @@ const int kInstrumentBytes = 32;
 const int kDirectoryEntryBytes = 12;
 const int kMaxBlocks = 32;
 
-// Block ids. FXPL, NAME, SYNP, MACR, MIXR, TUNE, SLIC, SMUT, ITUN and EFXS are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
+// Block ids. FXPL, NAME, SYNP, MACR, MIXR, TUNE, SLIC, SMUT, ITUN, EFXS and EDIT are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
 // stays spent rather than reused so a file written against the older sketch
 // cannot be misread as something else. An id this reader does not know is
 // skipped when the file says it is optional and refused when it says it is
@@ -883,6 +883,18 @@ const int kMaxTune = 1024;                 // +-128 semitones, in eighths
 // reader refuse the file instead. `SLC` needs none -- SLIC already protects it.
 const uint16_t kBlockEfxs = 0x000D;
 const int kEfxsBytes = 2;
+// EDIT: editor-only metadata, `u16 version` (1), `u16 hidden_channels`, `u16`
+// reserved zero, all little-endian, exactly kEditBytes. Bit `c` of the mask means an
+// editor does not draw channel `c`; the channel still plays, mixes and saves exactly as
+// before -- **nothing in the player or mixer reads it**. **Optional, always**: a reader
+// that does not know the id skips it and plays the same audio, and drops the mask on its
+// next save. Written only when the mask is non-zero, so a file with every channel visible
+// has no block and serializes as it did before. A version or length this reader does not
+// know, or a reserved word that is not zero, is refused like MIXR's. Every mask is valid:
+// all sixteen channels always exist, and hiding all of them is the editor's to survive.
+const uint16_t kBlockEdit = 0x000E;
+const int kEditBytes = 6;
+const uint16_t kEditVersion = 1;
 const uint16_t kBlockCritical = 0x0001;   // a directory entry's flags, bit 0
 
 // SMUT: `u16 order_count`, `u16 channels`, then one `u16 LE` per order position
@@ -1170,6 +1182,13 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       if (bytes != (uint32_t) kEfxsBytes || data[offset + 1] != 0u ||
           data[offset] > kFxLast)
         return false;
+    } else if (id == kBlockEdit) {
+      // Self-contained like EFXS, so judged here: exact, this version, reserved zero.
+      if (bytes != (uint32_t) kEditBytes ||
+          read_u16(data + offset) != kEditVersion ||
+          read_u16(data + offset + 4) != 0u)
+        return false;
+      module->hidden_channels = read_u16(data + offset + 2);
     } else if (id == kBlockItun) {
       // Judged against the instrument count, parsed below -- NAME's reason.
       itun = data + offset;
@@ -1821,12 +1840,14 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
       efxs_high = e;
   }
   const bool want_efxs = efxs_high != 0u;
+  const bool want_edit = module->hidden_channels != 0u;   // see kBlockEdit
 
   const int block_count = (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
                           (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
                           (want_macr ? 1 : 0) + (want_mixr ? 1 : 0) +
                           (want_slic ? 1 : 0) + (want_smut ? 1 : 0) +
-                          (want_itun ? 1 : 0) + (want_efxs ? 1 : 0);
+                          (want_itun ? 1 : 0) + (want_efxs ? 1 : 0) +
+                          (want_edit ? 1 : 0);
   const size_t directory_bytes =
       (size_t) block_count * (size_t) kDirectoryEntryBytes;
   // Lanes rather than channels, and the four-byte prefix that says how many.
@@ -1856,11 +1877,12 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const size_t itun_bytes =
       want_itun ? (size_t) module->instrument_count * 2u : 0u;
   const size_t efxs_bytes = want_efxs ? (size_t) kEfxsBytes : 0u;
+  const size_t edit_bytes = want_edit ? (size_t) kEditBytes : 0u;
   const size_t total = (size_t) kHeaderBytes + order_bytes + instrument_bytes +
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
                        tune_bytes + name_bytes + synp_bytes + macr_bytes +
                        mixr_bytes + slic_bytes + smut_bytes + itun_bytes +
-                       efxs_bytes;
+                       efxs_bytes + edit_bytes;
 
   *written = total;
   if (out == nullptr)
@@ -2010,6 +2032,18 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     out[at + 0] = efxs_high;
     out[at + 1] = 0u;
     at += (size_t) kEfxsBytes;
+  }
+
+  if (want_edit) {
+    write_u16(out + entry + 0, kBlockEdit);
+    write_u16(out + entry + 2, 0u);   // optional: editor state changes nothing heard
+    write_u32(out + entry + 4, (uint32_t) at);
+    write_u32(out + entry + 8, (uint32_t) edit_bytes);
+    entry += (size_t) kDirectoryEntryBytes;
+    write_u16(out + at + 0, kEditVersion);
+    write_u16(out + at + 2, module->hidden_channels);
+    write_u16(out + at + 4, 0u);
+    at += (size_t) kEditBytes;
   }
 
   if (want_itun) {

@@ -705,6 +705,17 @@ it from the top; written critical exactly when such a command (today `S`) is
 used, it makes that reader refuse the file instead. `SLC` needs none — SLIC
 already protects it.
 
+**`0x000E` EDIT is editor-only metadata**: `u16` version (1), `u16`
+`hidden_channels` (bit `c` set = an editor does not draw channel `c`), `u16`
+reserved zero, little-endian, exactly 6 bytes. It rides in `Module::hidden_channels`
+by value, so `module_load` / `module_save` round-trip it with no pointer into the
+file. **The player and mixer never read it** — a hidden channel plays, mixes and
+renders exactly as before. It is always optional and written only when the mask is
+non-zero, so a file with every channel visible serializes byte for byte as it did.
+Every 16-bit mask is valid, all hidden included. A size, version or reserved word it
+does not know is refused, like MIXR. A reader that predates the id skips it and plays
+the same audio, and drops the mask when it saves.
+
 **MIXR carries what the effect plane cannot say.** Every level, pan, filter and
 slot *parameter* is an FXPL command and has always been saved as automation; a
 slot's *kind* is deliberately not one — a row that swapped a shaper for a reverb

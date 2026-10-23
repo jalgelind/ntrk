@@ -730,6 +730,10 @@ struct Module {
   // save, and a view into the file's bytes would be read-only.
   bool has_slot_mute = false;
   uint16_t slot_mute[kMaxOrders] = {};
+
+  // EDIT: bit `c` set = an editor does not draw channel `c`. Editor metadata by value,
+  // carried through load/save; **the player and mixer never read it** (see kBlockEdit).
+  uint16_t hidden_channels = 0;
 };
 
 // Whether channel `c` is silenced at order position `o`. **The one reader**, so

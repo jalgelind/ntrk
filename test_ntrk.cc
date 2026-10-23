@@ -677,6 +677,167 @@ test_slot_mute() {
             (size_t) m.order_count * 2u);
 }
 
+// The directory entry for `id` with a payload of `bytes`, found by scanning for a whole
+// entry rather than re-deriving the layout (the SMUT refusal test does the same).
+static size_t
+find_entry(const uint8_t *file, size_t size, uint16_t id, size_t bytes) {
+  for (size_t e = 0; e + (size_t) ntrk::kDirectoryEntryBytes <= size; ++e) {
+    if (ntrk::read_u16(file + e) != id) continue;
+    if ((size_t) ntrk::read_u32(file + e + 8) != bytes) continue;
+    const size_t off = (size_t) ntrk::read_u32(file + e + 4);
+    if (off + bytes > size) continue;
+    return e;
+  }
+  return 0;
+}
+
+static void
+test_hidden_channels() {
+  printf("EDIT: hidden channels default to none, round-trip exactly, change no audio\n");
+
+  Spec s;
+  s.orders = 2;
+  s.patterns = 2;
+  build(s);
+  set_cell(s, 0, 1, 25u, 1u, 0u, 0u);
+
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+  CHECK(m.hidden_channels == 0u);                       // default: all visible
+
+  // Zero writes no block: a legacy all-visible file serializes as before.
+  size_t plain = 0;
+  CHECK(ntrk::module_save(&m, g_saved, sizeof g_saved, &plain));
+  CHECK(find_entry(g_saved, plain, ntrk::kBlockEdit, (size_t) ntrk::kEditBytes) == 0);
+  static uint8_t plain_bytes[1 << 20];
+  CHECK(plain <= sizeof plain_bytes);
+  for (size_t i = 0; i < plain; ++i) plain_bytes[i] = g_saved[i];
+
+  // Every mask is valid, the extremes included.
+  const uint16_t masks[] = {0x0001u, 0x0002u, 0x8000u, 0x5a5au, 0xffffu};
+  for (uint16_t mask : masks) {
+    ntrk::Module h;
+    CHECK(ntrk::module_load(&h, plain_bytes, plain));
+    h.hidden_channels = mask;
+    size_t need = 0, wrote = 0;
+    CHECK(ntrk::module_save(&h, nullptr, 0, &need));
+    CHECK(ntrk::module_save(&h, g_saved, sizeof g_saved, &wrote));
+    CHECK(wrote == need);
+    CHECK(need == plain + (size_t) ntrk::kDirectoryEntryBytes + (size_t) ntrk::kEditBytes);
+    const size_t e = find_entry(g_saved, wrote, ntrk::kBlockEdit, (size_t) ntrk::kEditBytes);
+    CHECK(e != 0);
+    CHECK(ntrk::read_u16(g_saved + e + 2) == 0u);       // optional, never critical
+
+    ntrk::Module back;
+    CHECK(ntrk::module_load(&back, g_saved, wrote));
+    CHECK(back.hidden_channels == mask);
+
+    // Byte-exact: loading and saving again reproduces the file.
+    static uint8_t again[1 << 20];
+    size_t wrote2 = 0;
+    CHECK(ntrk::module_save(&back, again, sizeof again, &wrote2));
+    CHECK(wrote2 == wrote);
+    for (size_t i = 0; i < wrote; ++i) CHECK(again[i] == g_saved[i]);
+
+    // The audio does not know: a separate module, hidden vs plain, same samples.
+    ntrk::Module open_m;
+    CHECK(ntrk::module_load(&open_m, plain_bytes, plain));
+    ntrk::Player a, b;
+    ntrk::player_start(&a, &open_m);
+    ntrk::player_start(&b, &back);
+    double ra[256] = {0}, rb[256] = {0};
+    ntrk::render_add(&a, ra, 256, 1, 22050.f);
+    ntrk::render_add(&b, rb, 256, 1, 22050.f);
+    CHECK(abs_peak(ra, 256) > 0.0);
+    for (int i = 0; i < 256; ++i) CHECK(ra[i] == rb[i]);
+  }
+
+  // Clearing the mask drops the block again.
+  ntrk::Module c;
+  CHECK(ntrk::module_load(&c, plain_bytes, plain));
+  c.hidden_channels = 4u;
+  c.hidden_channels = 0u;
+  size_t cw = 0;
+  CHECK(ntrk::module_save(&c, g_saved, sizeof g_saved, &cw));
+  CHECK(cw == plain);
+
+  // Coexists with another optional block (a slot mute) and both survive.
+  ntrk::Module both;
+  CHECK(ntrk::module_load(&both, plain_bytes, plain));
+  ntrk::slot_set_muted(&both, 0, 1, true);
+  both.hidden_channels = 0x0102u;
+  size_t bw = 0;
+  CHECK(ntrk::module_save(&both, g_saved, sizeof g_saved, &bw));
+  ntrk::Module bb;
+  CHECK(ntrk::module_load(&bb, g_saved, bw));
+  CHECK(bb.hidden_channels == 0x0102u && ntrk::slot_muted(&bb, 0, 1));
+}
+
+static void
+test_hidden_channels_refusals() {
+  printf("EDIT: wrong size, version, reserved word or a duplicate is refused; an unknown id is skipped\n");
+
+  Spec s;
+  s.orders = 2;
+  s.patterns = 2;
+  build(s);
+  ntrk::Module m;
+  CHECK(ntrk::module_load(&m, g_bytes, g_size));
+  m.hidden_channels = 0x0006u;
+  size_t wrote = 0;
+  CHECK(ntrk::module_save(&m, g_saved, sizeof g_saved, &wrote));
+  const size_t e = find_entry(g_saved, wrote, ntrk::kBlockEdit, (size_t) ntrk::kEditBytes);
+  CHECK(e != 0);
+  const size_t at = (size_t) ntrk::read_u32(g_saved + e + 4);
+  ntrk::Module back;
+
+  ntrk::write_u16(g_saved + at + 0, 2u);                      // version it does not know
+  CHECK(!ntrk::module_load(&back, g_saved, wrote));
+  ntrk::write_u16(g_saved + at + 0, 0u);
+  CHECK(!ntrk::module_load(&back, g_saved, wrote));
+  ntrk::write_u16(g_saved + at + 0, ntrk::kEditVersion);
+  CHECK(ntrk::module_load(&back, g_saved, wrote));
+
+  ntrk::write_u16(g_saved + at + 4, 1u);                      // reserved not zero
+  CHECK(!ntrk::module_load(&back, g_saved, wrote));
+  ntrk::write_u16(g_saved + at + 4, 0u);
+
+  ntrk::write_u32(g_saved + e + 8, (uint32_t) ntrk::kEditBytes - 1u);   // short
+  CHECK(!ntrk::module_load(&back, g_saved, wrote));
+  ntrk::write_u32(g_saved + e + 8, (uint32_t) ntrk::kEditBytes + 2u);   // long
+  CHECK(!ntrk::module_load(&back, g_saved, wrote));
+  ntrk::write_u32(g_saved + e + 8, (uint32_t) ntrk::kEditBytes);
+
+  // Truncated: the payload runs past the end of the file.
+  CHECK(!ntrk::module_load(&back, g_saved, at + 3));
+  CHECK(ntrk::module_load(&back, g_saved, wrote));
+
+  // An unlisted flag bit is refused like any entry's.
+  ntrk::write_u16(g_saved + e + 2, 2u);
+  CHECK(!ntrk::module_load(&back, g_saved, wrote));
+  ntrk::write_u16(g_saved + e + 2, 0u);
+
+  // A reader that does not know the id (here: another id) skips it and plays the same.
+  static uint8_t unknown[1 << 20];
+  for (size_t i = 0; i < wrote; ++i) unknown[i] = g_saved[i];
+  ntrk::write_u16(unknown + e, 0x00f0u);
+  CHECK(ntrk::module_load(&back, unknown, wrote));
+  CHECK(back.hidden_channels == 0u);
+
+  // Two EDIT entries in one directory disagree with themselves: turn the mute block
+  // (a second block) into a second EDIT.
+  ntrk::Module two;
+  CHECK(ntrk::module_load(&two, g_saved, wrote));
+  ntrk::slot_set_muted(&two, 0, 1, true);
+  size_t tw = 0;
+  CHECK(ntrk::module_save(&two, unknown, sizeof unknown, &tw));
+  const size_t sm = find_entry(unknown, tw, ntrk::kBlockSmut,
+                               (size_t) ntrk::kSmutHeaderBytes + (size_t) two.order_count * 2u);
+  CHECK(sm != 0);
+  ntrk::write_u16(unknown + sm, ntrk::kBlockEdit);
+  CHECK(!ntrk::module_load(&back, unknown, tw));
+}
+
 static void
 test_slot_mute_refusals() {
   printf("a SMUT block that disagrees with the module is refused\n");
@@ -8157,6 +8318,8 @@ main(void) {
   test_mute();
   test_slot_mute();
   test_slot_mute_refusals();
+  test_hidden_channels();
+  test_hidden_channels_refusals();
   test_seek();
   test_geometry_shrinks_under_player();
   test_preview();
