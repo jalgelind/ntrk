@@ -7,6 +7,10 @@ int main() {
   assert(!web_demo(0));
   assert(web_demo(48000));
   assert(web_info(0) == ntrk::kMaxChannels && web_info(1) == 32 && web_info(3) == 2);
+  assert(!std::strcmp(web_instrument_name(1), "Night circuit / bass"));
+  assert(web_instrument_volume(1) == 40);
+  assert(!std::strcmp(web_instrument_name(0), "") && !std::strcmp(web_instrument_name(4), ""));
+  assert(web_instrument_volume(0) == -1 && web_instrument_volume(4) == -1);
   assert(web_render(128));
   for (double x : audio) assert(x == 0);
   assert(!web_render(129) && !web_render(0));

@@ -13,7 +13,14 @@ export class Engine {
   state() { return Array.from({length: 12}, (_, i) => this.api.web_info(i)); }
   snapshot() {
     const state = this.state();
-    return {state,
+    const instruments = Array.from({length: state[4]}, (_, i) => {
+      const ptr = this.api.web_instrument_name(i + 1);
+      const bytes = new Uint8Array(this.api.memory.buffer, ptr);
+      const end = bytes.indexOf(0);
+      return {nameBytes: bytes.subarray(0, end < 0 ? bytes.length : end).slice(),
+        volume: this.api.web_instrument_volume(i + 1)};
+    });
+    return {state, instruments,
       orders: new Uint8Array(this.api.memory.buffer, this.api.web_orders(), state[3]).slice(),
       cells: new Uint8Array(this.api.memory.buffer, this.api.web_patterns(),
         state[0] * state[1] * state[2] * 4).slice()};

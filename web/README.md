@@ -1,7 +1,7 @@
 # ntrk in the browser
 
 A static tracker page: the actual ntrk replayer and mixer run inside an
-AudioWorklet, with an HTML pattern viewer and basic keyboard cell editor.
+AudioWorklet, with a single Canvas2D tracker and basic keyboard cell editor.
 No desktop code, framework, CDN, service, filesystem shim or extra library is
 linked. The C++ core is unchanged. Everything stays in the browser.
 
@@ -20,7 +20,7 @@ python3 -m http.server 8080 --bind 127.0.0.1 --directory out/web
 ```
 
 Alternatively, `make web EMXX=$HOME/emsdk/upstream/emscripten/em++`.
-The target emits `out/web/{index.html,style.css,app.js,engine.js,worklet.js,ntrk.wasm,demo.json}`.
+The target emits `out/web/{index.html,style.css,app.js,canvas.js,engine.js,worklet.js,ntrk.wasm,demo.json}`.
 Copy that directory as a unit to any static host; HTTPS is required outside
 localhost. Serve `.js` as JavaScript and `.wasm` as `application/wasm`.
 No cross-origin isolation headers are needed. `file://` does not work.
@@ -51,10 +51,10 @@ The order/row display follows the sequencer with a 40 ms polling interval,
 plus the browser/device's output latency. Channel headers toggle monitoring
 mutes, which survive Stop but are not saved.
 
-Click an order button to browse and seek; this turns Follow off. Enable Follow
-to track playback again. Select a cell with the pointer or arrows, check
-**Record edits**, and type notes using the piano keys listed in the page's
-help. Choose an octave and instrument first. Instrument, effect and parameter
+Click an order row to browse and seek; this turns Follow off. Enable Follow
+to track playback again. Select a cell with the pointer or arrows, enable
+**Edit**, and type notes using the piano keys listed in the page's
+drawn **? Help** overlay (also F1). Choose an octave and instrument first, using the ± controls or the module-named instrument list. Instrument, effect and parameter
 fields accept two hexadecimal digits; Enter in a note field writes note-off,
 Delete clears a field. Successful entries advance one row. Note entry edits the
 song; it does not audition a note while stopped.
@@ -70,6 +70,18 @@ instrument creation, undo, structural pattern/order editing and persistent
 browser storage are outside this editor's scope. All sixteen channels are
 shown, including channels hidden by other editors.
 
+All visible controls, lists, status, help and discard confirmation are drawn on one
+canvas; HTML only hosts the canvas and hidden local file plumbing. The row gutter
+stays pinned while channels scroll horizontally. Use the wheel for rows and
+Shift + wheel for channels, or drag the drawn scrollbars. Touch-drag pans the
+pattern. Orders and instruments have their own scroll regions. Narrow windows
+stack the instrument list below the order list; channel widths stay fixed.
+Rendering uses a dirty flag at browser refresh and a DPR-sized backing store.
+Clicking controls keeps keyboard focus on the canvas. There are no native text
+inputs or on-screen piano: a hardware keyboard is required for note editing.
+The canvas currently provides only a host accessibility label; screen-reader
+navigation of individual cells and controls is not implemented.
+
 ## Host boundary and checks
 
 `bridge.cc` is platform-free C++ and is compiled both natively and to a
@@ -81,7 +93,7 @@ every configured insert, send and master slot at the audio context's rate
 message handlers, separate from `process()`. Loading/saving large modules can
 still interrupt audio; pause before file operations for uninterrupted output.
 Rendering uses preallocated buffers, and all edits and playback share one
-worklet owner. The DOM never touches live WASM state.
+worklet owner. The canvas host never touches live WASM state.
 
 `make test-web` checks the same bridge natively: bounds and defaults, failed
 load preservation, repeated save/load, note-off, transport/seek, mute, effect
@@ -94,12 +106,14 @@ NTRK_PLAYWRIGHT=/absolute/path/to/node_modules/playwright node web/browser_test.
 ```
 
 It checks real worklet audio, editing, transport, order selection, mutes,
-downloads and reopening, rejected files, and small-screen overflow. Test logs
-and screenshots belong outside Git. The page requires a modern browser with
+downloads and reopening, rejected files, canvas pixels/DPR, actual pointer hit
+geometry, help, focus, scrolling and narrow-window resizing. Test logs and
+screenshots belong outside Git. The page requires a modern browser with
 WebAssembly, ES modules, Web Audio and AudioWorklet. Only Chromium is covered
 by the automated browser check; Safari/Firefox and mobile audio need manual
 verification. There is no independent review verdict in these tests.
 
-The visual and input conventions were informed by no2's web shell and tracker;
+The compact header bands, order rail, instrument list and fixed-pitch raster follow
+js-seq's tracker design; no2's tracker drawing and theme informed the palette;
 the browser host here does not depend on no2. New web sources and generated
 demo music are public domain / CC0, matching ntrk.

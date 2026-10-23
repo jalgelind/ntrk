@@ -57,6 +57,13 @@ uint8_t *web_input() { return files[1 - active]; }
 const uint8_t *web_patterns() { return reinterpret_cast<uint8_t *>(notes); }
 const uint8_t *web_orders() { return song.order; }
 double *web_audio() { return audio; }
+// Inspection only: names and values come from the loaded module, never UI aliases.
+const char *web_instrument_name(int slot) {
+  return slot >= 1 && slot <= song.instrument_count ? song.instruments[slot - 1].name : "";
+}
+int web_instrument_volume(int slot) {
+  return slot >= 1 && slot <= song.instrument_count ? song.instruments[slot - 1].volume : -1;
+}
 
 int web_demo(int sample_rate) {
   if (sample_rate < 8000 || sample_rate > 96000) return 0;
