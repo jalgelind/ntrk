@@ -8,7 +8,7 @@ linked. The C++ core is unchanged. Everything stays in the browser.
 ## Build and run
 
 Use an existing Emscripten SDK (tested with 6.0.8), a C++11 compiler for the
-native checks, and Python for a local static server:
+native checks, and Python 3.8+ for demo staging and a local static server:
 
 ```sh
 source ~/emsdk/emsdk_env.sh
@@ -20,16 +20,29 @@ python3 -m http.server 8080 --bind 127.0.0.1 --directory out/web
 ```
 
 Alternatively, `make web EMXX=$HOME/emsdk/upstream/emscripten/em++`.
-The target emits `out/web/{index.html,style.css,app.js,engine.js,worklet.js,ntrk.wasm}`.
+The target emits `out/web/{index.html,style.css,app.js,engine.js,worklet.js,ntrk.wasm,demo.json}`.
 Copy that directory as a unit to any static host; HTTPS is required outside
 localhost. Serve `.js` as JavaScript and `.wasm` as `application/wasm`.
 No cross-origin isolation headers are needed. `file://` does not work.
 `make clean` removes generated output. The SDK is a build tool, never a runtime
 dependency; its version and compiler flags determine the generated WASM bytes.
 
+To ship a host-owned song instead of the generated demo:
+
+```sh
+make web WEB_DEMO=/absolute/path/to/song.ntrk WEB_DEMO_NAME='Song name'
+```
+
+This copies the input to `out/web/demo.ntrk` and writes its identity to
+`demo.json`. The name defaults to the input filename without its extension.
+Startup and **Demo** load this same asset; failed configuration/song loads show
+an error, with no generated-song fallback. A later plain `make web` explicitly
+returns to the generated demo and removes the staged song. No parent repository
+or music asset is required for the standalone build.
+
 ## Use
 
-The original, generated **Night circuit** demo opens immediately without
+By default the original, generated **Night circuit** demo opens without
 shipping a music asset. It has two 32-row patterns, a bass, kick and hat, with
 the remaining channels free for editing. Press Play to resume the browser's
 audio context through a user gesture. Pause holds voices and timing; Stop

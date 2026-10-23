@@ -4,6 +4,7 @@ const pitches = ['C-', 'C#', 'D-', 'D#', 'E-', 'F-', 'F#', 'G-', 'G#', 'A-', 'A#
 const noteName = n => n === 97 ? '^^^' : n ? pitches[(n - 1) % 12] + (Math.floor((n - 1) / 12) + 1) : '...';
 let ctx, node, seq = 0, snapshot, state, order = 0, row = 0, channel = 0, field = 0;
 let dirty = false, nibble = '', busy = false;
+let demo;
 const pending = new Map();
 function status(text, error = false) { $('status').textContent = text; $('status').classList.toggle('error', error); }
 function request(type, args = []) {
@@ -86,7 +87,17 @@ function draw() {
 function adopt(result, name) {
   snapshot = result; state = result.state; order = row = channel = field = 0; nibble = '';
   $('instrument').value = state[4] ? 1 : 0;
-  $('filename').textContent = name; changed(false); draw(); updateState(state);
+  $('filename').textContent = name; document.title = `ntrk · ${name}`;
+  changed(false); draw(); updateState(state);
+}
+async function loadDemo() {
+  if (demo) {
+    const response = await fetch(demo.url);
+    if (!response.ok) throw new Error(`Cannot load configured demo: ${demo.url}`);
+    adopt(await request('load', [await response.arrayBuffer()]), demo.name);
+  } else {
+    adopt(await request('demo'), 'Night circuit');
+  }
 }
 async function run(fn) {
   try { await fn(); } catch (error) { status(error.message, true); }
@@ -105,7 +116,7 @@ $('demo').onclick = () => run(async () => {
   if (busy) return;
   if (dirty && !confirm('Discard unsaved edits and load the demo?')) return;
   busy = true;
-  try { adopt(await request('demo'), 'Night circuit'); status('Generated demo · ready to play'); }
+  try { await loadDemo(); status('Demo · ready to play'); }
   finally { busy = false; }
 });
 $('open').onchange = () => run(async () => {
@@ -191,6 +202,11 @@ document.addEventListener('keydown', event => {
 window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
 run(async () => {
   if (!window.AudioWorkletNode) throw new Error('AudioWorklet unavailable. Use a modern browser on localhost or HTTPS.');
+  const config = await fetch('demo.json');
+  if (!config.ok) throw new Error('Cannot load demo configuration');
+  demo = await config.json();
+  if (demo !== null && (!demo || typeof demo.url !== 'string' || !demo.url ||
+      typeof demo.name !== 'string' || !demo.name)) throw new Error('Invalid demo configuration');
   const response = await fetch('ntrk.wasm');
   if (!response.ok) throw new Error('Cannot load ntrk.wasm');
   const module = await WebAssembly.compile(await response.arrayBuffer());
@@ -206,7 +222,7 @@ run(async () => {
     if (data.error) p.reject(new Error(data.error)); else p.resolve(data.result);
   };
   node.connect(ctx.destination);
-  adopt(await request('snapshot'), 'Night circuit');
+  await loadDemo();
   for (const id of ['play', 'pause', 'stop', 'save', 'demo']) $(id).disabled = false;
   $('open').disabled = false; document.querySelector('main').setAttribute('aria-busy', 'false');
   status('Ready · press Play to enable audio');

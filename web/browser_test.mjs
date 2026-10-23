@@ -32,9 +32,18 @@ try {
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.waitForFunction(() => !document.getElementById('play').disabled);
   assert.match(await page.locator('#status').innerText(), /Ready/);
+  const demo = JSON.parse(await readFile(path.join(root, 'demo.json'), 'utf8'));
+  const demoName = demo?.name || 'Night circuit';
+  assert.equal(await page.locator('#filename').innerText(), demoName);
+  assert.equal(await page.title(), `ntrk · ${demoName}`);
+  // Autoplay policy varies by browser; the sequencer must always open stopped.
+  assert.match(await page.locator('#position').innerText(), /^IDLE/);
+  const initialDownload = page.waitForEvent('download');
+  await page.locator('#save').click();
+  const initialBytes = await readFile(await (await initialDownload).path());
+  if (demo) assert.deepEqual(initialBytes, await readFile(path.join(root, demo.url)));
   assert.equal(await page.locator('tbody tr').count(), 32);
   assert.equal(await page.locator('thead button').count(), 16);
-  assert.equal(await page.evaluate(() => testContext.state), 'suspended');
   await page.locator('#play').click();
   await page.waitForFunction(() => document.getElementById('position').textContent.startsWith('PLAY'));
   const peak = await page.evaluate(async () => {
@@ -89,13 +98,33 @@ try {
   await page.waitForFunction(() => document.getElementById('status').textContent.includes('Invalid'));
   assert.equal(await page.locator('#filename').innerText(), 'edited.ntrk');
   assert.equal(await page.locator(firstNote).innerText(), 'D-2');
+  // Demo must restore the same configured song after a different file was opened.
+  await page.locator('#demo').click();
+  await page.waitForFunction(name => document.getElementById('filename').textContent === name, demoName);
+  const restoredDownload = page.waitForEvent('download');
+  await page.locator('#save').click();
+  assert.deepEqual(await readFile(await (await restoredDownload).path()), initialBytes);
+  if (demo) {
+    await page.route(`**/${demo.url}`, route => route.fulfill({status: 404, body: 'missing'}));
+    await page.locator('#demo').click();
+    await page.waitForFunction(() => document.getElementById('status').textContent.includes('Cannot load configured demo'));
+    assert.equal(await page.locator('#filename').innerText(), demoName);
+    // A failed configured startup stays visibly failed with playback disabled.
+    const failed = await browser.newPage();
+    await failed.route(`**/${demo.url}`, route => route.fulfill({status: 404, body: 'missing'}));
+    await failed.goto(`http://127.0.0.1:${server.address().port}/`);
+    await failed.waitForFunction(() => document.getElementById('status').textContent.includes('Cannot load configured demo'));
+    assert(await failed.locator('#play').isDisabled());
+    assert.equal(await failed.locator('#filename').innerText(), 'Loading demo');
+    await failed.close();
+  }
   if (process.env.NTRK_SCREENSHOT) await page.screenshot({path: process.env.NTRK_SCREENSHOT + '.desktop.png', fullPage: true});
   await page.setViewportSize({width: 390, height: 844});
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   if (process.env.NTRK_SCREENSHOT) await page.screenshot({path: process.env.NTRK_SCREENSHOT, fullPage: true});
   await page.evaluate(() => testContext.close());
   assert.deepEqual(errors, []);
-  console.log(`browser: suspended startup, gesture playback (peak ${peak.toFixed(3)}), pause/stop, mute, order, note/hex/off editing, download/reopen, invalid file, mobile layout passed`);
+  console.log(`browser: ${demoName}, exact demo bytes, Demo restore, failed-load handling, idle startup, gesture playback (peak ${peak.toFixed(3)}), pause/stop, mute, order, editing, download/reopen, invalid file, mobile layout passed`);
 } finally {
   if (browser) await browser.close();
   await new Promise(resolve => server.close(resolve));

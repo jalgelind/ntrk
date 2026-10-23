@@ -110,9 +110,19 @@ clean:
 # Static browser build: source ~/emsdk/emsdk_env.sh first, or set EMXX.
 EMXX ?= em++
 WEB_OUT := $(OUT)/web
+# Optional host-owned song. No parent checkout dependency in the standalone build.
+WEB_DEMO ?=
+WEB_DEMO_NAME ?=
 WEB_EXPORTS := web_capacity web_input web_patterns web_orders web_audio web_demo web_load web_save web_info web_edit web_transport web_mute web_render
 .PHONY: web test-web
-web: $(WEB_OUT)/ntrk.wasm $(addprefix $(WEB_OUT)/,index.html style.css app.js engine.js worklet.js)
+web: $(WEB_OUT)/ntrk.wasm $(addprefix $(WEB_OUT)/,index.html style.css app.js engine.js worklet.js) web-demo
+
+# Always stage configuration: changing WEB_DEMO (including back to empty) must not
+# leave a previous build's song selected. Copy before publishing its manifest.
+.PHONY: web-demo
+web-demo:
+	@mkdir -p $(WEB_OUT)
+	@python3 web/stage_demo.py "$(WEB_OUT)" "$(WEB_DEMO)" "$(WEB_DEMO_NAME)"
 
 $(WEB_OUT)/ntrk.wasm: web/bridge.cc $(HDRS) $(LIB_CC)
 	@mkdir -p $(WEB_OUT)
