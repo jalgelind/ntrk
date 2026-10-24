@@ -83,6 +83,12 @@ its drop counter saturates at `UINT32_MAX`. The host must forward these through
 its own bounded transport. `Position.row_offset` describes the row whose audio
 actually began, unlike the base Player's lookahead position.
 
+The bounded snapshot also carries up to 32 control held values and actual
+row-applied mixer input bytes, plus up to 16 layer current/target gains, remaining
+ramp frames and paused held targets/fade durations. These are audio-owned facts;
+UI clients must forward snapshots rather than observe Runtime concurrently or
+reconstruct fade/row decisions.
+
 The tracker host provides `InteractivePublication` to retain an immutable E1
 Published snapshot plus its compiled binding off audio. `setInteractiveModule`
 borrows those stable pointers through `moduleAdopted()`. Publish only after the
@@ -132,3 +138,11 @@ they do not establish an end-to-end device deadline guarantee under that load.
 The callback budget remains 2 ms. Bindings occupy 5,896 bytes and runtime state
 17,296 bytes on this build; neither allocates. Mixer state is 28,152 bytes plus
 host-owned effect tanks (the tracker's pre-existing MixMemory allocation).
+
+
+Snapshot transport measurement (2026-10-24): Apple arm64 C++11 `-O2`, two million
+non-inlined `Position` assignments measured with `steady_clock`, 13.40 ns mean
+per copy. `sizeof(Position)` is 960 bytes; 128 host-ring entries use 122,880 bytes
+plus indices. At 375 callbacks/second the payload writes are 360,000 bytes/second;
+UI consumers drain to the latest snapshot. Load averages were 5.75/5.33/5.38.
+This is a snapshot-copy microbenchmark, not an end-to-end callback deadline test.

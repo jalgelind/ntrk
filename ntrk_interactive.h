@@ -97,10 +97,17 @@ struct CueEvent {
   uint32_t id=0, section=0, sample_offset=0;
   uint16_t type=0, strength=0;
 };
+struct ControlPosition { uint32_t id=0; uint16_t held=0, applied=0; };
+struct LayerPosition {
+  uint32_t id=0; double current=1.0,target=1.0; uint64_t remaining=0;
+  bool held=false; uint16_t held_value=0,held_fade_ms=0;
+};
 struct Position {
   uint64_t generation=0, clock=0, traversal=0, accepted_sequence=0;
   uint32_t current=0,pending=0,row_offset=0,cue_drops=0,order=0,row=0;
   bool playing=false,paused=false,draining=false;
+  uint8_t controls=0,layers=0;
+  ControlPosition control[kMaxImusControls]; LayerPosition layer[kMaxImusLayers];
 };
 struct Ramp {
   double current=1.0, start=1.0, target=1.0;
@@ -278,6 +285,15 @@ public:
     p.current=binding_ && section_>=0 ? binding_->section_[section_].id : 0;
     p.pending=binding_ && pending_>=0 ? binding_->section_[pending_].id : 0;
     p.order=audible_order_; p.row=audible_row_;
+    if (binding_) {
+      p.controls=uint8_t(binding_->controls_); p.layers=uint8_t(binding_->layers_);
+      for (int i=0;i<p.controls;++i) { p.control[i].id=binding_->control_[i].id; p.control[i].held=held_[i]; p.control[i].applied=mixer_->macro_in[binding_->control_[i].macro-1]; }
+      for (int i=0;i<p.layers;++i) {
+        LayerPosition &l=p.layer[i]; l.id=binding_->layer_[i].id; l.current=ramp_[i].current;
+        l.target=ramp_[i].target; l.remaining=ramp_[i].total-ramp_[i].elapsed;
+        l.held=layer_pending_[i]; l.held_value=layer_value_[i]; l.held_fade_ms=layer_ms_[i];
+      }
+    }
     p.row_offset=row_offset_; p.cue_drops=drops_; p.playing=active_ && !draining_; p.paused=paused_; p.draining=draining_; return p;
   }
 private:

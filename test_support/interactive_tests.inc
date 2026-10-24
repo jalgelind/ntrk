@@ -383,7 +383,24 @@ static void test_interactive_idempotent_section_selection() {
   ra.render(a,1,2,48000); CHECK(ra.position().current==4 && ra.position().clock==1921);
   CHECK(ra.position().accepted_sequence==9);
 }
+static void test_interactive_observable_state() {
+  ntrk_test::InteractiveFixture f; RuntimeBinding binding; Player p; mix::Mixer mx; Runtime r;
+  CHECK(binding.compile(f.module,81,f.caps,3)==Status::Ok);
+  CHECK(r.bind(binding,p,mx,81,48000)==Status::Ok);
+  double out[256]={}; CHECK(r.render(out,32,2,48000)==Status::Ok);
+  CHECK(r.control(81,1,1,0)==Status::Ok); CHECK(r.layer(81,2,2,0,100)==Status::Ok);
+  CHECK(r.render(out,64,2,48000)==Status::Ok);
+  Position pos=r.position(); CHECK(pos.controls==1 && pos.layers==1);
+  CHECK(pos.control[0].id==1 && pos.control[0].held==0 && pos.control[0].applied==255);
+  CHECK(pos.layer[0].id==2 && pos.layer[0].target==0 && pos.layer[0].remaining==4736);
+  CHECK(r.set_pause(81,3,true)==Status::Ok);
+  CHECK(r.layer(81,4,2,65535,50)==Status::Ok); CHECK(r.render(out,64,2,48000)==Status::Ok);
+  const Position paused=r.position(); CHECK(paused.clock==pos.clock);
+  CHECK(paused.layer[0].current==pos.layer[0].current && paused.layer[0].held);
+  CHECK(paused.layer[0].held_value==65535 && paused.layer[0].held_fade_ms==50);
+}
 static void test_interactive() {
+  test_interactive_observable_state();
   test_interactive_stop_capability_and_defaults();
   test_interactive_drain_freezes_automation();
   test_interactive_idempotent_section_selection();
