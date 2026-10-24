@@ -23,7 +23,7 @@ layouts remain in README.md and the codecs in ntrk.h are authoritative.
 | 0x000F | IPAN instrument pan; always written critical, including centered pan |
 | 0x0010 | Spent AUTO ID; never reuse |
 | 0x0011 | META descriptive and private editor metadata; always optional |
-| 0x0012 | IMUS required interactive score; schema/preservation only, no runtime |
+| 0x0012 | IMUS required interactive score; explicit capability-bound runtime |
 
 Directory capacity is now **64 entries**, shared by known and unknown blocks.
 The historical maximum was 32. Raising the bound permits any historical
@@ -169,7 +169,8 @@ editor metadata separately from audio snapshots is outside this format contract.
 
 ## IMUS — required interactive music score (`0x0012`)
 
-**Format and codecs are implemented; interactive playback is not implemented.**
+**Format/codecs and the explicit capability-bound runtime are implemented.**
+The runtime API, ownership and limits are in [INTERACTIVE.md](INTERACTIVE.md).
 The v2 core header is unchanged. IDs `0x0007..0x0009` remain reserved and
 `0x0010` remains spent. META (`0x0011`) stays strictly descriptive: it cannot
 carry audio or gameplay semantics. IMUS has exactly one directory entry, whose
@@ -269,8 +270,8 @@ invalid/unsupported rates before binding or resuming. Rate changes while paused
 use the same conversion but do not advance the ramp.
 
 A zero-gain layer keeps sequencing and voices running during unpaused rendering;
-no new signal feeds sends but existing shared tails continue. The library does
-**not** implement these ramps, rate-change or pause processing yet.
+no new signal feeds sends but existing shared tails continue. The explicit runtime implements these ramps and the pause/remaining-time contract;
+plain players do not. See its API for accepted rates and host effect-buffer lifecycle.
 
 Section coordinates refer to order **occurrences**, not pattern IDs. Spans are
 half-open lexicographic `[start,end)`: start order is in the order list, rows
@@ -300,8 +301,8 @@ then process the destination row. `tail_policy` 0=cut clears mixer effect buffer
 explicit carry capability. Stop terminates voices and clears tracker command
 memory; cut clears effect buffers immediately, while a carry host drains effect
 buffers to its bounded tail deadline. A host must declare support for all requested policies and these reset semantics
-before binding playback. There is no implemented tail processor or binding in
-this library yet; carry must never be advertised just because its byte decoded.
+before binding playback. The explicit runtime implements bounded tail drain and capability binding;
+carry must never be advertised just because its byte decoded.
 
 Profile 1 section spans require fixed timing: swing is zero and primary note
 commands Bxx, Dxx, Fxx (including F00), E6x and EEx are refused inside spans.
@@ -334,11 +335,11 @@ supported schema, **not** playback permission. Both publish only validated views
 them in a critical block; no export silently strips the score.
 
 Default `player_start`, `render_add`, `mix::mixer_render_add` and skip paths
-block required interactive data. No interactive interpreter is implemented.
-The only playback opt-in currently provided is
+block required interactive data unless a concrete runtime grants its checked
+capability during rendering. The separate deliberate preview opt-in is
 `player_start_ex(..., PlaybackMode::LinearPreview)`: standard order/restart,
 SMUT and MACR semantics, ignoring controls/layers/sections/cues, bound to the
 chosen Module and IMUS view. Parsing permission never authorizes playback.
 Callers must choose and label linear preview explicitly; ordinary APIs never
-silently downgrade. Future runtime binding must be a separate capability and
-module-generation contract with renderer backstops.
+silently downgrade. Runtime binding is a separate capability and module-generation contract with
+renderer backstops; see [INTERACTIVE.md](INTERACTIVE.md).

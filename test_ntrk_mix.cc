@@ -5032,6 +5032,8 @@ static void test_imus_renderer_gate() {
   ntrk::mix::mixer_render_add(&mx,&p,audio,4,2,48000); CHECK(p.ticks_elapsed==ticks);
 }
 
+#include "test_support/interactive_tests.inc"
+
 int
 main(void) {
   test_bypass_is_render_add();
@@ -5117,6 +5119,7 @@ main(void) {
   test_config_seed_gives_an_audible_effect();
   test_choice_params_name_themselves();
   test_imus_renderer_gate();
+  test_interactive();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

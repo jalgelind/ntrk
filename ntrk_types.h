@@ -958,6 +958,9 @@ struct Channel {
 };
 
 struct Player {
+  // Runtime authorization is checked on every renderer entry; owned by the host runtime.
+  bool (*runtime_allowed)(const Player *, const void *) = nullptr;
+  const void *runtime_cookie = nullptr;
   // An explicit linear-preview choice is bound to the module and its score view.
   const Module *linear_preview_module = nullptr;
   const uint8_t *linear_preview_imus = nullptr;

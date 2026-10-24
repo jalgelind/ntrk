@@ -52,7 +52,7 @@ $(OUT)/test_ntrk_fx: test_ntrk_fx.cc $(HDRS) $(LIB_CC)
 test-ntrk-fx: $(OUT)/test_ntrk_fx
 	@$(OUT)/test_ntrk_fx
 
-$(OUT)/test_ntrk_mix: test_ntrk_mix.cc $(HDRS) $(LIB_CC)
+$(OUT)/test_ntrk_mix: test_ntrk_mix.cc $(HDRS) $(LIB_CC) $(wildcard test_support/*)
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -O2 -I. -o $@ test_ntrk_mix.cc
 

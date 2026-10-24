@@ -2542,12 +2542,13 @@ player_start_ex(Player *player, const Module *module, PlaybackMode mode) {
   player->until_tick = 0.0;
 }
 
-// Required scores have no runtime interpreter here. Only deliberate linear preview
-// can run: standard order/restart/SMUT/MACR, ignoring the interactive score.
+// Required scores need an active runtime capability or deliberate view-bound
+// linear preview. Parser recognition never grants either playback permission.
 inline bool player_playback_allowed(const Player *p) {
   if (!p || !p->module) return false;
   const Module *m = p->module;
   return (!m->imus && !m->imus_bytes) ||
+      (p->runtime_allowed && p->runtime_allowed(p, p->runtime_cookie)) ||
       (p->linear_preview_module == m && p->linear_preview_imus == m->imus &&
        p->linear_preview_bytes == m->imus_bytes);
 }

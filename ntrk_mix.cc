@@ -1589,7 +1589,7 @@ soft_clip_process(float *l, float *r, int frames) {
 
 void
 mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
-                 int channels, float sample_rate) {
+                 int channels, float sample_rate, const float *host_gain) {
   if (mx == nullptr || !player_playback_allowed(player) ||
       !player->playing)
     return;
@@ -1809,6 +1809,15 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
         if (st)
           for (int i = 0; i < run; ++i)
             vr[i] *= vol;
+      }
+      // Frame-major kMaxChannels stride. One host factor before both dry and sends;
+      // null leaves the ordinary arithmetic unchanged. Voices/inserts already advanced.
+      if (host_gain) {
+        for (int i = 0; i < run; ++i) {
+          const float g = host_gain[(frame + i) * kMaxChannels + c];
+          v[i] *= g;
+          if (st) vr[i] *= g;
+        }
       }
       // A mono caller gets a stereo voice's mid, as `render_add` gives it.
       if (st && !stereo)

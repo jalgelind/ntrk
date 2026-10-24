@@ -1113,7 +1113,8 @@ void soft_clip_process(float *l, float *r, int frames);
 // mixed there. Interleaved, `channels` per frame; odd outputs take the right
 // bus and even the left, so a mono caller gets the left one.
 void mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
-                      int channels, float sample_rate);
+                      int channels, float sample_rate,
+                      const float *host_gain = nullptr);
 
 // ----------------------------------------------------------------------------
 // -- Describing a cell
