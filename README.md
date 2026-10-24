@@ -684,9 +684,11 @@ numbers are taken.
 **Directory blocks**: `0x0001` FXPL (the second effect plane, with a `u16`
 `fx_columns` / `u16` `meta_columns` prefix), `0x0003` SYNP (one parameter record
 per SYNTH instrument), `0x0004` MACR (the macro table), `0x0005` MIXR (the
-mixer's configuration — see below). `0x0002` NAME and `0x0010` AUTO are reserved
-and stay spent rather than reused. Bit 0 of an entry's
-flags marks it **critical**: an id the reader does not know is skipped when
+mixer's configuration — see below). `0x0002` NAME is the instrument-name table;
+`0x0007..0x0009` remain planned/reserved and `0x0010` AUTO stays spent.
+`0x0011` META carries optional namespaced editor data. See [FORMAT.md](FORMAT.md)
+for the registry, bounds and editor compatibility policy. Bit 0 of an entry's
+flags marks it **critical**: an id the reader does not know is preserved when
 optional and refuses the file when critical, which is how this reader stays
 honest against one written by a later version.
 
@@ -739,7 +741,7 @@ by value, so `module_load` / `module_save` round-trip it with no pointer into th
 file. **The player and mixer never read it** — a hidden channel plays, mixes and
 renders exactly as before. It is always optional and written only when the mask is
 non-zero, so a file with every channel visible serializes byte for byte as it did.
-Every 16-bit mask is valid, all hidden included. A size, version or reserved word it
+Every 16-bit mask is valid, all hidden included; inactive bits are preserved. A size, version or reserved word it
 does not know is refused, like MIXR. A reader that predates the id skips it and plays
 the same audio, and drops the mask when it saves.
 

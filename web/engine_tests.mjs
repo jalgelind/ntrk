@@ -43,3 +43,28 @@ assert.equal(engine.command('pattern',[1]).rows[0][0],'PAN');
 engine.command('demo');assert.equal(engine.state()[12],0);
 assert.equal(engine.command('pattern',[0]).rows[0].length,16,'no FXPL means no fake FX lane');
 console.log(`WASM large geometry passed: ${original.length} bytes, ${256*149} formatted cells maximum, cache peak ${peakCache}, payload ${payload} bytes, exact load/edit/save`);
+
+// Native bridge fixtures are independent audio references for every actual channel count.
+for(let channels=1;channels<=16;++channels) {
+  const name=`count-${String(channels).padStart(2,'0')}`;
+  const original=fs.readFileSync(path.join(fixtures,name+'.ntrk'));
+  const snapshot=engine.command('load',[original]); assert.equal(snapshot.state[0],channels);
+  assert.deepEqual(Buffer.from(engine.command('save')),original);
+  engine.command('transport',[1,0,0]);
+  const bytes=fs.readFileSync(path.join(fixtures,name+'.f32'));
+  const expected=new Float32Array(bytes.buffer,bytes.byteOffset,bytes.length/4);
+  let energy=0;
+  for(let q=0;q<100;++q) {
+    const l=new Float32Array(128),r=new Float32Array(128); engine.render(l,r);
+    for(let i=0;i<128;++i) {
+      assert.equal(l[i],expected[q*256+i*2]); assert.equal(r[i],expected[q*256+i*2+1]);
+      energy+=l[i]*l[i]+r[i]*r[i];
+    }
+  }
+  assert(energy>0); engine.command('transport',[0,0,0]);
+  engine.command('edit',[0,1,channels-1,3,27]);
+  const expectedSave=Buffer.from(original); expectedSave[32+snapshot.orders.length+snapshot.state[4]*32+(channels+channels-1)*4+3]=27;
+  const saved=Buffer.from(engine.command('save')); assert.deepEqual(saved,expectedSave);
+  engine.command('load',[saved]); assert.deepEqual(Buffer.from(engine.command('save')),saved);
+}
+console.log('WASM counts 1..16: exact native audio, META/opaque bytes and inactive masks retained through load/edit/save');

@@ -7476,7 +7476,7 @@ test_module_param_table() {
     CHECK(!ntrk::module_save(&m, NULL, 0, &need));                             \
   } while (0)
 
-  MOD_REFUSED(m.channels = ntrk::kMaxChannels - 1);
+  MOD_REFUSED(m.channels = 0);
   MOD_REFUSED(m.channels = ntrk::kMaxChannels + 1);
   MOD_REFUSED(m.rows = 0);
   MOD_REFUSED(m.rows = ntrk::kMaxRows + 1);
@@ -8373,8 +8373,114 @@ test_instrument_pan() {
   for(int c=0;c<ntrk::kMaxChannels;++c)CHECK(l[c]==1 && r[c]==1);
 }
 
+static void test_extensions_metadata_counts() {
+  RtSpec s;
+  uint8_t metadata[128]; size_t meta_bytes = 0;
+  uint8_t payload[] = {0xFE, 0, 1, 2};
+  ntrk::MetaEntry e;
+  e.name = (const uint8_t*)"vendor.future"; e.name_bytes = 13;
+  e.version = 99; e.data = payload; e.bytes = sizeof payload;
+  CHECK(ntrk::meta_encode(&e, 1, metadata, sizeof metadata, &meta_bytes));
+  CHECK(ntrk::meta_valid(metadata, meta_bytes));
+  CHECK(!ntrk::meta_valid(metadata, meta_bytes-1));
+  CHECK(!ntrk::meta_valid(metadata, ntrk::kMaxMetadataBytes+1));
+  uint8_t duplicate_meta[256]; memcpy(duplicate_meta,metadata,meta_bytes);
+  memcpy(duplicate_meta+meta_bytes,metadata+4,meta_bytes-4);
+  ntrk::write_u16(duplicate_meta,2);
+  CHECK(!ntrk::meta_valid(duplicate_meta,2*meta_bytes-4));
+  duplicate_meta[meta_bytes]=0;
+  ntrk::write_u16(duplicate_meta,1);
+  CHECK(!ntrk::meta_valid(duplicate_meta,meta_bytes+1));
+  metadata[2]=1; CHECK(!ntrk::meta_valid(metadata, meta_bytes)); metadata[2]=0;
+  metadata[5]=1; CHECK(!ntrk::meta_valid(metadata, meta_bytes)); metadata[5]=0;
+  metadata[12]='V'; CHECK(!ntrk::meta_valid(metadata, meta_bytes)); metadata[12]='v';
+  ntrk::MetaEntry duplicate[2] = {e,e}; size_t need=0;
+  CHECK(!ntrk::meta_encode(duplicate,2,nullptr,0,&need));
+  CHECK(!ntrk::meta_encode(&e,1,metadata,meta_bytes-1,&need));
+  CHECK(need==meta_bytes);
+  uint8_t saved[65536], again[65536];
+  for (int channels=1; channels<=16; ++channels) {
+    s.channels=channels;
+    ntrk::Module m; rt_build(&m,s);
+    m.metadata=metadata; m.metadata_bytes=(uint32_t)meta_bytes;
+    m.hidden_channels=0x8000; m.slot_mute[0]=0x8000;
+    m.extension_count=1; m.extensions[0].id=0x7000;
+    m.extensions[0].data=payload; m.extensions[0].bytes=sizeof payload;
+    CHECK(ntrk::module_save(&m,nullptr,0,&need));
+    size_t written=0;
+    CHECK(!ntrk::module_save(&m,saved,need-1,&written)); CHECK(written==need);
+    CHECK(ntrk::module_save(&m,saved,sizeof saved,&written)); CHECK(written==need);
+    ntrk::Module loaded;
+    CHECK(ntrk::module_load(&loaded,saved,written)); CHECK(loaded.channels==channels);
+    CHECK(loaded.hidden_channels==0x8000 && loaded.slot_mute[0]==0x8000);
+    CHECK(loaded.extension_count==1 && loaded.extensions[0].id==0x7000);
+    CHECK(memcmp(loaded.extensions[0].data,payload,sizeof payload)==0);
+    CHECK(loaded.metadata_bytes==meta_bytes && memcmp(loaded.metadata,metadata,meta_bytes)==0);
+    size_t n=0; CHECK(ntrk::module_save(&loaded,again,sizeof again,&n));
+    CHECK(n==written && memcmp(saved,again,n)==0);
+    // Optional metadata/opaque bytes have no effect on audio. Negative control changes a note.
+    ntrk::Module plain=loaded; plain.metadata=nullptr; plain.metadata_bytes=0; plain.extension_count=0;
+    ntrk::Player a,b; ntrk::player_start(&a,&loaded); ntrk::player_start(&b,&plain);
+    double aa[512]={},bb[512]={};
+    ntrk::render_add(&a,aa,256,2,48000); ntrk::render_add(&b,bb,256,2,48000);
+    CHECK(memcmp(aa,bb,sizeof aa)==0);
+    ntrk::Module changed=plain; ntrk::Note cells[kRtCells];
+    memcpy(cells,plain.patterns,sizeof cells); cells[0].note=36; changed.patterns=cells;
+    ntrk::Player c; ntrk::player_start(&c,&changed); double cc[512]={};
+    ntrk::render_add(&c,cc,256,2,48000); CHECK(memcmp(aa,cc,sizeof aa)!=0);
+  }
+  ntrk::Module m; s.channels=16; rt_build(&m,s);
+  // 63 extras plus mandatory IPAN fills the explicit 64-entry directory budget.
+  m.extension_count=ntrk::kMaxBlocks-1;
+  for(int i=0;i<m.extension_count;++i) {
+    m.extensions[i].id=uint16_t(0x7000+i); m.extensions[i].data=payload; m.extensions[i].bytes=4;
+  }
+  CHECK(ntrk::module_save(&m,saved,sizeof saved,&need));
+  ntrk::Module loaded; CHECK(ntrk::module_load(&loaded,saved,need));
+  CHECK(loaded.extension_count==63);
+  m.extensions[63]=m.extensions[62]; m.extensions[63].id=0x7100; m.extension_count=64;
+  CHECK(!ntrk::module_save(&m,nullptr,0,&need));
+  m.extension_count=2; m.extensions[1]=m.extensions[0];
+  CHECK(!ntrk::module_save(&m,nullptr,0,&need));
+  m.extension_count=1; m.extensions[0].id=ntrk::kBlockName;
+  CHECK(!ntrk::module_save(&m,nullptr,0,&need));
+  m.extensions[0].id=0x7000; m.extensions[0].bytes=UINT32_MAX;
+  CHECK(!ntrk::module_save(&m,nullptr,0,&need));
+  m.extensions[0].bytes=4; CHECK(ntrk::module_save(&m,saved,sizeof saved,&need));
+  size_t dir=32+m.order_count+m.instrument_count*32+m.pattern_count*m.rows*m.channels*4+
+             ntrk::read_u32(saved+22);
+  // Unknown critical, duplicate ID, truncated payload and malformed MIXR must refuse.
+  ntrk::write_u16(saved+dir+12+2,1); CHECK(!ntrk::module_load(&loaded,saved,need));
+  ntrk::write_u16(saved+dir+12+2,0);
+  ntrk::write_u16(saved+dir+12,ntrk::kBlockIpan); CHECK(!ntrk::module_load(&loaded,saved,need));
+  ntrk::write_u16(saved+dir+12,0x7000);
+  ntrk::write_u32(saved+dir+12+8,0xFFFFFFFF); CHECK(!ntrk::module_load(&loaded,saved,need));
+  // Empty known block at end-of-file must reject before reading its version.
+  ntrk::write_u16(saved+dir+12,ntrk::kBlockMixr);
+  ntrk::write_u32(saved+dir+12+4,(uint32_t)need);
+  ntrk::write_u32(saved+dir+12+8,0); CHECK(!ntrk::module_load(&loaded,saved,need));
+  ntrk::Module huge=m;
+  huge.instruments[0].type=(uint8_t)ntrk::InstrumentType::kPcm16;
+  huge.instruments[0].flags=ntrk::kInstrumentStereo;
+  huge.instruments[0].length=0x7fffffff;
+  CHECK(!ntrk::module_save(&huge,nullptr,0,&need));
+  // Arbitrary input: all truncations and deterministic random bytes stay bounded under ASan.
+  CHECK(ntrk::module_save(&m,saved,sizeof saved,&need));
+  for(size_t n=0;n<need;++n) { ntrk::Module x; ntrk::module_load(&x,saved,n); }
+  uint32_t rng=123;
+  for(int pass=0;pass<2000;++pass) {
+    size_t n=size_t(pass)%512;
+    for(size_t i=0;i<n;++i) { rng=rng*1664525+1013904223; again[i]=uint8_t(rng>>24); }
+    ntrk::Module x; ntrk::module_load(&x,again,n);
+    memcpy(again,saved,need);
+    again[rng%need] ^= uint8_t(1u << (pass%8));
+    ntrk::module_load(&x,again,need);
+  }
+}
+
 int
 main(void) {
+  test_extensions_metadata_counts();
   test_loads();
   test_refusals();
   test_noise_and_silence();

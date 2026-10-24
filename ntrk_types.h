@@ -644,6 +644,14 @@ struct Macro {
   MacroTarget targets[kMaxMacroTargets];
 };
 
+// Fixed resource budget: enough for historical 32-block files plus every known block.
+const int kMaxBlocks = 64;
+struct ExtensionBlock {
+  uint16_t id = 0;
+  const uint8_t *data = nullptr;
+  uint32_t bytes = 0;
+};
+
 struct Module {
   // A fresh `Module` already carries a mixer — `mix_default` — because the
   // mixer is no longer an optional feature a file may or may not have used;
@@ -651,6 +659,11 @@ struct Module {
   // does) still zero-inits every other field the way it always has; this
   // constructor only reaches into `mix`.
   Module() { mix_default(mix); }
+
+  int extension_count = 0;
+  ExtensionBlock extensions[kMaxBlocks]; // borrowed optional payloads; never audio input
+  const uint8_t *metadata = nullptr;
+  uint32_t metadata_bytes = 0;
 
   int version = 2;           // the only one; module_save refuses any other
 

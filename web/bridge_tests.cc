@@ -172,6 +172,54 @@ void test_large_geometry(const char *directory) {
   std::puts("web large geometry: 198 patterns x256 rows,8 FXPL+5 meta,16MiB-cap save/load/edit passed");
 }
 
+void test_active_counts(const char* directory) {
+  for(int channels=1;channels<=16;++channels) {
+    assert(web_demo(48000)); song.channels=channels;
+    std::memset(notes,0,sizeof(ntrk::Note)*song.pattern_count*song.rows*channels);
+    notes[0].note=25; notes[0].instrument=1;
+    notes[(song.rows-1)*channels+channels-1].note=29; notes[(song.rows-1)*channels+channels-1].instrument=1;
+    uint8_t opaque[]={0,255,3,4};
+    uint8_t fields[64]; size_t fields_bytes=0;
+    ntrk::MetaField f; f.tag=1; f.data=(const uint8_t*)"Small song"; f.bytes=10;
+    assert(ntrk::meta_field_encode(f,fields,sizeof fields,&fields_bytes));
+    f.tag=0x8000; f.data=opaque; f.bytes=4; size_t tail=0;
+    assert(ntrk::meta_field_encode(f,fields+fields_bytes,sizeof fields-fields_bytes,&tail)); fields_bytes+=tail;
+    ntrk::MetaEntry entries[2];
+    entries[0].name=(const uint8_t*)"ntrk.names"; entries[0].name_bytes=10; entries[0].version=1;
+    entries[0].data=fields; entries[0].bytes=(uint32_t)fields_bytes;
+    entries[1].name=(const uint8_t*)"vendor.future"; entries[1].name_bytes=13; entries[1].version=99;
+    entries[1].data=opaque; entries[1].bytes=4;
+    uint8_t meta[256]; size_t n=0; assert(ntrk::meta_encode(entries,2,meta,sizeof meta,&n));
+    song.metadata=meta; song.metadata_bytes=(uint32_t)n;
+    song.extension_count=1; song.extensions[0].id=0x7331;
+    song.extensions[0].data=opaque; song.extensions[0].bytes=4;
+    song.hidden_channels=0x8000; song.slot_mute[0]=0x8000;
+    const int size=web_save(); assert(size>0);
+    std::vector<uint8_t> original(web_input(),web_input()+size);
+    assert(web_load(size)); assert(web_info(0)==channels);
+    assert(web_save()==size && !memcmp(original.data(),web_input(),size));
+    char name[32]; snprintf(name,sizeof name,"count-%02d",channels);
+    if(directory) {
+      std::string path=std::string(directory)+"/"+name+".ntrk";
+      FILE* file=fopen(path.c_str(),"wb"); assert(file);
+      assert(fwrite(original.data(),1,original.size(),file)==original.size()); fclose(file);
+      path=std::string(directory)+"/"+name+".f32";
+      file=fopen(path.c_str(),"wb"); assert(file);
+      assert(web_transport(1,0,0));
+      for(int quantum=0;quantum<100;++quantum) {
+        assert(web_render(128)); float samples[256];
+        for(int i=0;i<256;++i) { assert(std::isfinite(audio[i])); samples[i]=(float)audio[i]; }
+        assert(fwrite(samples,sizeof(float),256,file)==256);
+      }
+      fclose(file); assert(web_transport(0,0,0));
+    }
+    assert(web_edit(0,1,channels-1,3,27));
+    assert(!web_edit(0,1,channels,3,27));
+    assert(web_save()>0); assert(song.metadata_bytes==n && !memcmp(song.metadata,meta,n));
+    assert(song.extension_count==1 && !memcmp(song.extensions[0].data,opaque,4));
+  }
+}
+
 int main(int argc, char **argv) {
   assert(!web_demo(0));
   assert(web_demo(48000));
@@ -266,6 +314,7 @@ int main(int argc, char **argv) {
     assert(web_transport(1, 0, 0) && web_render(128));
     for (double value : audio) assert(std::isfinite(value));
   }
+  test_active_counts(argc > 1 ? argv[1] : nullptr);
   test_imports(argc > 1 ? argv[1] : nullptr);
   test_channel_usage(argc > 1 ? argv[1] : nullptr);
   test_command_metadata(argc > 1 ? argv[1] : nullptr);

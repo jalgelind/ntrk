@@ -215,7 +215,7 @@ test_convert_loads_and_renders() {
   ntrk::Module module;
   CHECK(ntrk::module_load(&module, g_out, out_size));
   CHECK(module.version == 2);
-  CHECK(module.channels == ntrk::kMaxChannels);
+  CHECK(module.channels == 4);
   CHECK(module.rows == 64);
   CHECK(module.speed == 6);
   CHECK(module.bpm == 125);
@@ -704,7 +704,7 @@ test_xm_cells() {
     CHECK(ntrk::module_load(&module, g_out, out_size));
     CHECK(module.version == 2);              // sixteen channels, ninety-six notes
     CHECK(module.note_max == ntrk::kMaxNote);
-    CHECK(module.channels == ntrk::kMaxChannels);
+    CHECK(module.channels == 4);
     CHECK(module.rows == 8);
     CHECK(module.speed == 6);
     CHECK(module.bpm == 125);
@@ -712,7 +712,7 @@ test_xm_cells() {
 
     // The file's own four channels, padded to sixteen: cell `r * kCh + c`
     // still names row `r`, channel `c` -- only the row stride grew.
-    const int kCh = ntrk::kMaxChannels;
+    const int kCh = 4;
     const ntrk::Note *n = module.patterns;
     // **The cells are the file's own, and the three octaves are on the
     // instrument.** XM's note 49 plays a sample at its recorded rate and ours
@@ -938,7 +938,7 @@ test_xm_short_patterns() {
 
   // The second pattern is four rows in an eight-row block, so it breaks at the
   // end of row three rather than playing four rows of silence.
-  const int kCh = ntrk::kMaxChannels;
+  const int kCh = 4;
   const ntrk::Note *p1 = module.patterns + 8 * kCh;
   bool found = false;
   for (int c = 0; c < 4; ++c)
@@ -977,7 +977,7 @@ static void
 test_xm_global_volume() {
   // The cell at row `r`, channel `c`, in the probe layout: the file's own
   // four channels, padded to sixteen.
-  const int kCh = ntrk::kMaxChannels;
+  const int kCh = 4;
 
   // ---- a `G` ramp, which is what a fade-out is written as -------------------
   {
@@ -1405,8 +1405,34 @@ test_real_files(const char *ext) {
   closedir(dir);
 }
 
+// The previous conversion padded to sixteen. Compare its exact replay to source-width output.
+static void test_source_width_audio() {
+  for (int fmt=0;fmt<2;++fmt) {
+    size_t src=0,n=0;
+    if(fmt==0) CHECK(convert(spec_typical(),&src,&n));
+    else { XmSpec s; CHECK(xm_convert(s,&src,&n)); }
+    ntrk::Module narrow; CHECK(ntrk::module_load(&narrow,g_out,n));
+    CHECK(narrow.channels==4);
+    const int rows=narrow.pattern_count*narrow.rows;
+    ntrk::Note* padding=new ntrk::Note[size_t(rows)*16];
+    for(int r=0;r<rows;++r) for(int c=0;c<narrow.channels;++c)
+      padding[r*16+c]=narrow.patterns[r*narrow.channels+c];
+    ntrk::Module old=narrow; old.channels=16; old.patterns=padding;
+    ntrk::Player a,b; ntrk::player_start(&a,&narrow); ntrk::player_start(&b,&old);
+    bool audible=false;
+    for(int quantum=0;quantum<2400;++quantum) {
+      double aa[256]={},bb[256]={};
+      ntrk::render_add(&a,aa,128,2,48000); ntrk::render_add(&b,bb,128,2,48000);
+      CHECK(memcmp(aa,bb,sizeof aa)==0);
+      for(int i=0;i<256;++i) if(aa[i]!=0) audible=true;
+    }
+    CHECK(audible); delete[] padding;
+  }
+}
+
 int
 main() {
+  test_source_width_audio();
   test_detect();
   test_convert_loads_and_renders();
   test_instrument_trimming();

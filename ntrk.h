@@ -673,7 +673,7 @@ struct ModParamInfo {
 inline const ModParamInfo *
 module_param_table(int *count) {
   static const ModParamInfo kTable[(int) ModParam::kCount] = {
-      {"channels", kMaxChannels, kMaxChannels},  // fixed: every module has all sixteen
+      {"channels", 1, kMaxChannels},
       {"rows", 1, kMaxRows},
       {"speed", 1, 31},
       {"bpm", 32, 255},
@@ -858,14 +858,15 @@ const int kInstrumentBytes = 32;
 // The block directory: `id` (u16), `flags` (u16), `offset` (u32 from the start
 // of the file), `bytes` (u32).
 const int kDirectoryEntryBytes = 12;
-const int kMaxBlocks = 32;
+
 
 // Block ids. FXPL, NAME, SYNP, MACR, MIXR, TUNE, SLIC, SMUT, ITUN, IPAN, EFXS and EDIT are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
 // stays spent rather than reused so a file written against the older sketch
 // cannot be misread as something else. An id this reader does not know is
-// skipped when the file says it is optional and refused when it says it is
+// preserved when the file says it is optional and refused when it says it is
 // critical, which is how this reader stays honest against a file written by a
 // later one.
+const uint16_t kBlockMeta = 0x0011;
 const uint16_t kBlockFxpl = 0x0001;
 const uint16_t kBlockName = 0x0002;
 const uint16_t kBlockTune = 0x0006;
@@ -897,11 +898,112 @@ const int kEfxsBytes = 2;
 // next save. Written only when the mask is non-zero, so a file with every channel visible
 // has no block and serializes as it did before. A version or length this reader does not
 // know, or a reserved word that is not zero, is refused like MIXR's. Every mask is valid:
-// all sixteen channels always exist, and hiding all of them is the editor's to survive.
+// inactive bits are preserved, and hiding every active channel is the editor's to survive.
 const uint16_t kBlockEdit = 0x000E;
 const int kEditBytes = 6;
 const uint16_t kEditVersion = 1;
 const uint16_t kBlockCritical = 0x0001;   // a directory entry's flags, bit 0
+
+// META framing and field TLVs have one codec, shared by core and editors.
+const uint32_t kMaxMetadataBytes = 65536;
+const int kMaxMetadataEntries = 64;
+struct MetaEntry {
+  const uint8_t *name = nullptr;
+  uint8_t name_bytes = 0;
+  uint16_t version = 0;
+  const uint8_t *data = nullptr;
+  uint32_t bytes = 0;
+};
+inline bool meta_namespace_valid(const uint8_t *p, size_t n) {
+  if (!p || n < 1 || n > 63) return false;
+  for (size_t i = 0; i < n; ++i)
+    if (!((p[i] >= 'a' && p[i] <= 'z') || (p[i] >= '0' && p[i] <= '9') ||
+          p[i] == '.' || p[i] == '_' || p[i] == '-')) return false;
+  return true;
+}
+// Cursor starts at 4, after the count/reserved words; false means end or invalid.
+inline bool meta_next(const uint8_t *p, size_t n, size_t *at, MetaEntry *e) {
+  if (!p || !at || !e || *at > n || n - *at < 8) return false;
+  const uint8_t *h = p + *at;
+  size_t len = h[0];
+  uint32_t bytes = read_u32(h + 4);
+  if (h[1] || len > n - *at - 8 || bytes > n - *at - 8 - len ||
+      !meta_namespace_valid(h + 8, len)) return false;
+  e->name = h + 8; e->name_bytes = (uint8_t)len;
+  e->version = read_u16(h + 2); e->data = h + 8 + len; e->bytes = bytes;
+  *at += 8 + len + bytes;
+  return true;
+}
+inline bool meta_valid(const uint8_t *p, size_t n) {
+  if (!p || n < 4 || n > kMaxMetadataBytes || read_u16(p + 2) ||
+      read_u16(p) > kMaxMetadataEntries) return false;
+  MetaEntry seen[kMaxMetadataEntries];
+  size_t at = 4;
+  for (int i = 0; i < (int)read_u16(p); ++i) {
+    if (!meta_next(p, n, &at, &seen[i])) return false;
+    for (int j = 0; j < i; ++j) {
+      if (seen[j].name_bytes != seen[i].name_bytes) continue;
+      size_t k = 0;
+      while (k < seen[i].name_bytes && seen[j].name[k] == seen[i].name[k]) ++k;
+      if (k == seen[i].name_bytes) return false;
+    }
+  }
+  return at == n;
+}
+inline bool meta_encode(const MetaEntry *entries, int count, uint8_t *out,
+                        size_t cap, size_t *written) {
+  if (!written) return false;
+  *written = 0;
+  if (count < 0 || count > kMaxMetadataEntries || (count && !entries)) return false;
+  size_t total = 4;
+  for (int i = 0; i < count; ++i) {
+    const MetaEntry &e = entries[i];
+    if (!meta_namespace_valid(e.name, e.name_bytes) || (e.bytes && !e.data) ||
+        e.bytes > kMaxMetadataBytes || total + 8 + e.name_bytes + e.bytes > kMaxMetadataBytes)
+      return false;
+    for (int j = 0; j < i; ++j) {
+      if (entries[j].name_bytes != e.name_bytes) continue;
+      size_t k = 0;
+      while (k < e.name_bytes && entries[j].name[k] == e.name[k]) ++k;
+      if (k == e.name_bytes) return false;
+    }
+    total += 8 + e.name_bytes + e.bytes;
+  }
+  *written = total;
+  if (!out) return true;
+  if (cap < total) return false;
+  write_u16(out, (uint16_t)count); write_u16(out + 2, 0);
+  size_t at = 4;
+  for (int i = 0; i < count; ++i) {
+    const MetaEntry &e = entries[i];
+    out[at] = e.name_bytes; out[at+1] = 0;
+    write_u16(out+at+2, e.version); write_u32(out+at+4, e.bytes); at += 8;
+    for (size_t k = 0; k < e.name_bytes; ++k) out[at++] = e.name[k];
+    for (size_t k = 0; k < e.bytes; ++k) out[at++] = e.data[k];
+  }
+  return true;
+}
+struct MetaField { uint16_t tag = 0; const uint8_t *data = nullptr; uint32_t bytes = 0; };
+inline bool meta_field_next(const uint8_t *p, size_t n, size_t *at, MetaField *f) {
+  if (!p || !at || !f || *at > n || n - *at < 8) return false;
+  const uint8_t *h = p + *at;
+  if (read_u16(h+2) || read_u32(h+4) > n - *at - 8) return false;
+  f->tag = read_u16(h); f->bytes = read_u32(h+4); f->data = h+8;
+  *at += 8 + f->bytes;
+  return true;
+}
+inline bool meta_field_encode(const MetaField &f, uint8_t *out, size_t cap, size_t *written) {
+  if (!written || f.bytes > kMaxMetadataBytes || (f.bytes && !f.data)) return false;
+  *written = 8 + (size_t)f.bytes;
+  if (!out) return true;
+  if (cap < *written) return false;
+  write_u16(out, f.tag); write_u16(out+2, 0); write_u32(out+4, f.bytes);
+  for (size_t i=0; i<f.bytes; ++i) out[8+i] = f.data[i];
+  return true;
+}
+inline bool block_known(uint16_t id) {
+  return (id >= 1 && id <= 6) || (id >= 0xA && id <= 0xF) || id == kBlockMeta;
+}
 
 // SMUT: `u16 order_count`, `u16 channels`, then one `u16 LE` per order position
 // -- bit `c` set means channel `c` is silent for that position. `kMaxChannels`
@@ -1226,21 +1328,26 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // **One layout.** Versions 1 and 2 were dropped, not up-converted: a block
       // that is not exactly this version at exactly this length is refused, and
       // the file with it.
-      if (read_u16(data + offset) != (uint16_t) kMixrVersion ||
-          bytes != (uint32_t) kMixrBytes)
+      if (bytes != (uint32_t) kMixrBytes ||
+          read_u16(data + offset) != (uint16_t) kMixrVersion)
         return false;
       if (read_u16(data + offset + 2) != (uint16_t) kMixrSlots)
         return false;
       for (int k = 0; k < kMixrBytes; ++k)
         module->mix[k] = data[offset + (uint32_t) k];
+    } else if (id == kBlockMeta) {
+      if (flags || !meta_valid(data + offset, bytes)) return false;
+      module->metadata = data + offset;
+      module->metadata_bytes = bytes;
     } else if ((flags & kBlockCritical) != 0u) {
       // A block the writer said the file cannot be played without, and this
       // reader does not know it. Playing anyway would be playing something else.
       return false;
     }
-    // ponytail: an unknown optional block is skipped, and lost on the next
-    // save. Carrying one through wants a table on Module; add it when something
-    // actually writes one.
+    else {
+      ExtensionBlock &b = module->extensions[module->extension_count++];
+      b.id = id; b.data = data + offset; b.bytes = bytes;
+    }
   }
 
   // Payloads are bounds-checked but not checked for overlap. An overlapping
@@ -1423,9 +1530,7 @@ module_load(Module *module, const uint8_t *data, size_t size) {
     if (smut_bytes != (size_t) kSmutHeaderBytes + (size_t) so * 2u)
       return false;
     for (int i = 0; i < so; ++i) {
-      // `sc` above is already pinned to `module->channels`, which is always
-      // `kMaxChannels` (16) -- every bit of a u16 names a channel that exists,
-      // so there is no "bit above the channel count" case left to refuse.
+      // Preserve inactive capacity bits; they take effect only on regrowth.
       const uint16_t bits = read_u16(smut + kSmutHeaderBytes + (size_t) i * 2u);
       module->slot_mute[i] = bits;
       if (bits != 0u)
@@ -1757,7 +1862,9 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     }
     if (ins.type == (uint8_t) InstrumentType::kWaveBuiltin)
       continue;         // generated at load, so it stores nothing at all
-    blob_bytes += instrument_blob_bytes(ins);
+    const uint64_t bytes = (uint64_t) ins.length * instrument_frame_bytes(ins);
+    if (bytes > UINT32_MAX - (uint64_t) blob_bytes) return false;
+    blob_bytes += (size_t) bytes;
   }
 
   // The two fields the loader will check on the way back in. Everything else in
@@ -1859,12 +1966,23 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const bool want_efxs = efxs_high != 0u;
   const bool want_edit = module->hidden_channels != 0u;   // see kBlockEdit
 
-  const int block_count = 1 + (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
+  size_t extra_bytes = module->metadata_bytes;
+  if ((module->metadata_bytes && !meta_valid(module->metadata, module->metadata_bytes)) ||
+      module->extension_count < 0 || module->extension_count > kMaxBlocks) return false;
+  for (int i = 0; i < module->extension_count; ++i) {
+    const ExtensionBlock &b = module->extensions[i];
+    if (block_known(b.id) || (b.bytes && !b.data)) return false;
+    for (int j = 0; j < i; ++j) if (module->extensions[j].id == b.id) return false;
+    if (b.bytes > UINT32_MAX - extra_bytes) return false;
+    extra_bytes += b.bytes;
+  }
+  const int block_count = module->extension_count + (module->metadata_bytes ? 1 : 0) + 1 + (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
                           (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
                           (want_macr ? 1 : 0) + (want_mixr ? 1 : 0) +
                           (want_slic ? 1 : 0) + (want_smut ? 1 : 0) +
                           (want_itun ? 1 : 0) + (want_efxs ? 1 : 0) +
                           (want_edit ? 1 : 0);
+  if (block_count > kMaxBlocks) return false;
   const size_t directory_bytes =
       (size_t) block_count * (size_t) kDirectoryEntryBytes;
   // Lanes rather than channels, and the four-byte prefix that says how many.
@@ -1895,16 +2013,18 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
       want_itun ? (size_t) module->instrument_count * 2u : 0u;
   const size_t efxs_bytes = want_efxs ? (size_t) kEfxsBytes : 0u;
   const size_t edit_bytes = want_edit ? (size_t) kEditBytes : 0u;
-  const size_t total = (size_t) kHeaderBytes + order_bytes + instrument_bytes +
+  const uint64_t total = (uint64_t) kHeaderBytes + order_bytes + instrument_bytes +
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
                        tune_bytes + name_bytes + synp_bytes + macr_bytes +
                        mixr_bytes + slic_bytes + smut_bytes + itun_bytes +
                        efxs_bytes + edit_bytes + (size_t) module->instrument_count;
 
-  *written = total;
+  if (total > UINT32_MAX || extra_bytes > UINT32_MAX - total) return false;
+  const size_t final_total = total + extra_bytes;
+  *written = final_total;
   if (out == nullptr)
     return true;
-  if (cap < total)
+  if (cap < final_total)
     return false;
 
   for (size_t i = 0; i < (size_t) kHeaderBytes; ++i)
@@ -2254,7 +2374,16 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     at += mixr_bytes;
   }
 
-  return at == total;
+  for (int i = -1; i < module->extension_count; ++i) {
+    const uint8_t *p = i < 0 ? module->metadata : module->extensions[i].data;
+    const uint32_t n = i < 0 ? module->metadata_bytes : module->extensions[i].bytes;
+    if (i < 0 && !n) continue;
+    write_u16(out+entry, i < 0 ? kBlockMeta : module->extensions[i].id);
+    write_u16(out+entry+2, 0); write_u32(out+entry+4, (uint32_t)at);
+    write_u32(out+entry+8, n); entry += kDirectoryEntryBytes;
+    for (size_t k = 0; k < n; ++k) out[at++] = p[k];
+  }
+  return at == final_total;
 }
 
 // ----------------------------------------------------------------------------

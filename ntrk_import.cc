@@ -151,9 +151,7 @@ mod_geometry(const uint8_t *data, size_t size, ModGeometry *geom) {
   geom->order_count = song_length;
   geom->restart = restart;
   geom->pattern_bytes = pattern_bytes;
-  // `kMaxChannels`, not `channels` -- a `.mod` is at most eight wide and every
-  // ntrk module is sixteen, so the `Note` array the cells unpack into (and
-  // then widen in place within) needs the full width's room, not the file's.
+  // Keep the historical scratch budget; output retains the source channel count.
   geom->scratch_bytes = (size_t) pattern_count * (size_t) kModRows *
                         (size_t) kMaxChannels * 4u;
   return true;
@@ -442,12 +440,8 @@ xm_geometry(const uint8_t *data, size_t size, XmGeometry *geom) {
     return false;
   if ((size_t) header_bytes < 20u + (size_t) order_count)
     return false;
-  // **More than sixteen is refused, never mixed down.** XM allows thirty-two
-  // channels and ntrk always has sixteen; a converter that folded the extra
-  // ones together would be making up a mix, which is not an import. Fewer
-  // than sixteen is the common case and is padded, not refused — see
-  // `widen_channels`, which every module (including `.mod`'s own narrower
-  // ones) now goes through, since sixteen is the format's fixed width.
+  // More than sixteen is refused rather than mixed down. Smaller counts keep
+  // their original stride and count; unused capacity is not part of the file.
   if (channels < 1 || channels > kMaxChannels)
     return false;
   if (pattern_count < 1 || pattern_count > 256)
@@ -506,11 +500,7 @@ xm_geometry(const uint8_t *data, size_t size, XmGeometry *geom) {
   geom->instrument_count = instrument_count;
   geom->pattern_at = 60u + (size_t) header_bytes;
   geom->instrument_at = at;
-  // `kMaxChannels`, not `channels` -- every ntrk module is sixteen channels
-  // wide now, and a source narrower than that is padded up to it (see
-  // `widen_channels`), so the scratch this sizes has to hold the WIDE array,
-  // not the file's own one. The unpack still writes at the file's own stride;
-  // widening runs after, in place, in the room this reserves for it.
+  // Keep the historical scratch budget; output retains the source channel count.
   geom->cell_bytes = (size_t) pattern_count * (size_t) rows_max *
                      (size_t) kMaxChannels * 4u;
   return xm_instruments(data, size, at, instrument_count, nullptr, nullptr,
@@ -1031,33 +1021,6 @@ xm_bake_global_volume(const uint8_t *data, const XmGeometry &geom,
   }
 }
 
-// **Every ntrk module is `kMaxChannels` wide now, and a source narrower than
-// that is padded, never left as its own count.** `notes` holds
-// `patterns*rows` rows already packed at `from` channels, densely, at the
-// FRONT of a buffer sized for `kMaxChannels` — the caller's scratch sizing
-// (`geom.cell_bytes` / `ModGeometry::scratch_bytes`) already reserves the
-// room. This spreads that dense packing out to the wide stride, in place.
-//
-// **Backwards, row by row, or it self-clobbers.** Row `r`'s destination slots
-// are `[r*kMaxChannels, r*kMaxChannels+kMaxChannels)`; its source slots are
-// `[r*from, r*from+from)`. Since `kMaxChannels &gt;= from`, row `r`'s destination
-// never starts before row `r-1`'s source ends — so processing every row's
-// channels from `kMaxChannels-1` down to `0`, and the rows themselves from
-// last to first, reads every source cell before anything is written over it.
-// A forward pass would overwrite row 1's real cells with row 0's padding
-// before row 1 was ever read.
-void
-widen_channels(Note *notes, int patterns, int rows, int from) {
-  if (from >= kMaxChannels)
-    return;
-  for (int row = patterns * rows - 1; row >= 0; --row) {
-    Note *dst = notes + (size_t) row * (size_t) kMaxChannels;
-    const Note *src = notes + (size_t) row * (size_t) from;
-    for (int c = kMaxChannels - 1; c >= 0; --c)
-      dst[c] = c < from ? src[c] : Note{};
-  }
-}
-
 bool
 xm_convert(const uint8_t *data, size_t size, uint8_t *scratch,
            size_t scratch_size, uint8_t *out, size_t out_cap, size_t *written) {
@@ -1072,7 +1035,7 @@ xm_convert(const uint8_t *data, size_t size, uint8_t *scratch,
 
   Module module;
   module.note_max = kMaxNote;  // an `.xm` reaches well past three octaves
-  module.channels = kMaxChannels;
+  module.channels = geom.channels;
   module.rows = geom.rows;
   module.speed = geom.speed;
   module.bpm = geom.bpm;
@@ -1109,11 +1072,6 @@ xm_convert(const uint8_t *data, size_t size, uint8_t *scratch,
   // Last, so the instrument volumes it reads are the ones `xm_instruments`
   // settled on.
   xm_bake_global_volume(data, geom, module.instruments, notes);
-
-  // **After the bake, not before.** Both it and the unpack above index `notes`
-  // at the file's own `geom.channels` stride; widening changes that stride, so
-  // anything that still reads at the old one has to run first.
-  widen_channels(notes, geom.pattern_count, geom.rows, geom.channels);
 
   return module_save(&module, out, out_cap, written);
 }
@@ -1179,7 +1137,7 @@ import_convert(const uint8_t *data, size_t size, uint8_t *scratch,
   // The defaults are what a `.mod` is: three octaves, PCM8, no plane, no
   // blocks. Nothing below has to switch any of that off.
   Module module;
-  module.channels = kMaxChannels;
+  module.channels = geom.channels;
   module.rows = geom.rows;
   module.speed = 6;
   module.bpm = 125;
@@ -1273,10 +1231,6 @@ import_convert(const uint8_t *data, size_t size, uint8_t *scratch,
   module.instrument_count = named > last_used ? named : last_used;
   if (module.instrument_count > kMaxInstruments)
     return false;                // unreachable from a `.mod`'s 31 slots
-
-  // Last: nothing above touches `notes` again, so widening (dense at
-  // `geom.channels` -> full `kMaxChannels`, in place) can run once, here.
-  widen_channels(notes, geom.pattern_count, geom.rows, geom.channels);
 
   // `module_save` re-checks every field above and refuses rather than dropping
   // anything, so a module built wrong here is a refusal rather than a file

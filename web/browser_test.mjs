@@ -207,6 +207,13 @@ try {
   const loadFixture=async name=>loadBytes(name+'.ntrk',await readFile(path.join(fixtureRoot,name+'.ntrk')));
   const visible=()=>page.evaluate(()=>view.m.snapshot.channels);
   assert.deepEqual(await visible(),demo?[0,1,2,3]:[0,1,2]);
+  const small=await readFile(path.join(fixtureRoot,'count-03.ntrk'));
+  await loadBytes('small-metadata.ntrk',small);
+  assert.deepEqual(await download(),small,'small-count META and opaque bytes retained at /player/');
+  await loadBytes('small-reopened.ntrk',await download());
+  assert.deepEqual(await download(),small);
+
+  assert.deepEqual(await visible(),[0,2]);
   // Large valid files retain compact raw song data and one formatted pattern.
   await loadFixture('large');
   assert.equal((await model()).state[2],198);
