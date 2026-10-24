@@ -414,7 +414,7 @@ slot_master_index(int slot) {
 
 bool
 slot_is_global(int slot) {
-  return (slot >= kSlotSend && slot < kSlotSend + kSends) || slot_master_index(slot) >= 0;
+  return macro_slot_is_global(slot);
 }
 
 bool
@@ -1590,7 +1590,7 @@ soft_clip_process(float *l, float *r, int frames) {
 void
 mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
                  int channels, float sample_rate) {
-  if (mx == nullptr || player == nullptr || player->module == nullptr ||
+  if (mx == nullptr || !player_playback_allowed(player) ||
       !player->playing)
     return;
   if (buffer == nullptr || frames <= 0 || channels <= 0)

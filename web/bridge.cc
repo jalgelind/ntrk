@@ -167,7 +167,9 @@ int web_load(int size) {
                               imported, sizeof(imported), &length)) return 0;
     bytes = imported;
   }
-  if (!ntrk::module_load(&candidate, bytes, length)) return 0;
+  ntrk::ModuleLoadError load_error;
+  if (!ntrk::module_load_ex(&candidate, bytes, length, ntrk::ModuleLoadMode::Ordinary, &load_error))
+    return load_error == ntrk::ModuleLoadError::InteractiveRequired ? -2 : 0;
   ntrk::mix::Mixer checked;
   if (!ntrk::mix::mixer_config_read(&checked, &candidate) || !effects_fit(checked)) return 0;
   // Failed loads leave the playing module and all its backing storage intact.

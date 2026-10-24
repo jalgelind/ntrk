@@ -389,7 +389,7 @@ const int kFxplSlotEnd = 0xc0;
 // which one, and a macro says it through `scope`.
 const int kSlotSend = 0;          // 0 .. kSends-1
 const int kSlotMaster = 4;        // master FX 1
-const int kSlotInsert = 5;
+const int kSlotInsert = kMacroSlotInsert;
 const int kSlotMaster2 = 6;       // master FX 2 and 3: the ids that were spare, so a file
 const int kSlotMaster3 = 7;       // written before them never names one
 const int kSlotCount = 8;

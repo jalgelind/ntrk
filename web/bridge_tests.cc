@@ -247,6 +247,17 @@ int main(int argc, char **argv) {
   assert(notes[0].note == 96 && notes[ntrk::kMaxChannels].note == ntrk::kNoteOff);
   assert(web_save() == size);
   assert(!std::memcmp(saved.data(), web_input(), size));
+  // Interactive scores refuse distinctly and leave the current song intact.
+  {
+    ntrk::Module interactive=song;
+    uint8_t score[12]={1,0,1,0,0,0,0,0,1,0,0,0};
+    interactive.imus=score; interactive.imus_bytes=12;
+    size_t required=0;
+    assert(ntrk::module_save(&interactive,nullptr,0,&required));
+    assert(ntrk::module_save(&interactive,web_input(),web_capacity(),&required));
+    assert(web_load(int(required))==-2);
+    assert(web_save()==size && !std::memcmp(saved.data(),web_input(),size));
+  }
   // Repeated loads exercise both backing buffers and failed-load preservation.
   assert(web_load(size));
   web_input()[0] = 0;

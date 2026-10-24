@@ -942,3 +942,17 @@ file open/save, playback and checks. The core library has no new dependencies.
 Public domain / CC0. Written for the no2 project. The format, the player and the
 importer are original work; ProTracker's effect numbering and period table are
 facts about a file format rather than anything borrowed.
+
+### Interactive music format
+
+[IMUS (`0x0012`)](FORMAT.md#imus--required-interactive-music-score-0x0012)
+is a required, bounded score container for stable-ID controls, gain/fade layers,
+sections and typed cues. `ntrk_imus.h` provides allocation-free borrowed/typed
+views, body/container codecs and validation. `module_load_ex` explicitly permits
+editor preservation or the supported schema; neither permits playback. Default
+load, start and renderer paths refuse interactive scores. No interactive runtime,
+layer fading or tail processor is implemented. Deliberate `LinearPreview` plays
+only the ordinary order/SMUT/MACR score and ignores IMUS. Save preserves required
+and future opaque bytes; no silent downgrade. Host plans in the js-seq checkout:
+[editor](../../docs/TODO_ntrk_interactive_editor.md) and
+[Tetris](../../docs/TODO_ntrk_tetris_music.md) (these links require that host checkout).

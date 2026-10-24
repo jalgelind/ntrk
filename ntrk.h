@@ -60,6 +60,7 @@
 #include "ntrk_fx_shape.h"
 #include "ntrk_synth.h"
 #include "ntrk_types.h"
+#include "ntrk_imus.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -1002,7 +1003,7 @@ inline bool meta_field_encode(const MetaField &f, uint8_t *out, size_t cap, size
   return true;
 }
 inline bool block_known(uint16_t id) {
-  return (id >= 1 && id <= 6) || (id >= 0xA && id <= 0xF) || id == kBlockMeta;
+  return (id >= 1 && id <= 6) || (id >= 0xA && id <= 0xF) || id == kBlockMeta || id == kBlockImus;
 }
 
 // SMUT: `u16 order_count`, `u16 channels`, then one `u16 LE` per order position
@@ -1083,7 +1084,7 @@ const int kMacroRecordBytes =
     kMacroTargetsAt + kMaxMacroTargets * kMacroTargetBytes;   // 52
 
 inline bool
-module_load(Module *module, const uint8_t *data, size_t size) {
+module_load_impl(Module *module, const uint8_t *data, size_t size, ModuleLoadMode mode, ModuleLoadError *error) {
   *module = Module();
   if (data == nullptr || size < (size_t) kHeaderBytes)
     return false;
@@ -1259,6 +1260,13 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       // `FxCell` has no alignment of its own -- two uint8_t -- so the cells
       // start at an arbitrary offset plus four and the cast stays sound.
       module->fx = (const FxCell *) (const void *) (p + kFxplPrefixBytes);
+    } else if (id == kBlockImus) {
+      if (flags != kBlockCritical || !bytes || bytes > kMaxImusBytes) return false;
+      if (mode == ModuleLoadMode::Ordinary) {
+        if (error) *error = ModuleLoadError::InteractiveRequired;
+        return false;
+      }
+      module->imus = data + offset; module->imus_bytes = bytes;
     } else if (id == kBlockMacr) {
       // Recorded and parsed below rather than here: the meta lanes and the
       // macro table judge each other, and a directory may name the two blocks
@@ -1707,7 +1715,31 @@ module_load(Module *module, const uint8_t *data, size_t size) {
     }
   }
 
+  if (module->imus_bytes) {
+    const ImusStatus status = imus_decode(module->imus, module->imus_bytes, nullptr, module);
+    if (status == ImusStatus::Invalid) return false;
+    if (status == ImusStatus::Opaque && mode != ModuleLoadMode::EditorPreserve) {
+      if (error) *error = ModuleLoadError::UnsupportedProfile;
+      return false;
+    }
+  }
   return true;
+}
+
+// Parse into a temporary: no partially validated view is published on refusal.
+// InteractiveV1 means schema support only. It does not authorize playback.
+inline bool module_load_ex(Module *module, const uint8_t *data, size_t size,
+                           ModuleLoadMode mode, ModuleLoadError *error = nullptr) {
+  if (error) *error = ModuleLoadError::Invalid;
+  if (!module) return false;
+  Module parsed;
+  const bool ok = module_load_impl(&parsed, data, size, mode, error);
+  *module = ok ? parsed : Module();
+  if (ok && error) *error = ModuleLoadError::None;
+  return ok;
+}
+inline bool module_load(Module *module, const uint8_t *data, size_t size) {
+  return module_load_ex(module, data, size, ModuleLoadMode::Ordinary);
 }
 
 /// The frame a slice starts at. **The one reader of a boundary**, because the
@@ -1966,7 +1998,9 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const bool want_efxs = efxs_high != 0u;
   const bool want_edit = module->hidden_channels != 0u;   // see kBlockEdit
 
-  size_t extra_bytes = module->metadata_bytes;
+  if ((module->imus_bytes && imus_decode(module->imus, module->imus_bytes, nullptr, module) == ImusStatus::Invalid) ||
+      (!module->imus_bytes && module->imus)) return false;
+  size_t extra_bytes = size_t(module->metadata_bytes) + module->imus_bytes;
   if ((module->metadata_bytes && !meta_valid(module->metadata, module->metadata_bytes)) ||
       module->extension_count < 0 || module->extension_count > kMaxBlocks) return false;
   for (int i = 0; i < module->extension_count; ++i) {
@@ -1976,7 +2010,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     if (b.bytes > UINT32_MAX - extra_bytes) return false;
     extra_bytes += b.bytes;
   }
-  const int block_count = module->extension_count + (module->metadata_bytes ? 1 : 0) + 1 + (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
+  const int block_count = module->extension_count + (module->metadata_bytes ? 1 : 0) + (module->imus_bytes ? 1 : 0) + 1 + (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
                           (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
                           (want_macr ? 1 : 0) + (want_mixr ? 1 : 0) +
                           (want_slic ? 1 : 0) + (want_smut ? 1 : 0) +
@@ -2374,6 +2408,12 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     at += mixr_bytes;
   }
 
+  if (module->imus_bytes) {
+    write_u16(out+entry, kBlockImus); write_u16(out+entry+2, kBlockCritical);
+    write_u32(out+entry+4, (uint32_t)at); write_u32(out+entry+8, module->imus_bytes);
+    entry += kDirectoryEntryBytes;
+    for (size_t k=0; k<module->imus_bytes; ++k) out[at++] = module->imus[k];
+  }
   for (int i = -1; i < module->extension_count; ++i) {
     const uint8_t *p = i < 0 ? module->metadata : module->extensions[i].data;
     const uint32_t n = i < 0 ? module->metadata_bytes : module->extensions[i].bytes;
@@ -2456,7 +2496,8 @@ player_pan_gains(const Player *p, bool stereo, float *left, float *right) {
 // instead of a read outside the pattern block. That is a backstop, not a
 // licence: the notes it plays are meaningless.
 inline void
-player_start(Player *player, const Module *module) {
+player_start_ex(Player *player, const Module *module, PlaybackMode mode) {
+  if (!player) return;
   // **Mutes are the editor's state, not the tune's**, so pressing play must not
   // silently unmute what somebody muted. Everything else is reset; this is the
   // one field that survives, and it survives player_seek for the same reason.
@@ -2481,8 +2522,15 @@ player_start(Player *player, const Module *module) {
   // the half that costs one line.
   if (module == nullptr || module->order == nullptr ||
       module->patterns == nullptr || module->channels < 1 ||
-      module->rows < 1 || module->order_count < 1)
+      module->rows < 1 || module->order_count < 1 ||
+      ((module->imus || module->imus_bytes) && mode != PlaybackMode::LinearPreview))
     return;
+
+  if (mode == PlaybackMode::LinearPreview) {
+    player->linear_preview_module = module;
+    player->linear_preview_imus = module->imus;
+    player->linear_preview_bytes = module->imus_bytes;
+  }
 
   player_reset_pan(player);
 
@@ -2492,6 +2540,19 @@ player_start(Player *player, const Module *module) {
   // Zero, so the first tick is processed by the first frame rendered rather
   // than a tick's worth of silence later.
   player->until_tick = 0.0;
+}
+
+// Required scores have no runtime interpreter here. Only deliberate linear preview
+// can run: standard order/restart/SMUT/MACR, ignoring the interactive score.
+inline bool player_playback_allowed(const Player *p) {
+  if (!p || !p->module) return false;
+  const Module *m = p->module;
+  return (!m->imus && !m->imus_bytes) ||
+      (p->linear_preview_module == m && p->linear_preview_imus == m->imus &&
+       p->linear_preview_bytes == m->imus_bytes);
+}
+inline void player_start(Player *player, const Module *module) {
+  player_start_ex(player, module, PlaybackMode::Ordinary);
 }
 
 // Set the host's loop over an inclusive range of order entries, or clear it with
@@ -4005,6 +4066,7 @@ channel_sample(Channel *ch, const Instrument &ins) {
 // same count, or the sequencer's idea of where it is drifts from the audio's.
 inline int
 player_run_begin(Player *player, double rate, int max_frames) {
+  if (!player_playback_allowed(player)) return 0;
   // A `while`, because a tempo high enough to put a tick inside one frame would
   // otherwise fall permanently behind.
   while (player->sequencing && player->until_tick <= 0.0) {
@@ -4082,7 +4144,7 @@ player_walk_run(Player *player, int run) {
 // slam each pan, gain and cutoff to its rail.
 inline void
 player_skip(Player *player, double rate, int frames) {
-  if (player == nullptr || player->module == nullptr || !player->playing)
+  if (!player_playback_allowed(player) || !player->playing)
     return;
   if (frames <= 0)
     return;
@@ -4111,7 +4173,7 @@ player_skip(Player *player, double rate, int frames) {
 inline bool
 player_skip_to(Player *player, double rate, int order, int row,
                uint64_t max_ticks) {
-  if (player == nullptr || player->module == nullptr || !player->playing)
+  if (!player_playback_allowed(player) || !player->playing)
     return false;
   const Module *m = player->module;
   if (order < 0 || order >= m->order_count || row < 0 || row >= m->rows)
@@ -4138,7 +4200,7 @@ player_skip_to(Player *player, double rate, int order, int row,
 inline void
 render_add(Player *player, double *buffer, int frames, int channels,
            float sample_rate) {
-  if (player == nullptr || player->module == nullptr || !player->playing)
+  if (!player_playback_allowed(player) || !player->playing)
     return;
   if (buffer == nullptr || frames <= 0 || channels <= 0)
     return;

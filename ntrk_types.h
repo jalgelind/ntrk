@@ -631,6 +631,14 @@ macro_target_valid(uint8_t target) {
          (target >= 0x40u && target < 0x80u);
 }
 
+// The wire slot namespace: slot 5 is per-channel insert, every other valid
+// slot is global. Shared by macro reference validation and the mixer.
+const int kMacroSlotInsert = 5;
+inline bool macro_slot_is_global(int slot) { return slot>=0 && slot<8 && slot!=kMacroSlotInsert; }
+inline bool macro_target_is_global(uint8_t target) {
+  return target==1 || (target>=0x40 && target<0x80 && macro_slot_is_global((target-0x40)>>3));
+}
+
 // One macro record. **An empty target list is legal**: an editor makes a macro
 // before it fills one in, and refusing that means a song somebody is halfway
 // through writing will not load.
@@ -664,6 +672,9 @@ struct Module {
   ExtensionBlock extensions[kMaxBlocks]; // borrowed optional payloads; never audio input
   const uint8_t *metadata = nullptr;
   uint32_t metadata_bytes = 0;
+
+  const uint8_t *imus = nullptr; // borrowed required interactive score, never interpreted by the player
+  uint32_t imus_bytes = 0;
 
   int version = 2;           // the only one; module_save refuses any other
 
@@ -947,6 +958,10 @@ struct Channel {
 };
 
 struct Player {
+  // An explicit linear-preview choice is bound to the module and its score view.
+  const Module *linear_preview_module = nullptr;
+  const uint8_t *linear_preview_imus = nullptr;
+  uint32_t linear_preview_bytes = 0;
   const Module *module = nullptr;
   int order = 0;
   int row = 0;

@@ -8478,6 +8478,131 @@ static void test_extensions_metadata_counts() {
   }
 }
 
+// Required interactive data is a schema, never implicit playback authorization.
+static void test_imus() {
+  using namespace ntrk;
+  uint8_t control[]={1,'C',1,0xff,0xff,0,0};
+  uint8_t layer[]={1,'L',1,0,0xff,0xff,250,0};
+  uint8_t section[]={1,'S',0,0,0,0,1,0,0,0,170,0,6,0,2,1,1};
+  uint8_t cue[]={1,'Q',3,0,0,0,0,0,0,0,2,0,0xff,0xff};
+  ImusRecord records[5];
+  uint8_t *bodies[]={control,layer,section,cue};
+  const uint32_t sizes[]={sizeof(control),sizeof(layer),sizeof(section),sizeof(cue)};
+  for (int i=0;i<4;++i) {
+    records[i].kind=uint8_t(i+1); records[i].flags=1;
+    records[i].id=uint32_t(i+1); records[i].body=bodies[i]; records[i].bytes=sizes[i];
+  }
+  CHECK(imus_macro_byte(0)==0 && imus_macro_byte(65535)==255 && imus_macro_byte(32768)==128);
+  for (int channels=1;channels<=16;channels+=15) {
+    uint8_t order[]={0}; Note notes[16*4]={}; FxCell fx[16*4]={};
+    Module m; m.channels=channels; m.rows=4; m.order_count=1; m.pattern_count=1;
+    m.order=order; m.patterns=notes; m.fx=fx; m.macro_count=1;
+    m.macros[0].target_count=1; m.macros[0].targets[0].target=0;
+    m.macros[0].targets[0].scale=256;
+    layer[2]=uint8_t(1u<<(channels-1)); layer[3]=uint8_t((1u<<(channels-1))>>8);
+    uint8_t wire[2048], saved[4096], again[4096]; size_t n=0, written=0;
+    CHECK(imus_encode(1,1,5,records,4,nullptr,0,&n,&m));
+    memset(wire,0xa5,sizeof(wire));
+    CHECK(!imus_encode(1,1,5,records,4,wire,n-1,&written,&m)); CHECK(wire[0]==0xa5);
+    CHECK(imus_encode(1,1,5,records,4,wire,sizeof(wire),&written,&m)); CHECK(n==written);
+    ImusView view; CHECK(imus_decode(wire,n,&view,&m)==ImusStatus::Supported);
+    size_t at=12; ImusRecord r; ImusControlView c; ImusLayerView l; ImusSectionView s; ImusCueView q;
+    CHECK(imus_next(view,&at,&r) && imus_control(r,&c) && c.default_value==65535);
+    CHECK(imus_next(view,&at,&r) && imus_layer(r,&l) && l.fade_ms==250 && l.default_gain==65535);
+    CHECK(imus_next(view,&at,&r) && imus_section(r,&s) && s.tail_policy==1 && s.quantization==2);
+    CHECK(imus_next(view,&at,&r) && imus_cue(r,&q) && q.section_id==3);
+    uint8_t body[32]; size_t bn=0;
+    CHECK(imus_body_encode(c,body,sizeof(body),&bn) && bn==sizeof(control) && !memcmp(body,control,bn));
+    CHECK(imus_body_encode(l,body,sizeof(body),&bn) && bn==sizeof(layer) && !memcmp(body,layer,bn));
+    CHECK(imus_body_encode(s,body,sizeof(body),&bn) && bn==sizeof(section) && !memcmp(body,section,bn));
+    CHECK(imus_body_encode(q,body,sizeof(body),&bn) && bn==sizeof(cue) && !memcmp(body,cue,bn));
+    CHECK(!imus_body_encode(q,body,1,&bn));
+    for (size_t cut=0;cut<n;++cut) CHECK(imus_decode(wire,cut,nullptr,&m)==ImusStatus::Invalid);
+    m.imus=wire; m.imus_bytes=uint32_t(n);
+    CHECK(module_save(&m,saved,sizeof(saved),&written));
+    Module loaded; ModuleLoadError err;
+    CHECK(!module_load_ex(&loaded,saved,written,ModuleLoadMode::Ordinary,&err));
+    CHECK(err==ModuleLoadError::InteractiveRequired && loaded.patterns==nullptr);
+    CHECK(module_load_ex(&loaded,saved,written,ModuleLoadMode::InteractiveV1,&err));
+    Player p; player_start(&p,&loaded); CHECK(!p.playing);
+    p.playing=true; double audio[8]; for (int i=0;i<8;++i) audio[i]=0.125;
+    render_add(&p,audio,4,2,48000); CHECK(audio[0]==0.125 && p.ticks_elapsed==0);
+    player_start_ex(&p,&loaded,PlaybackMode::LinearPreview); CHECK(p.playing);
+    render_add(&p,audio,4,2,48000); CHECK(p.ticks_elapsed>0);
+    Module copied=loaded; p.module=&copied; CHECK(!player_playback_allowed(&p));
+    size_t n2=0; CHECK(module_save(&loaded,again,sizeof(again),&n2));
+    CHECK(n2==written && memcmp(saved,again,n2)==0);
+    // Every primary transport command and future player-plane command is refused in a span.
+    const uint8_t bad[]={0x0b,0x0d,0x0f,0x0e,0x0e};
+    const uint8_t params[]={0,0,170,0x60,0xe1};
+    for (int i=0;i<5;++i) { notes[0].effect=bad[i]; notes[0].param=params[i];
+      CHECK(!module_save(&m,nullptr,0,&n2)); }
+    notes[0]=Note(); fx[0].cmd=0x32; CHECK(!module_save(&m,nullptr,0,&n2));
+    fx[0].cmd=0x30; CHECK(module_save(&m,nullptr,0,&n2)); fx[0].cmd=0;
+    m.swing=1; CHECK(!module_save(&m,nullptr,0,&n2)); m.swing=0;
+    cue[2]=99; CHECK(!imus_encode(1,1,5,records,4,nullptr,0,&n2,&m)); cue[2]=3;
+    cue[6]=4; CHECK(!imus_encode(1,1,5,records,4,nullptr,0,&n2,&m)); cue[6]=0;
+    m.macros[0].targets[0].scope=kMacroScopeSelf; CHECK(!module_save(&m,nullptr,0,&n2));
+    m.macros[0].targets[0].scope=uint8_t(channels); CHECK(!module_save(&m,nullptr,0,&n2));
+    m.macros[0].targets[0].scope=0;
+    control[5]=1; CHECK(!imus_encode(1,1,5,records,4,nullptr,0,&n2,&m)); control[5]=0;
+    records[1].id=1; CHECK(!imus_encode(1,1,5,records,4,nullptr,0,&n2,&m)); records[1].id=2;
+    CHECK(!imus_encode(1,1,4,records,4,nullptr,0,&n2,&m));
+    records[1].bytes=UINT32_MAX; CHECK(!imus_encode(1,1,5,records,4,nullptr,0,&n2,&m)); records[1].bytes=sizes[1];
+    // Future container framing is validated, bodies are never read as v1.
+    wire[0]=2; CHECK(imus_decode(wire,n,&view,&m)==ImusStatus::Opaque);
+    at=12; CHECK(imus_next(view,&at,&r)); CHECK(!imus_control(r,&c));
+    CHECK(module_save(&m,saved,sizeof(saved),&written));
+    CHECK(!module_load_ex(&loaded,saved,written,ModuleLoadMode::InteractiveV1,&err));
+    CHECK(err==ModuleLoadError::UnsupportedProfile);
+    CHECK(module_load_ex(&loaded,saved,written,ModuleLoadMode::EditorPreserve));
+    CHECK(module_save(&loaded,again,sizeof(again),&n2)); CHECK(n2==written && !memcmp(saved,again,n2));
+    wire[0]=1;
+    // Unknown required records refuse supported-profile parsing; optional ones survive.
+    uint8_t unknown[]={0xde,0xad}; records[4].kind=99; records[4].id=5;
+    records[4].body=unknown; records[4].bytes=2; records[4].flags=1;
+    CHECK(imus_encode(1,1,6,records,5,wire,sizeof(wire),&n,&m));
+    CHECK(imus_decode(wire,n,nullptr,&m)==ImusStatus::Opaque);
+    records[4].flags=0; CHECK(imus_encode(1,1,6,records,5,wire,sizeof(wire),&n,&m));
+    CHECK(imus_decode(wire,n,nullptr,&m)==ImusStatus::Supported);
+    // An unknown optional field after a known body is retained byte for byte.
+    uint8_t extended[32]={}; memcpy(extended,layer,sizeof(layer));
+    imus_w16(extended+sizeof(layer),42); imus_w32(extended+sizeof(layer)+4,2);
+    extended[sizeof(layer)+8]=0xaa; extended[sizeof(layer)+9]=0xbb;
+    records[1].body=extended; records[1].bytes=sizeof(layer)+10;
+    CHECK(imus_encode(1,1,5,records,4,wire,sizeof(wire),&n,&m));
+    CHECK(imus_decode(wire,n,nullptr,&m)==ImusStatus::Supported);
+    extended[sizeof(layer)+2]=1;
+    CHECK(imus_encode(1,1,5,records,4,wire,sizeof(wire),&n,&m));
+    CHECK(imus_decode(wire,n,nullptr,&m)==ImusStatus::Opaque);
+    records[1].body=layer; records[1].bytes=sizeof(layer);
+  }
+  size_t n=0; uint8_t empty[12];
+  CHECK(imus_encode(1,1,1,nullptr,0,empty,sizeof(empty),&n));
+  CHECK(imus_decode(empty,n,nullptr)==ImusStatus::Supported);
+  CHECK(!imus_encode(1,1,0,nullptr,0,nullptr,0,&n));
+  CHECK(!imus_encode(1,1,1,records,513,nullptr,0,&n));
+  static ImusRecord many[257];
+  const int limits[]={32,16,64,256};
+  for (int kind=1;kind<=4;++kind) {
+    for (int i=0;i<=limits[kind-1];++i) {
+      many[i]=ImusRecord(); many[i].kind=uint8_t(kind); many[i].version=2;
+      many[i].flags=1; many[i].id=uint32_t(i+1);
+    }
+    CHECK(imus_encode(1,1,1000,many,uint32_t(limits[kind-1]),nullptr,0,&n));
+    CHECK(!imus_encode(1,1,1000,many,uint32_t(limits[kind-1]+1),nullptr,0,&n));
+  }
+  // The byte cap includes every record header; arithmetic cannot wrap it.
+  static uint8_t large[kMaxImusBytes];
+  ImusRecord opaque; opaque.kind=99; opaque.id=1; opaque.body=large;
+  opaque.bytes=uint32_t(kMaxImusBytes-24);
+  CHECK(imus_encode(1,1,2,&opaque,1,nullptr,0,&n) && n==kMaxImusBytes);
+  ++opaque.bytes; CHECK(!imus_encode(1,1,2,&opaque,1,nullptr,0,&n));
+  empty[4]=1; CHECK(imus_decode(empty,sizeof(empty),nullptr)==ImusStatus::Invalid);
+  empty[4]=0; empty[0]=0; CHECK(imus_decode(empty,sizeof(empty),nullptr)==ImusStatus::Invalid);
+
+}
+
 int
 main(void) {
   test_extensions_metadata_counts();
@@ -8570,6 +8695,7 @@ main(void) {
   test_instrument_param_enforced();
   test_instrument_param_round_trip();
   test_module_param_table();
+  test_imus();
 
   test_slic_block();
   test_itun_block();

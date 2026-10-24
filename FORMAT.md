@@ -23,6 +23,7 @@ layouts remain in README.md and the codecs in ntrk.h are authoritative.
 | 0x000F | IPAN instrument pan; always written critical, including centered pan |
 | 0x0010 | Spent AUTO ID; never reuse |
 | 0x0011 | META descriptive and private editor metadata; always optional |
+| 0x0012 | IMUS required interactive score; schema/preservation only, no runtime |
 
 Directory capacity is now **64 entries**, shared by known and unknown blocks.
 The historical maximum was 32. Raising the bound permits any historical
@@ -53,7 +54,7 @@ Consequently, skipping either can change audio; optional does not promise an
 identical rendering across those capability levels. Their existing writer flags
 are unchanged. META is strictly non-audio and has no such exception.
 
-Borrowed input storage (order, notes, FXPL, samples, slices, META and extensions)
+Borrowed input storage (order, notes, FXPL, samples, slices, META, IMUS and extensions)
 must stay readable and unchanged throughout serialization. The output buffer
 must not overlap any of that source storage: in-place saving is unsupported.
 Use a separate output buffer, then replace the original. A loaded Module remains
@@ -165,3 +166,146 @@ EditModule owns and re-points metadata and extension buffers through adopt,
 copy, move, undo and save; destroying a ModuleFile cannot invalidate its copies.
 The player and mixer never interpret META. A host's choice of how to expose
 editor metadata separately from audio snapshots is outside this format contract.
+
+## IMUS — required interactive music score (`0x0012`)
+
+**Format and codecs are implemented; interactive playback is not implemented.**
+The v2 core header is unchanged. IDs `0x0007..0x0009` remain reserved and
+`0x0010` remains spent. META (`0x0011`) stays strictly descriptive: it cannot
+carry audio or gameplay semantics. IMUS has exactly one directory entry, whose
+flags MUST be CRITICAL (`1`). It is not an optional hint or a linear fallback.
+A legacy reader refuses the block; recognition alone is not playback support.
+
+All integers below are unsigned little-endian, unaligned, with no padding.
+The payload is at most 65,536 bytes. Its 12-byte header is:
+
+| Offset | Type | Meaning |
+|---|---|---|
+| 0 | u16 | container version, 1 |
+| 2 | u16 | required profile, 1 |
+| 4 | u32 | record count, at most 512 including unknown records |
+| 8 | u32 | persisted next document ID, nonzero |
+
+Each record has `u8 kind, u8 flags, u16 record_version, u32 body_bytes, u32 id`,
+then exactly `body_bytes` bytes. Version and ID are nonzero. IDs are unique
+across all kinds, including opaque records, and less than `next_id`. IDs are
+stable through rename, reordering, save and undo. Allocate monotonically;
+undo must retain the largest next-ID high-water mark. `UINT32_MAX` as next-ID
+means allocation is exhausted; never wrap or reuse a deleted ID. Counts are
+bounded at 32 controls, 16 layers, 64 sections and 256 cues, even for future
+versions of those kinds. No trimming, clamping, truncating or reference repair
+is implicit. The payload ends exactly at the last record.
+
+Record flag bit 0 means required semantics; other bits are zero. A record
+version or kind not understood is never decoded as v1. An unknown optional
+record can be ignored by a supported-profile host but is preserved. Unknown
+required semantics refuse supported-profile use. Future nonzero container
+versions/profiles retain this framing envelope; only framing, IDs, resource
+bounds and flags are checked, never their bodies interpreted as profile 1.
+They can be opened only through explicit editor preservation.
+
+Known v1 bodies begin with `u8 name_bytes` and that many UTF-8 bytes (1..63,
+well-formed Unicode, no ASCII controls, DEL or NUL). Names are descriptive,
+not references; duplicate names are allowed. The fixed fields below follow.
+Trailing extension fields use repeated `u16 tag, u16 flags, u32 bytes, payload`.
+Tags are nonzero; flag bit 0 means required, all other bits zero. No extension
+tags are currently understood. Optional fields are preserved exactly. Required
+fields make the score opaque to this implementation. Repeated extension tags
+are allowed and their order is preserved. Truncated fields are malformed.
+
+| Kind | Fixed fields after name | Bounds and defaults |
+|---|---|---|
+| 1 control | u8 macro_index; u16 default_value; u16 smoothing_ms | existing absolute MACR 1..32, normalized default 0..65535; smoothing MUST be 0 |
+| 2 layer | u16 channel_mask; u16 default_gain; u16 fade_ms | nonempty active-channel mask, disjoint across layers; gain 0..65535; fade 0..60000 ms |
+| 3 section | u16 start_order,start_row,end_order,end_row,entry_bpm,entry_speed; u8 quantization,end_action,tail_policy | bpm 32..255; speed 1..31; enums below |
+| 4 cue | u32 section_id,row_offset; u16 type,strength | referenced section ID; row offset strictly within span; marker=1/strength 0, accent=2/normalized strength |
+
+Defaults are explicit wire values, not omitted fields. Typed builder views use
+control default 0, layer gain 65535/fade 0, section tempo 125/speed 6/row/stop/cut,
+and marker strength 0; IDs, masks, names and nonempty spans still need authoring.
+An empty container is legal and still requires explicit playback choice.
+
+Controls require an FXPL plane and a nonempty absolute macro. SELF scopes and
+inactive channel scopes are refused; ALL refers only to active channels.
+Destinations must not overlap within or between named controls (global slot parameters
+and master gain are global regardless of scope; insert parameters use channel scope). Scale and offset retain MACR's
+signed Q8.8 semantics. Normalize with `(u32(value)*255+32767)/65535`; the
+existing macro input is only 8-bit. A host initializes defaults before the first
+row; latest accepted host update before a row wins. It retains current values
+and reapplies them **after authored row cells** on every row. The current macro
+input API is not itself that held-value evaluator. Profile 1 allows no smoothing
+evaluator (`smoothing_ms=0`); row latency and byte quantization are explicit.
+
+Layer gain is a separate host factor, multiplied with score channel gain before
+routing into dry output and sends. It never overwrites authored automation or
+SMUT/user mute state. A request ramps linearly from the current gain to the
+normalized target over `ceil(fade_ms*sample_rate/1000)` output frames (wide
+arithmetic); zero means immediate. A new request restarts from the current gain.
+Both stereo samples use the same frame gain. Default gain applies at entry;
+channels outside masks use unity. A zero-gain layer keeps sequencing and voices
+running; no new signal feeds sends but existing shared tails continue. This
+library does **not** implement these gain ramps yet.
+
+Section coordinates refer to order **occurrences**, not pattern IDs. Spans are
+half-open lexicographic `[start,end)`: start order is in the order list, rows
+are `<module.rows`, and `(order_count,0)` is the sole terminal endpoint. No
+zero-length span. Quantization 0=row, 1=beat, 2=bar, using TUNE rows-per-beat/bar
+and anchored to the **outgoing section's start**. A request takes effect at the
+first eligible row boundary strictly after receipt; latest pending request wins.
+The outgoing section end is always eligible, even off-grid. A request received
+at a boundary cannot retroactively take that boundary. With no request,
+end_action 0=stop, 1=loop. A loop wrap keeps the monotonic clock, voices and tails;
+it does not perform a fresh section entry. Cues at row offset zero fire again
+on the new traversal.
+
+On an initial entry or a transition to another section, reset voice and tracker
+channel/effect command memory, reload score MIXR state, set entry bpm/speed,
+restore held controls and current host layer gains, then process the destination
+row. `tail_policy` 0=cut clears mixer effect buffers; 1=carry retains mixer tail
+buffers while resetting score parameter/command state, and requires a host with
+explicit carry capability. Stop terminates voices and clears tracker command memory; cut clears effect
+buffers immediately, while a carry host drains effect buffers to its bounded
+tail deadline.
+A host must declare support for all requested policies and these reset semantics
+before binding playback. There is no implemented tail processor or binding in
+this library yet; carry must never be advertised just because its byte decoded.
+
+Profile 1 section spans require fixed timing: swing is zero and primary note
+commands Bxx, Dxx, Fxx (including F00), E6x and EEx are refused inside spans.
+FXPL is scanned too: its current player namespace allows only 0x30 accent and
+0x31 glide; future commands 0x32..0x3f are refused there. Mixer commands are a
+separate namespace, not ProTracker transport commands. Ordinary files remain
+unrestricted. Section entry bpm/speed explicitly determine timing; no timing
+state is inherited from an earlier order occurrence.
+
+Cues are notifications, not scripts, implicit transitions or sound triggers.
+Emit at row start, once per traversal, sorted by stable cue ID for simultaneous
+cues. Their row offsets count rows across order occurrences from section start.
+An interactive host needs a bounded, generation-tagged feedback queue; cue
+sample offsets must be measured against its continuous audio clock.
+
+`ntrk_imus.h` supplies borrowed container/record iterators, typed named views,
+typed body encoding, raw-record container size-query/write, UTF-8/framing and
+module-context validation. No allocation or format decoding belongs on the
+audio thread. Pass a Module to codec validation for geometry, macro, reference
+and score checks; module load/save always do so. All validation precedes output
+writes; short buffers leave output unchanged and return required size. Input
+and output storage must not overlap. Future bytes survive as bytes, not as v1
+objects. Editors must atomically remap every known reference or refuse geometry
+and semantic changes; opaque future semantics freeze unsafe edits.
+
+`module_load()` refuses IMUS. `module_load_ex(..., EditorPreserve)` validates
+framing, known semantics and retains opaque data; `InteractiveV1` requires the
+supported schema, **not** playback permission. Both publish only validated views.
+`Module::imus/imus_bytes` borrow the backing file. Save validates and preserves
+them in a critical block; no export silently strips the score.
+
+Default `player_start`, `render_add`, `mix::mixer_render_add` and skip paths
+block required interactive data. No interactive interpreter is implemented.
+The only playback opt-in currently provided is
+`player_start_ex(..., PlaybackMode::LinearPreview)`: standard order/restart,
+SMUT and MACR semantics, ignoring controls/layers/sections/cues, bound to the
+chosen Module and IMUS view. Parsing permission never authorizes playback.
+Callers must choose and label linear preview explicitly; ordinary APIs never
+silently downgrade. Future runtime binding must be a separate capability and
+module-generation contract with renderer backstops.

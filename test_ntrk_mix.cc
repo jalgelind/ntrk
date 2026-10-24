@@ -5016,6 +5016,22 @@ test_pan_deltas_follow_audible_rows() {
   }
 }
 
+static void test_imus_renderer_gate() {
+  ntrk::Module m; uint8_t order[]={0}; ntrk::Note notes[1]={};
+  m.channels=1; m.rows=1; m.pattern_count=1; m.order_count=1; m.order=order; m.patterns=notes;
+  uint8_t imus[12]={1,0,1,0,0,0,0,0,1,0,0,0}; m.imus=imus; m.imus_bytes=12;
+  ntrk::Player p; ntrk::mix::Mixer mx;
+  ntrk::player_start(&p,&m); CHECK(!p.playing);
+  p.playing=true; double audio[8]; for (int i=0;i<8;++i) audio[i]=0.125;
+  ntrk::mix::mixer_render_add(&mx,&p,audio,4,2,48000);
+  CHECK(audio[0]==0.125 && p.ticks_elapsed==0);
+  ntrk::player_start_ex(&p,&m,ntrk::PlaybackMode::LinearPreview);
+  ntrk::mix::mixer_render_add(&mx,&p,audio,4,2,48000); CHECK(p.ticks_elapsed>0);
+  // A binding to another score cannot authorize this module, even with playing forced on.
+  m.imus_bytes=11; const uint64_t ticks=p.ticks_elapsed;
+  ntrk::mix::mixer_render_add(&mx,&p,audio,4,2,48000); CHECK(p.ticks_elapsed==ticks);
+}
+
 int
 main(void) {
   test_bypass_is_render_add();
@@ -5100,6 +5116,7 @@ main(void) {
   test_config_set_refuses_a_bad_block();
   test_config_seed_gives_an_audible_effect();
   test_choice_params_name_themselves();
+  test_imus_renderer_gate();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
