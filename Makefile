@@ -113,7 +113,7 @@ WEB_OUT := $(OUT)/web
 # Optional host-owned song. No parent checkout dependency in the standalone build.
 WEB_DEMO ?=
 WEB_DEMO_NAME ?=
-WEB_EXPORTS := web_capacity web_input web_patterns web_orders web_audio web_demo web_load web_save web_info web_edit web_transport web_mute web_render web_instrument_name web_instrument_volume web_used_channels
+WEB_EXPORTS := web_fx web_cell_text web_instrument_pan web_capacity web_input web_patterns web_orders web_audio web_demo web_load web_save web_info web_edit web_transport web_mute web_render web_instrument_name web_instrument_volume web_used_channels
 .PHONY: web test-web
 web: $(WEB_OUT)/ntrk.wasm web-demo
 	python3 web/version_assets.py "$(WEB_OUT)"

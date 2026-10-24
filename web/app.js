@@ -1,4 +1,4 @@
-import {TrackerCanvas} from './canvas.js';
+import {TrackerCanvas,fieldLayout} from './canvas.js';
 const canvas=document.getElementById('tracker'),open=document.getElementById('open');
 const m={snapshot:null,state:null,order:0,row:0,channel:0,field:0,dirty:false,nibble:'',busy:false,ready:false,volume:1,level:0,
   octave:2,instrument:1,edit:false,follow:true,help:false,confirm:null,name:'Module player',message:'Loading audio engine…',error:false};
@@ -30,7 +30,7 @@ function updateState(s) {
 }
 function adopt(result,name) {
   const decoder=new TextDecoder();
-  result.instruments=result.instruments.map(ins=>({name:decoder.decode(ins.nameBytes),volume:ins.volume}));
+  result.instruments=result.instruments.map(ins=>({name:decoder.decode(ins.nameBytes),pan:ins.pan,volume:ins.volume}));
   // Keep this load's channel list stable through edits, including clearing its
   // final cell. Reopening recomputes usage without changing the stored channels.
   m.snapshot=result;m.state=result.state;m.order=m.row=m.field=0;m.channel=result.channels[0];m.nibble='';
@@ -67,7 +67,7 @@ function discardThen(fn) {
 }
 async function action(type,arg) {
   if(!m.ready)return;
-  if(type==='select'){Object.assign(m,arg);m.nibble='';view.invalidate();return;}
+  if(type==='select'){Object.assign(m,arg);m.nibble='';status(m.channel<0||m.field>=4?'Selected command lane · read only':'Primary field selected');view.invalidate();return;}
   if(type==='step'){m[arg.id]=Math.max(arg.min,Math.min(arg.max,m[arg.id]+arg.delta));view.invalidate();return;}
   if(type==='entry'){m[arg.id]=arg.toggle?!m[arg.id]:arg.value;view.invalidate();return;}
   if(type==='volume'){m.volume=Math.max(0,Math.min(1,arg));gain.gain.setTargetAtTime(m.volume,ctx.currentTime,.008);view.invalidate();return;}
@@ -105,7 +105,11 @@ canvas.addEventListener('dragover',e=>{e.preventDefault();});
 canvas.addEventListener('drop',e=>{e.preventDefault();const file=e.dataTransfer.files[0];enqueue(()=>loadFile(file));});
 async function write(value) {
   await request('edit',[m.snapshot.orders[m.order],m.row,m.channel,m.field,value]);
-  m.snapshot.cells[index()]=value;m.dirty=true;m.row=(m.row+1)%m.state[1];
+  m.snapshot.cells[index()]=value;m.dirty=true;
+  const pattern=m.snapshot.orders[m.order];
+  m.snapshot.commands[pattern*m.state[1]+m.row][m.channel*(1+m.state[12])]=
+    await request('formatted',[pattern,m.row,m.channel,-1]);
+  m.row=(m.row+1)%m.state[1];
   view.reveal();status('Cell updated');
 }
 async function keydown(event) {
@@ -123,19 +127,22 @@ async function keydown(event) {
   }
   if(['arrowup','arrowdown','arrowleft','arrowright','pageup','pagedown','home','end'].includes(key)) {
     event.preventDefault();m.nibble='';
-    const rows=m.state[1],ids=m.snapshot.channels,channels=ids.length,slot=ids.indexOf(m.channel);
+    const rows=m.state[1];
     if(key==='arrowup')m.row=(m.row+rows-1)%rows;
     if(key==='arrowdown')m.row=(m.row+1)%rows;
     if(key==='pageup')m.row=Math.max(0,m.row-16);
     if(key==='pagedown')m.row=Math.min(rows-1,m.row+16);
     if(key==='home')m.row=0;if(key==='end')m.row=rows-1;
     if(key==='arrowleft'||key==='arrowright') {
-      const pos=(slot*4+m.field+(key==='arrowleft'?channels*4-1:1))%(channels*4);
-      m.channel=ids[Math.floor(pos/4)];m.field=pos%4;
+      const cols=fieldLayout(m.snapshot),at=cols.findIndex(c=>c.channel===m.channel&&c.field===m.field);
+      const col=cols[(at+(key==='arrowleft'?cols.length-1:1))%cols.length];
+      m.channel=col.channel;m.field=col.field;
+      status(col.readOnly?'Selected command lane · read only':'Primary field selected');
     }
     view.reveal();return;
   }
   if(!m.edit||event.repeat)return;
+  if(m.channel<0||m.field>=4){status('Selected command lane · read only');return;}
   let value;
   if(key==='delete'||key==='backspace') {value=0;m.nibble='';}
   else if(m.field===0) {

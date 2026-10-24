@@ -353,8 +353,7 @@ fxpl_clamp(float v) {
 
 float
 fxpl_to_pan(float v) {
-  const float p = (v - 128.f) * (1.f / 127.f);
-  return p < -1.f ? -1.f : (p > 1.f ? 1.f : p);
+  return pan_from_byte(v);
 }
 
 float
@@ -486,17 +485,7 @@ slot_from_param(int param) {
 void
 mixer_pan_gains(const Player *player, bool stereo, float *gain_l,
                 float *gain_r) {
-  for (int c = 0; c < kMaxChannels; ++c) {
-    float p = 0.f;
-    if (stereo) {
-      float sep = player->separation;
-      sep = sep < 0.f ? 0.f : (sep > 1.f ? 1.f : sep);
-      p = player->pan[c] * sep;
-      p = p < -1.f ? -1.f : (p > 1.f ? 1.f : p);
-    }
-    gain_l[c] = p > 0.f ? 1.f - p : 1.f;
-    gain_r[c] = p < 0.f ? 1.f + p : 1.f;
-  }
+  player_pan_gains(player, stereo, gain_l, gain_r);
 }
 
 // **The mixer's own headroom, which happens to be the number `render_add`
@@ -602,7 +591,6 @@ mixer_reset(Mixer *mx) {
   // cleared to defaults here: those knobs are settings, and this call keeps
   // settings.
   mx->fxpl_synced = false;
-  mx->strip_synced = false;
   // A queued external input is NOT a setting -- it is an invocation that has not
   // happened yet, and a reset is where the caller says the last tune is over.
   // Carried across, it would fire on the first row of whatever comes next, at a
@@ -643,7 +631,7 @@ mixr_unit(float v) {
   return v >= 1.f ? (uint16_t) 65535 : (uint16_t) (v * 65535.f + 0.5f);
 }
 
-// A stored channel pan: 0 is "the player's own layout", 1..255 is -1..+1 with 128 the centre, so
+// A stored channel pan: 0 is instrument fallback, 1..255 is -1..+1 with 128 the centre, so
 // centre is exact both ways and the byte never lands on the 0 that means something else.
 uint8_t
 pan_to_stored(float pan) {
@@ -1031,8 +1019,8 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
     mx->channel_volume[c] = config_channel_volume(p, c);
     // **Only a pan that CHANGED is pushed into the player**, on the next run. A live edit of
     // anything else must not snap every channel back to its stored pan over the pattern's own
-    // `8xx`; a restart re-seeds them all (`strip_synced`).
-    if (p[kMixrPanAt + c] != mx->channel_pan[c])
+    // `8xx`; a start/seek re-seeds before sequencing via pan_epoch.
+    if (mx->strip_synced && p[kMixrPanAt + c] != mx->channel_pan[c])
       mx->strip_pan_dirty = (uint16_t) (mx->strip_pan_dirty | (1u << c));
     mx->channel_pan[c] = p[kMixrPanAt + c];
     mx->channel_output[c] = p[kMixrOutputAt + c];
@@ -1042,6 +1030,7 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
     mx->send_output[s] = p[kMixrSendOutputAt + s];
     mx->send_mode[s] = (SendMode) p[kMixrSendModeAt + s];
   }
+  mx->strip_synced = true;
   return true;
 }
 
@@ -1144,7 +1133,7 @@ void
 fxpl_write(Mixer *mx, Player *player, int c, int index) {
   const float v = mx->fxpl_val[c][index];
   if (index == kFxplPan)
-    player->pan[c] = fxpl_to_pan(v);
+    player_set_pan(player, c, fxpl_to_pan(v));
   else if (index == kFxplGain)
     mx->master_gain = fxpl_to_gain(v);
   else if (index >= kFxplSend)
@@ -1555,7 +1544,7 @@ void
 fxpl_run(Mixer *mx, Player *player, int order, int row, int tick) {
   const uint64_t n = player->ticks_elapsed;
   uint64_t ticks;
-  if (!mx->fxpl_synced || n < mx->fxpl_seen) {
+  if (!mx->fxpl_synced || mx->fxpl_epoch != player->pan_epoch || n < mx->fxpl_seen) {
     // Backwards means the player restarted or seeked; an unsynced mixer against
     // an already-running player is the same problem. Drop every slide in flight
     // rather than replaying the gap -- those accumulators belong to a row
@@ -1567,6 +1556,7 @@ fxpl_run(Mixer *mx, Player *player, int order, int row, int tick) {
     if (ticks == 0)
       return;                     // a run that did not cross a tick
   }
+  mx->fxpl_epoch = player->pan_epoch;
   mx->fxpl_seen = n;
 
   for (uint64_t k = 0; k < ticks; ++k) {
@@ -1625,6 +1615,20 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
 
   int frame = 0;
   while (frame < frames) {
+    // Apply strip state before sequencing so commands on the landing row win.
+    const bool restart = mx->strip_seen != player->pan_epoch;
+    for (int c = 0; c < kMaxChannels; ++c) {
+      const bool edited = (mx->strip_pan_dirty & (1u << c)) != 0;
+      if (!restart && !edited) continue;
+      if (mx->channel_pan[c])
+        player_set_pan(player, c, pan_from_byte(mx->channel_pan[c]));
+      else if (edited) {
+        player->pan_held[c] = false;
+        player_instrument_pan(player, c, player->channels[c].instrument);
+      }
+    }
+    mx->strip_seen = player->pan_epoch;
+    mx->strip_pan_dirty = 0;
     // Where the sequencer stands *before* the tick, which is the only place the
     // plane can learn which row is starting. See fxpl_run.
     const int at_order = player->order;
@@ -1663,26 +1667,7 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
     if (!plane && mx->macro_pending != 0u)
       mx->macro_pending = 0u;
 
-    // **The stored pans, written into the player where the player itself would reset them** --
-    // at a start or a seek, which `ticks_elapsed` going backwards is the tell for (the one
-    // `fxpl_run` reads). Ahead of the plane, because `fxpl_sync` reads `player->pan` to seed its
-    // own pan value; a pattern's pan commands move it afterwards as they always have. A pan of
-    // 0 writes nothing: that channel keeps the player's layout, which is also what a module with no MIXR block plays.
-    {
-      const bool restart = !mx->strip_synced || player->ticks_elapsed < mx->strip_seen;
-      const uint16_t which = restart ? (uint16_t) 0xFFFFu : mx->strip_pan_dirty;
-      bool moved = false;
-      for (int c = 0; c < kMaxChannels; ++c)
-        if ((which & (1u << c)) != 0u && mx->channel_pan[c] != 0u) {
-          player->pan[c] = pan_from_stored(mx->channel_pan[c]);
-          moved = true;
-        }
-      if (moved)
-        mixer_pan_gains(player, stereo, gain_l, gain_r);
-      mx->strip_synced = true;
-      mx->strip_pan_dirty = 0u;
-    }
-    mx->strip_seen = player->ticks_elapsed;
+    mixer_pan_gains(player, stereo, gain_l, gain_r);
 
     if (plane) {
       fxpl_run(mx, player, at_order, at_row, at_tick);

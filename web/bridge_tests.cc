@@ -101,6 +101,45 @@ void test_imports(const char *directory) {
   std::puts("web imports: sampled 8-channel MOD/XM, PCM8/16, truncation preservation, roundtrip and finite audio passed");
 }
 
+void test_command_metadata(const char *directory) {
+  assert(web_demo(48000));
+  song.fx_columns=3;song.meta_columns=5;song.macro_count=1;
+  std::vector<ntrk::FxCell> fx(song.pattern_count*song.rows*ntrk::module_lanes(&song));
+  song.fx=fx.data();
+  char expected[512],mnemonic[4];
+  for(int command=0;command<=ntrk::kFxLast;++command) for(int param:{0,1,128,255}) {
+    notes[0].effect=command;notes[0].param=param;
+    ntrk::note_fx_mnemonic(command,param,mnemonic);
+    assert(!std::strcmp(web_cell_text(0,0,0,-1,0),command||param?mnemonic:"..."));
+    ntrk::note_fx_describe(command,param,expected,sizeof expected);
+    assert(!std::strcmp(web_cell_text(0,0,0,-1,1),expected));
+  }
+  for(int channel:{0,15,-1}) for(int lane=0;lane<(channel<0?5:3);++lane)
+    for(int command=0;command<256;++command) for(int param:{0,127,255}) {
+      auto &cell=fx[channel<0?song.channels*3+lane:channel*3+lane];
+      cell.cmd=command;cell.param=param;
+      ntrk::mix::fxpl_describe(&mixer,&song,channel,cell,expected,sizeof expected);
+      assert(!std::strcmp(web_cell_text(0,0,channel,lane,1),expected));
+      assert(std::strlen(web_cell_text(0,0,channel,lane,0))==6);
+    }
+  fx.assign(fx.size(),ntrk::FxCell());
+  fx[song.channels*3].cmd=1; // meta 01 is macro 1, never channel PAN
+  fx[song.channels*3+1].param=64; // meta 00 has no macro invocation
+  assert(!std::strcmp(web_cell_text(0,0,-1,0,0),"M01 00"));
+  assert(!std::strcmp(web_cell_text(0,0,-1,1,1),"None"));
+  assert(!std::strcmp(web_cell_text(0,0,-1,1,0),"... 40"));
+  assert(!*web_cell_text(0,0,-1,5,0));
+  notes[0].effect=8;notes[0].param=0;
+  notes[1].effect=ntrk::kFxSlice;notes[1].param=0;
+  notes[2].effect=ntrk::kFxOffset;notes[2].param=0;
+  notes[3].effect=0xE;notes[3].param=0x80;
+  song.instruments[0].pan=32;
+  assert(web_instrument_pan(1)==32 && web_instrument_pan(0)==-1);
+  save_fixture(directory,"commands",web_used_channels());
+  const int size=web_save();assert(web_load(size) && web_instrument_pan(1)==32);
+  std::puts("web metadata: all note/FXPL bytes, every column/meta lane, macro/00 distinction and pan passed");
+}
+
 int main(int argc, char **argv) {
   assert(!web_demo(0));
   assert(web_demo(48000));
@@ -197,6 +236,7 @@ int main(int argc, char **argv) {
   }
   test_imports(argc > 1 ? argv[1] : nullptr);
   test_channel_usage(argc > 1 ? argv[1] : nullptr);
+  test_command_metadata(argc > 1 ? argv[1] : nullptr);
   if (argc > 1) {
     assert(web_demo(48000));
     uint8_t orders[128] = {}; song.order = orders; song.order_count = 128;

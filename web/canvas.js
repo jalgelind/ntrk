@@ -15,9 +15,31 @@ const help = [
   ['PIANO KEYS', 'Z S X D C V G B H N J M = one octave. Q 2 W 3 E R 5 T 6 Y 7 U = the next. Octave and instrument controls set note entry. Enter writes note-off. Delete / Backspace clears a field. Notes are not auditioned while stopped.'],
   ['HEX FIELDS', 'Instrument, effect and parameter take two hexadecimal digits. Values outside the module range are refused. Only the four primary cell fields are editable here.'],
   ['NAVIGATION', 'Order rows browse a pattern and seek playback, disabling Follow. Double-click a cell to seek its row; selection alone browses. Follow tracks the playing row. Click a channel header to mute monitoring (not saved). Wheel or drag the scrollbars to scroll; Shift + wheel scrolls channels. Touch-drag the pattern to pan. Lists scroll separately. Only tracks with primary cells or channel automation are shown, keeping their original numbers. The track list stays fixed until another file or demo is loaded. An empty song keeps track 01 editable.'],
-  ['INSTRUMENTS', 'Select a module instrument in the list to use it for note entry. Names and volume are read from the module. Unnamed slots are labeled explicitly. Parameters, secondary effect planes and mixer settings are preserved in files but have no editor here.'],
+  ['INSTRUMENTS', 'Select a module instrument in the list to use it for note entry. Names, volume and pan are read from the module. Unnamed slots are labeled explicitly. All secondary effect columns and meta lanes are displayed read-only; parameters and mixer settings are preserved.'],
   ['LIMITATIONS', 'No undo, instrument creation, structural song editing or browser storage. Large file operations can interrupt audio: pause first. A hardware keyboard is needed for note entry on touch screens. F1 or Escape closes this help.'],
 ];
+// Character positions are the sole geometry for draw, hit, reveal and keyboard.
+export function fieldLayout(snapshot) {
+  if (!snapshot) return [];
+  const columns=[]; let offset=0;
+  for (const c of snapshot.channels) {
+    for (const [f,width] of [4,3,4,3].entries()) {
+      columns.push({channel:c,field:f,offset,width,readOnly:false}); offset+=width;
+    }
+    for (let lane=0;lane<snapshot.state[12];lane++) {
+      columns.push({channel:c,field:4+lane,lane,offset,width:7,readOnly:true});offset+=7;
+    }
+    offset++;
+  }
+  for (let lane=0;lane<snapshot.state[13];lane++) {
+    columns.push({channel:-1,field:lane,lane,offset,width:7,readOnly:true});offset+=7;
+  }
+  return columns;
+}
+export function commandCell(snapshot, pattern, row, channel, field) {
+  const s=snapshot.state,base=channel<0?s[0]*(1+s[12])+field:channel*(1+s[12])+(field<4?0:field-3);
+  return snapshot.commands[pattern*s[1]+row][base];
+}
 export class TrackerCanvas {
   constructor(canvas, model, action) {
     this.canvas=canvas; this.g=canvas.getContext('2d'); this.m=model; this.action=action;
@@ -59,16 +81,17 @@ export class TrackerCanvas {
   }
   // One field geometry, including its trailing gap, for both paint and selection.
   cell(r,c,f) {
-    const offsets=[0,4,7,10],widths=[4,3,3,3];
-    return rect(this.grid.x+this.gutter+this.m.snapshot.channels.indexOf(c)*this.channelW+offsets[f]*this.advance-this.sx,
-      this.grid.y+r*this.pitch-this.sy,widths[f]*this.advance,this.pitch);
+    const col=this.columns.find(col=>col.channel===c&&col.field===f);
+    return rect(this.grid.x+this.gutter+(col?.offset||0)*this.advance-this.sx,
+      this.grid.y+r*this.pitch-this.sy,(col?.width||0)*this.advance,this.pitch);
   }
+
   setEntry(id,value) {
     this.action('entry',{id,value});
   }
   limits() {
     const s=this.m.state;
-    this.maxX=Math.max(0,(this.m.snapshot?.channels.length||0)*this.channelW-this.raster.w);
+    this.maxX=Math.max(0,(this.columns.at(-1)?.offset+this.columns.at(-1)?.width||0)*this.advance-this.raster.w);
     this.maxY=Math.max(0,(s?.[1]||0)*this.pitch-this.grid.h);
     this.sx=clamp(this.sx,this.maxX);this.sy=clamp(this.sy,this.maxY);
   }
@@ -85,7 +108,8 @@ export class TrackerCanvas {
     const m=this.m,s=m.state,w=this.w,h=this.h,ready=!!m.snapshot;
     this.hits=[];this.fill(rect(0,0,w,h),ink.bg);
     this.g.font='13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-    this.advance=this.g.measureText('0').width;this.pitch=20;this.channelW=Math.ceil(14*this.advance);this.gutter=34;
+    this.columns=fieldLayout(m.snapshot);
+    this.advance=this.g.measureText('0').width;this.pitch=20;this.channelW=Math.ceil((15+7*(s?.[12]||0))*this.advance);this.gutter=34;
     const narrow=w<700;
     this.label('ntrk',rect(3,3,55,28),ink.accent,16);
     this.label(`${m.name}${m.dirty?'  • UNSAVED':''}`,rect(62,3,w-65,28),m.dirty?ink.fx:ink.text);
@@ -108,7 +132,7 @@ export class TrackerCanvas {
       this.button(id+'-','−',rect(x+56,y,27,24),()=>this.action('step',{id,delta:-1,min:id==='octave'?1:0,max}),false,ready);
       this.button(id+'+','+',rect(x+85,y,27,24),()=>this.action('step',{id,delta:1,min:id==='octave'?1:0,max}),false,ready);x+=120;
     }
-    this.label(`P${ready?hex(m.snapshot.orders[m.order]):'--'}  ${hex(m.row)} / ${hex(m.channel+1)}  ${['NOTE','INSTRUMENT','EFFECT','PARAMETER'][m.field]}`,rect(x,y,w-x-5,24),ink.dim,11);
+    this.label(`P${ready?hex(m.snapshot.orders[m.order]):'--'}  ${hex(m.row)} / ${hex(m.channel+1)}  ${m.channel<0?'META '+(m.field+1)+' · READ ONLY':m.field>=4?'FX '+(m.field-3)+' · READ ONLY':['NOTE','INSTRUMENT','EFFECT','PARAMETER'][m.field]}`,rect(x,y,w-x-5,24),ink.dim,11);
     y+=29;
     this.label(`OUTPUT ${Math.round(m.volume*100)}%`,rect(5,y,98,23),ink.dim,11);
     this.button('volume-','−',rect(105,y,27,23),()=>this.action('volume',m.volume-.1),false,m.ready);
@@ -136,7 +160,7 @@ export class TrackerCanvas {
       this.label(`INS ${hex(m.instrument)}`,rect(insX,infoY,insW,22),ink.accent);
       if(info) {
         this.label(info.name||'(unnamed)',rect(insX,infoY+22,insW,22),ink.text,11);
-        this.label(`Volume ${info.volume} / 64`,rect(insX,infoY+44,insW,22),ink.dim,narrow?10:12);
+        this.label(`Pan ${hex(info.pan)} · Vol ${info.volume}`,rect(insX,infoY+44,insW,22),ink.dim,narrow?10:12);
       }
       if(!narrow) {
         this.label('Inspection only',rect(insX,infoY+71,insW,22),ink.dim,11);
@@ -157,7 +181,7 @@ export class TrackerCanvas {
     }
     this.fill(rect(0,h-43,w,43),ink.panel);
     this.label(m.message,rect(0,h-43,w,22),m.error?ink.warn:ink.accent,11);
-    this.label(this.hits.find(hit=>hit.id===this.hover)?.tip || 'Space play/pause · Arrows move · F1 help · Shift+wheel channels',rect(0,h-21,w,21),ink.dim,10);
+    this.label((ready?commandCell(m.snapshot,m.snapshot.orders[m.order],m.row,m.channel,m.field)?.description:'') || this.hits.find(hit=>hit.id===this.hover)?.tip || 'Space play/pause · Arrows move · F1 help · Shift+wheel channels',rect(0,h-21,w,21),ink.dim,10);
     if(document.activeElement===this.canvas) this.edge(rect(0,0,w,h),ink.line);
     if(m.help || m.confirm) this.overlay();
   }
@@ -182,7 +206,7 @@ export class TrackerCanvas {
   pattern() {
     const m=this.m,s=m.state,g=this.grid;
     const firstRow=Math.floor(this.sy/this.pitch),lastRow=Math.min(s[1],Math.ceil((this.sy+g.h)/this.pitch));
-    const firstCh=Math.floor(this.sx/this.channelW),lastCh=Math.min(m.snapshot.channels.length,Math.ceil((this.sx+this.raster.w)/this.channelW));
+    const visible=this.columns.filter(col=>col.offset*this.advance+col.width*this.advance>this.sx&&col.offset*this.advance<this.sx+this.raster.w);
     this.clip(g,()=>{
       for(let r=firstRow;r<lastRow;r++) {
         const y=g.y+r*this.pitch-this.sy;
@@ -193,28 +217,36 @@ export class TrackerCanvas {
       }
     });
     this.clip(this.raster,()=>{
-      for(let slot=firstCh;slot<lastCh;slot++) {
-        const c=m.snapshot.channels[slot];
-        const muted=!!(s[11]&(1<<c));
-        for(let r=firstRow;r<lastRow;r++) for(let f=0;f<4;f++) {
-          const box=this.cell(r,c,f),v=m.snapshot.cells[((m.snapshot.orders[m.order]*s[1]+r)*s[0]+c)*4+f];
-          const selected=r===m.row&&c===m.channel&&f===m.field;
-          if(selected) {this.fill(box,m.edit?ink.cursor:ink.select);this.edge(box,m.edit?ink.accent:ink.cursor);}
-          this.text(f===0?noteName(v):hex(v),box.x+2,box.y+box.h/2,
-            selected&&m.edit?ink.bg:muted?ink.faint:!v?ink.faint:[ink.text,ink.ins,ink.fx,ink.param][f],13);
+      for(const col of visible) {
+        const c=col.channel,f=col.field,muted=c>=0&&!!(s[11]&(1<<c));
+        for(let r=firstRow;r<lastRow;r++) {
+          const box=this.cell(r,c,f),selected=r===m.row&&c===m.channel&&f===m.field;
+          if(selected) {this.fill(box,m.edit&&!col.readOnly?ink.cursor:ink.select);this.edge(box,col.readOnly?ink.fx:ink.cursor);}
+          const cmd=commandCell(m.snapshot,m.snapshot.orders[m.order],r,c,f);
+          let text,color;
+          if(col.readOnly) {text=cmd.text;color=text==='... ..'?ink.faint:ink.fx;}
+          else {
+            const at=((m.snapshot.orders[m.order]*s[1]+r)*s[0]+c)*4;
+            const v=m.snapshot.cells[at+f];
+            text=f===0?noteName(v):f===2?cmd.text:f===3?(m.snapshot.cells[at+2]||v?hex(v):'..'):v?hex(v):'..';
+            color=f===2?(text==='...'?ink.faint:ink.fx):!v?ink.faint:[ink.text,ink.ins,ink.fx,ink.param][f];
+          }
+          this.text(text,box.x+2,box.y+box.h/2,selected&&m.edit&&!col.readOnly?ink.bg:muted?ink.faint:color,13);
         }
-        this.fill(rect(this.cell(0,c,0).x-3,g.y,1,g.h),ink.line);
+        if(f===0) this.fill(rect(this.cell(0,c,f).x-3,g.y,1,g.h),ink.line);
       }
     });
     const header=rect(this.raster.x,g.y-28,this.raster.w,27);
     this.fill(rect(g.x,g.y-28,g.w,27),ink.panel);this.label('ROW',rect(g.x,g.y-28,this.gutter,27),ink.dim,10);
     this.clip(header,()=>{
-      for(let slot=firstCh;slot<lastCh;slot++) {
-        const c=m.snapshot.channels[slot];
-        const x=this.cell(0,c,0).x,muted=!!(s[11]&(1<<c));
-        const b=rect(x,g.y-27,this.channelW-2,25);
-        this.fill(b,muted?'#3a292b':ink.panel);this.label(`CH ${hex(c+1)}${muted?' MUTE':''}`,b,muted?ink.warn:ink.dim,11);
-        this.hit('mute'+c,rect(Math.max(x,header.x),b.y,Math.min(x+b.w,header.x+header.w)-Math.max(x,header.x),b.h),()=>this.action('mute',c),true,'Toggle monitoring mute');
+      for(const col of visible) {
+        const c=col.channel,f=col.field,x=this.cell(0,c,f).x;
+        if(c>=0&&f<4&&f!==0)continue;
+        const b=rect(x,g.y-27,(c>=0&&f===0?14:col.width)*this.advance-2,25);
+        const muted=c>=0&&!!(s[11]&(1<<c));
+        this.fill(b,muted?'#3a292b':ink.panel);
+        this.label(c<0?`META ${f+1}`:f>=4?`FX ${f-3}`:`CH ${hex(c+1)}${muted?' MUTE':''}`,b,muted?ink.warn:ink.dim,10);
+        if(c>=0&&f===0)this.hit('mute'+c,rect(Math.max(x,header.x),b.y,Math.min(x+b.w,header.x+header.w)-Math.max(x,header.x),b.h),()=>this.action('mute',c),true,'Toggle monitoring mute');
       }
     });
     this.fill(rect(this.raster.x-1,g.y,1,g.h),ink.line);
@@ -293,12 +325,10 @@ export class TrackerCanvas {
     const p=this.point(e),hit=this.at(p.x,p.y);
     if(hit&&hit.id===d.hit?.id)hit.fn();
     else if(!this.m.help&&!this.m.confirm&&this.m.snapshot&&contains(this.raster,p.x,p.y)) {
-      const slot=Math.floor((p.x-this.raster.x+this.sx)/this.channelW);
-      const c=this.m.snapshot.channels[slot];
+      const col=this.columns.find(col=>contains(this.cell(0,col.channel,col.field),p.x,this.cell(0,col.channel,col.field).y+1));
       const r=Math.floor((p.y-this.grid.y+this.sy)/this.pitch);
-      if(c===undefined||r>=this.m.state[1])return;
-      const local=p.x-this.cell(r,c,0).x;
-      const f=local<4*this.advance?0:local<7*this.advance?1:local<10*this.advance?2:3;
+      if(!col||r>=this.m.state[1])return;
+      const c=col.channel,f=col.field;
       this.action('select',{row:r,channel:c,field:f,follow:false});
       const now=performance.now();
       if(this.lastCell?.r===r&&this.lastCell?.c===c&&now-this.lastCell.time<350)this.action('seek',r);

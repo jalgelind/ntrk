@@ -582,6 +582,7 @@ struct Mixer {
   // the same triple; at speed 1 on a one-row loop none of the three ever moves;
   // and a seek to the row already playing is invisible in all three.
   uint64_t fxpl_seen = 0;
+  uint64_t fxpl_epoch = 0;
   bool     fxpl_synced = false;
 
   // -- External macro input: a macro invoked from outside the pattern.
@@ -619,14 +620,12 @@ struct Mixer {
   static_assert(kMaxChannels == 16, "the volume initialiser below names sixteen");
   float   channel_volume[kMaxChannels] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f,
                                           1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f};
-  uint8_t channel_pan[kMaxChannels] = {};     // 0 = the player's layout; see config_channel_pan
+  uint8_t channel_pan[kMaxChannels] = {};     // 0 = instrument fallback; see config_channel_pan
   uint8_t channel_output[kMaxChannels] = {};  // 0 = master, n = send n (a Bus)
   uint8_t send_output[kSends] = {};           // 0 = master, n = a higher send
   SendMode send_mode[kSends] = {};
-  // Where the stored pans were last written into the player -- the same restart
-  // test `fxpl_run` makes, kept apart because a module with no plane never runs it.
-  bool     strip_synced = false;
-  uint64_t strip_seen = 0;
+  bool     strip_synced = false; // configuration has been read at least once
+  uint64_t strip_seen = 0;       // last player pan epoch seeded before sequencing
   uint16_t strip_pan_dirty = 0;               // channels whose stored pan a read changed
 
   // Master FX 1..3, run in order after the gain and before the width.
@@ -792,9 +791,8 @@ void config_set_channel_output(uint8_t *block, int channel, int output);
 float config_channel_volume(const uint8_t *block, int channel);
 void config_set_channel_volume(uint8_t *block, int channel, float v);
 
-// A channel's pan, -1..+1, when the block sets one. **Not set is its own state**: the player's
-// own layout (ProTracker's LRRL), which an imported .mod and a module with no MIXR block play
-// with. `clear` returns to it.
+// A saved channel pan overrides instrument defaults until cleared. Stored 0
+// means instrument fallback; explicit values 1..255 map to -1..+1 (128 center).
 bool config_channel_pan_explicit(const uint8_t *block, int channel);
 float config_channel_pan(const uint8_t *block, int channel);
 void config_set_channel_pan(uint8_t *block, int channel, float pan);
@@ -993,17 +991,15 @@ mixer_config_write(const Mixer *mx, ntrk::Module *module) {
 
 // Takes the plane's accumulators from wherever the knobs currently stand, so a
 // slide arriving before any `set` continues from the value the caller -- or
-// `player_start`'s LRRL panning -- actually left, rather than jumping to a
+// instrument/channel defaults -- actually left, rather than jumping to a
 // default first.
 void fxpl_sync(Mixer *mx, const Player *player);
 
-// **Pan is written into `player->pan`, a public knob that effect `8xx` also
-// writes.** Both are row-level, so the ordinary rule settles it: the last
-// writer in a row wins, and the plane runs after the effect column. The one
-// seam is that a plane *slide* resumes from `fxpl_val` rather than from a pan
-// `8xx` set in between, because the accumulator is only reseeded by
-// `fxpl_sync`. Documented rather than reconciled: a tune driving one channel's
-// pan from both places at once is asking for two different things.
+// Pan commands call player_set_pan and hold over all instrument retriggers.
+// Note 8xx/E8x runs first, FXPL runs afterward and wins on the same tick.
+// Plane slides keep their own accumulator until fxpl_sync/start/seek, so a
+// later slide resumes that accumulator after an intervening note pan command.
+// Start and seek invalidate automation by pan_epoch, including forward seeks.
 //
 // **The master gain is one knob written from per-channel data**, so the last
 // channel to touch it in a row wins. Privileging a channel would be worse; a

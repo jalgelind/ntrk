@@ -151,6 +151,17 @@ build(const Spec &s, bool with_note = true) {
     g_bytes[blob + (size_t) i] = (uint8_t) (int8_t) ((i % 8) < 4 ? 100 : -100);
 }
 
+// Old input keeps its musical bytes; exports add mandatory critical IPAN.
+static size_t pan_export_bytes() {
+  return 12u + ntrk::read_u16(g_bytes + 18);
+}
+static bool migrated_bytes_match(const uint8_t *saved, size_t size) {
+  return size == g_size + pan_export_bytes() &&
+    memcmp(saved, g_bytes, 26) == 0 &&
+    ntrk::read_u16(saved + 26) == 1 &&
+    memcmp(saved + 28, g_bytes + 28, g_size - 28) == 0;
+}
+
 static double g_buffer[65536];
 
 static void
@@ -455,7 +466,7 @@ abs_peak(const double *buffer, int frames) {
 
 static void
 test_save_round_trip() {
-  printf("a saved module is the file it was loaded from\n");
+  printf("old input exports centered semantics while preserving its musical bytes\n");
 
   Spec s;
   s.rows = 8;
@@ -473,7 +484,7 @@ test_save_round_trip() {
   // Sizing call: no buffer, just the count.
   size_t need = 0;
   CHECK(ntrk::module_save(&a, nullptr, 0, &need));
-  CHECK(need == g_size);
+  CHECK(need == g_size + pan_export_bytes());
 
   // One byte short refuses rather than writing a truncated file.
   size_t wrote = 12345u;
@@ -482,10 +493,8 @@ test_save_round_trip() {
   CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &wrote));
   CHECK(wrote == need);
 
-  // Byte for byte against the hand-assembled original, which is the strongest
-  // form of the claim -- and it holds only because every instrument here shares
-  // one sample at offset 0, which is what the builder emits.
-  CHECK(memcmp(g_saved, g_bytes, wrote) == 0);
+  // Musical bytes survive exactly; the critical IPAN directory entry is new.
+  CHECK(migrated_bytes_match(g_saved, wrote));
 
   ntrk::Module b;
   CHECK(ntrk::module_load(&b, g_saved, wrote));
@@ -532,7 +541,7 @@ test_save_round_trip() {
   CHECK(ntrk::module_load(&c, g_bytes, g_size));
   size_t two_need = 0;
   CHECK(ntrk::module_save(&c, nullptr, 0, &two_need));
-  CHECK(two_need == g_size + (size_t) two.sample_len);
+  CHECK(two_need == g_size + pan_export_bytes() + (size_t) two.sample_len);
 }
 
 static void
@@ -1053,9 +1062,10 @@ test_preview() {
 // ---------------------------------------------------------------------------
 
 static uint64_t
-render_hash(const ntrk::Module *m, int frames, int channels, float rate) {
+render_hash(const ntrk::Module *m, int frames, int channels, float rate, float separation = 1.f) {
     ntrk::Player player;
     ntrk::player_start(&player, m);
+    player.separation = separation;
 
     uint64_t hash = 1469598103934665603ULL;
     double buffer[256 * 2];
@@ -1156,8 +1166,15 @@ test_render_hashes() {
         // every stereo render by construction. The one-channel fingerprint
         // above did *not* move, which is the check that panning is a no-op
         // when it is off.
+        // Centered defaults and full separation replace implicit LRRL/0.7.
         check_hash("four channels with effects",
                    render_hash(&m, 12000, 2, 48000.f),
+                   0xa7f00ca65b6139e7ULL);
+        // Explicitly reproduce the old layout/width as a negative control:
+        // the unchanged old fingerprint isolates the new default's effect.
+        for(int c=0;c<ntrk::kMaxChannels;++c)
+          m.mix[ntrk::kMixrPanAt+c]=(c%4==0||c%4==3)?1:255;
+        check_hash("explicit legacy stereo reference",render_hash(&m,12000,2,48000.f,.7f),
                    0x29bacb56083b3bceULL);
     }
 }
@@ -1178,8 +1195,8 @@ test_pan() {
         ntrk::Player p;
         ntrk::player_start(&p, &m);
         p.separation = 1.f;
-        p.pan[0] = -1.f;
-        p.pan[1] = -1.f;
+        ntrk::player_set_pan(&p, 0, -1.f);
+        ntrk::player_set_pan(&p, 1, -1.f);
 
         double buffer[128 * 2] = {0};
         ntrk::render_add(&p, buffer, 128, 2, 22050.f);
@@ -1233,7 +1250,7 @@ test_pan() {
             ntrk::Player p;
             ntrk::player_start(&p, &m1);
             p.separation = pass == 0 ? 0.f : 1.f;
-            p.pan[0] = -1.f;
+            ntrk::player_set_pan(&p, 0, -1.f);
 
             double buffer[128 * 2] = {0};
             ntrk::render_add(&p, buffer, 128, 2, 22050.f);
@@ -1782,11 +1799,11 @@ test_itun_block() {
   CHECK(ntrk::module_load(&a, g_bytes, g_size));
   CHECK(a.instruments[0].tune == 0);
 
-  // **No tune, no block, not one byte moved** -- the gate that lets ITUN exist.
+  // Untuned instruments add no ITUN; IPAN protects the centered semantics.
   size_t plain = 0;
   CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &plain));
-  CHECK(plain == g_size);
-  CHECK(memcmp(g_saved, g_bytes, plain) == 0);
+  CHECK(plain == g_size + pan_export_bytes());
+  CHECK(migrated_bytes_match(g_saved, plain));
 
   // The step. An octave of tune is exactly an octave; +240 eighths is what a
   // transpose of +30 meant, through the same pitch law.
@@ -1825,7 +1842,7 @@ test_itun_block() {
   a.instruments[0].tune = 240;
   size_t n = 0;
   CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &n));
-  CHECK(n == g_size + (size_t) ntrk::kDirectoryEntryBytes +
+  CHECK(n == g_size + pan_export_bytes() + (size_t) ntrk::kDirectoryEntryBytes +
                  (size_t) a.instrument_count * 2u);
   ntrk::Module b;
   CHECK(ntrk::module_load(&b, g_saved, n));
@@ -1866,13 +1883,11 @@ test_slic_block() {
   CHECK(a.instruments[0].slice_count == 0);
   CHECK(ntrk::slice_offset(a.instruments[0], 0) == 0u);
 
-  // **A module with no SLIC is byte-identical to what it was**, which is the
-  // gate that lets this block exist at all: every shipped tune's bytes are
-  // unmoved.
+  // No SLIC payload is added. The only export addition is critical IPAN.
   size_t plain = 0;
   CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &plain));
-  CHECK(plain == g_size);
-  CHECK(memcmp(g_saved, g_bytes, plain) == 0);
+  CHECK(plain == g_size + pan_export_bytes());
+  CHECK(migrated_bytes_match(g_saved, plain));
 
   // **Offset 0 need not be the first boundary** -- a break may have a lead-in --
   // so the table below starts late on purpose.
@@ -1884,7 +1899,7 @@ test_slic_block() {
   // Exactly the formula: a directory entry, the header, one record, four
   // offsets. Spelled out rather than derived from the same expression the
   // writer uses, so a change to either has to be made twice deliberately.
-  CHECK(need == g_size + (size_t) ntrk::kDirectoryEntryBytes + 4u + 4u + 16u);
+  CHECK(need == g_size + pan_export_bytes() + (size_t) ntrk::kDirectoryEntryBytes + 4u + 4u + 16u);
 
   ntrk::Module b;
   CHECK(ntrk::module_load(&b, g_saved, need));
@@ -1911,8 +1926,8 @@ test_slic_block() {
   // assumed, because "which block is last" is the writer's business.
   {
     const int blocks = (int) ntrk::read_u16(g_saved + 26);
-    CHECK(blocks == 1);
-    const size_t dir = need - (size_t) ntrk::kDirectoryEntryBytes - 4u - 4u - 16u;
+    CHECK(blocks == 2);
+    const size_t dir = g_size + 12u; // second directory entry, after IPAN
     CHECK(ntrk::read_u16(g_saved + dir + 0) == ntrk::kBlockSlic);
     CHECK((ntrk::read_u16(g_saved + dir + 2) & ntrk::kBlockCritical) != 0u);
 
@@ -2967,7 +2982,7 @@ test_mixr_block() {
 
   size_t need = 0;
   CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
-  CHECK(need == g_size + (size_t) ntrk::kDirectoryEntryBytes +
+  CHECK(need == g_size + pan_export_bytes() + (size_t) ntrk::kDirectoryEntryBytes +
                     (size_t) ntrk::kMixrBytes);
 
   ntrk::Module b;
@@ -3100,9 +3115,8 @@ static void
 test_v2_save_round_trip() {
   printf("a module round trips, and any other version is refused\n");
 
-  // The plainest file there is, out and back in. It is byte-identical to what
-  // went in, which is the property every shipped tune rests on: a module opened
-  // and written back unchanged is the same file.
+  // Plain older input migrates to protected centered semantics without
+  // changing its musical bytes. Subsequent saves are byte-identical.
   {
     Spec s;
     build(s);
@@ -3117,8 +3131,8 @@ test_v2_save_round_trip() {
 
     size_t need = 0;
     CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &need));
-    CHECK(need == g_size);
-    CHECK(memcmp(g_saved, g_bytes, need) == 0);
+    CHECK(need == g_size + pan_export_bytes());
+    CHECK(migrated_bytes_match(g_saved, need));
 
     ntrk::Module b;
     CHECK(ntrk::module_load(&b, g_saved, need));
@@ -6104,9 +6118,8 @@ test_panning_commands() {
 
   ntrk::Player p;
   ntrk::player_start(&p, &m);
-  // LRRL first, so every move below is away from a known start rather than a
-  // value that happened to be there.
-  CHECK(p.pan[0] == -1.f);
+  // Every channel starts centered before its first instrument or command.
+  CHECK(p.pan[0] == 0.f);
 
   ntrk::player_tick(&p, kSynRate);
   CHECK(p.pan[0] == 0.f);  // 0x80 is exactly centre, not a rounded one
@@ -6120,19 +6133,17 @@ test_panning_commands() {
     ntrk::player_tick(&p, kSynRate);
   CHECK(p.pan[0] == 1.f);
 
-  // And the output carries it. Hard left with the default separation is not
-  // silence on the right, so this asks for a wide margin rather than a zero.
+  // First-row 880 centers the voice before the first rendered sample.
   double buf[512] = {};
   ntrk::player_start(&p, &m);
-  p.pan[0] = -1.f;
+  ntrk::player_set_pan(&p, 0, -1.f);
   ntrk::render_add(&p, buf, 128, 2, 48000.f);
   double l = 0.0, r = 0.0;
   for (int i = 0; i < 128; ++i) {
     l += buf[i * 2] < 0 ? -buf[i * 2] : buf[i * 2];
     r += buf[i * 2 + 1] < 0 ? -buf[i * 2 + 1] : buf[i * 2 + 1];
   }
-  CHECK(l > r * 2.0);
-  CHECK(r > 0.0);
+  CHECK(l == r && l > 0.0); // first-row 880 overrides the host-set pan immediately
 }
 
 static void
@@ -7156,7 +7167,7 @@ test_round_trip_property() {
     CHECK(ntrk::module_load(&a, g_bytes, g_size));
     size_t wrote = 0;
     CHECK(ntrk::module_save(&a, g_saved, sizeof g_saved, &wrote));
-    CHECK(wrote == g_size && memcmp(g_saved, g_bytes, wrote) == 0);
+    CHECK(migrated_bytes_match(g_saved, wrote));
   }
 
   // **A version-1 file is refused, and that is the whole reason the version
@@ -7223,7 +7234,7 @@ test_round_trip_property() {
     CHECK(ntrk::module_load(&m, g_bytes, g_size));
     size_t wrote = 0;
     CHECK(ntrk::module_save(&m, g_saved, sizeof g_saved, &wrote));
-    CHECK(wrote == g_size && memcmp(g_saved, g_bytes, wrote) == 0);
+    CHECK(migrated_bytes_match(g_saved, wrote));
   }
 }
 
@@ -8233,7 +8244,7 @@ test_tune() {
   CHECK(plain.swing == 0);
   size_t plain_need = 0;
   CHECK(ntrk::module_save(&plain, nullptr, 0, &plain_need));
-  CHECK(plain_need == g_size);          // and writes no block, so the file is unchanged
+  CHECK(plain_need == g_size + pan_export_bytes());          // and writes no block, so the file is unchanged
 
   // Three in a bar, and a shuffle. 0.19 of a row is the deepest figure in the
   // starter tunes, which is where the number comes from rather than taste.
@@ -8297,6 +8308,69 @@ test_tune() {
   CHECK(!ntrk::module_save(&bad, nullptr, 0, &junk));
   bad = plain; bad.swing = ntrk::kSwingMax + 1;
   CHECK(!ntrk::module_save(&bad, nullptr, 0, &junk));
+}
+
+static void
+test_instrument_pan() {
+  printf("instrument pan: centered migration, critical export, bounds and held precedence\n");
+  Spec s; s.instruments=2; s.speed=1;
+  build(s);
+  ntrk::Module m; CHECK(ntrk::module_load(&m,g_bytes,g_size));
+  CHECK(m.instruments[0].pan==128 && m.instruments[1].pan==128);
+  size_t centered_size=0;
+  CHECK(ntrk::module_save(&m,g_saved,sizeof g_saved,&centered_size));
+  const size_t centered_dir=g_size+s.sample_len;
+  CHECK(ntrk::read_u16(g_saved+centered_dir)==ntrk::kBlockIpan);
+  CHECK(ntrk::read_u16(g_saved+centered_dir+2)==ntrk::kBlockCritical);
+  ntrk::write_u16(g_saved+centered_dir,0x7FFF);
+  ntrk::Module older_reader;CHECK(!ntrk::module_load(&older_reader,g_saved,centered_size));
+
+  const int id=(int)ntrk::InsParam::kPan;
+  for(int type=0;type<=4;++type){
+    ntrk::Instrument ins;ins.type=(uint8_t)type;
+    CHECK(ntrk::instrument_param_state(&ins,id)==ntrk::ParamState::Live);
+  }
+  ntrk::instrument_param_set(&m.instruments[0],id,-9); CHECK(m.instruments[0].pan==0);
+  ntrk::instrument_param_set(&m.instruments[1],id,999); CHECK(m.instruments[1].pan==255);
+  size_t size=0; CHECK(ntrk::module_save(&m,g_saved,sizeof g_saved,&size));
+  ntrk::Module loaded; CHECK(ntrk::module_load(&loaded,g_saved,size));
+  CHECK(loaded.instruments[0].pan==0 && loaded.instruments[1].pan==255);
+  // IPAN starts at the end of the old file, before its payload. Unknown critical
+  // IDs model an older reader, including an entirely centered export.
+  const size_t dir=g_size+s.sample_len; // save duplicates the shared sample for instrument 2
+  CHECK(ntrk::read_u16(g_saved+dir)==ntrk::kBlockIpan);
+  CHECK(ntrk::read_u16(g_saved+dir+2)==ntrk::kBlockCritical);
+  ntrk::write_u16(g_saved+dir,0x7FFF); CHECK(!ntrk::module_load(&loaded,g_saved,size));
+  ntrk::write_u16(g_saved+dir,ntrk::kBlockIpan);
+  ntrk::write_u32(g_saved+dir+8,1); CHECK(!ntrk::module_load(&loaded,g_saved,size));
+  ntrk::write_u32(g_saved+dir+8,2); CHECK(ntrk::module_load(&loaded,g_saved,size));
+  ntrk::Note cells[8]={}; uint8_t order[]={0};
+  m.patterns=cells;m.order=order;m.rows=4;m.channels=2;m.order_count=1;m.pattern_count=1;
+  cells[0].note=25;cells[0].instrument=1;
+  cells[2].note=25;cells[2].instrument=2;
+  cells[4].note=25;cells[4].instrument=1;cells[4].effect=8;cells[4].param=192;
+  cells[6].note=25;cells[6].instrument=2;
+  ntrk::Player p;ntrk::player_start(&p,&m); CHECK(p.pan[0]==0 && p.pan[1]==0 && p.separation==1);
+  ntrk::player_tick(&p,48000);CHECK(p.pan[0]==-1);
+  ntrk::player_tick(&p,48000);CHECK(p.pan[0]==1);
+  ntrk::player_tick(&p,48000);CHECK(p.pan[0]==ntrk::pan_from_byte(192));
+  ntrk::player_tick(&p,48000);CHECK(p.pan[0]==ntrk::pan_from_byte(192));
+  const uint64_t epoch=p.pan_epoch;
+  CHECK(ntrk::player_seek(&p,0,1));CHECK(p.pan_epoch!=epoch && p.pan[0]==0 && !p.pan_held[0]);
+  ntrk::player_tick(&p,48000);CHECK(p.pan[0]==1);
+  m.mix[ntrk::kMixrPanAt]=64; ntrk::player_start(&p,&m);
+  CHECK(p.pan[0]==ntrk::pan_from_byte(64));
+  ntrk::player_tick(&p,48000);ntrk::player_tick(&p,48000);
+  CHECK(p.pan[0]==ntrk::pan_from_byte(64));
+  ntrk::player_tick(&p,48000);CHECK(p.pan[0]==ntrk::pan_from_byte(192));
+  CHECK(ntrk::player_seek(&p,0,3));CHECK(p.pan[0]==ntrk::pan_from_byte(64));
+  ntrk::player_stop(&p);CHECK(ntrk::player_preview(&p,0,25,2,48000));CHECK(p.pan[0]==ntrk::pan_from_byte(64));
+  m.mix[ntrk::kMixrPanAt]=0;ntrk::player_start(&p,&m);ntrk::player_stop(&p);
+  CHECK(ntrk::player_preview(&p,0,25,2,48000));CHECK(p.pan[0]==1);
+  // Both channels' gains are unity at the center, regardless of channel ID.
+  float l[ntrk::kMaxChannels],r[ntrk::kMaxChannels];
+  ntrk::player_start(&p,&m);ntrk::player_pan_gains(&p,true,l,r);
+  for(int c=0;c<ntrk::kMaxChannels;++c)CHECK(l[c]==1 && r[c]==1);
 }
 
 int
@@ -8369,6 +8443,7 @@ main(void) {
   test_plane_slide_zero_and_the_guard();
   test_plane_slide_reaches_a_sample();
   test_panning_commands();
+  test_instrument_pan();
   test_instrument_transpose();
   test_fractional_frame_and_note_step();
   test_plane_every_column();

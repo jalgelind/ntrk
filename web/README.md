@@ -1,7 +1,7 @@
 # ntrk module player
 
 A static, fully Canvas2D player and small cell editor. The actual ntrk replayer,
-importer and mixer run inside an AudioWorklet; the C++ core is unchanged.
+importer and mixer run inside an AudioWorklet; the shared C++ core owns playback semantics.
 Open/drop local modules first; **Example** is optional. No backend, CDN, account,
 analytics, framework or new runtime dependency. Files stay in the browser.
 
@@ -85,9 +85,18 @@ Notes are not auditioned while stopped. Edits, navigation, save and replacement
 loads are queued in input order, so rapid typing is retained while the worklet
 responds. Unsaved replacement has a drawn discard/cancel dialog.
 
+The grid displays primary command mnemonics and parameters, every per-channel
+FXPL column and every meta lane. Formatting/descriptions come from ntrk's note,
+FXPL and macro APIs. Meta `M01` means macro 1; `00` is no invocation, not PAN.
+Empty cells show dots; a valid command's zero parameter remains `00`. Arrows,
+hit testing and scrolling use the same fixed character geometry and true channel
+IDs. Extra columns/meta lanes are labeled read-only when selected; typing there
+cannot write primary bytes. The selected instrument shows its persisted pan.
+
 Save uses `module_save` and downloads a complete `.ntrk`. Samples, extra FXPL
 columns, instrument parameters, macros, mixer settings and editor metadata are
-preserved, though only the four primary cell fields are editable here. No undo,
+preserved. Exports add critical IPAN to protect the centered pan semantics from
+older readers; older input files load absent instrument pans centered. Only the four primary cell fields are editable here. No undo,
 instrument creation, structural song/pattern editing or persistent browser
 storage. A hardware keyboard is needed for editing on touch screens.
 

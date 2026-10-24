@@ -690,6 +690,33 @@ flags marks it **critical**: an id the reader does not know is skipped when
 optional and refuses the file when critical, which is how this reader stays
 honest against one written by a later version.
 
+**`0x000F` IPAN defines instrument pan and centered playback semantics.** The
+payload is exactly `instrument_count` bytes in instrument order: 0 hard left,
+128 center, 255 hard right. Older inputs without IPAN load all instruments at
+128; no channel number, import format or absent MIXR pan implies hard panning.
+Every new export writes IPAN as **critical**, including centered songs and zero
+instruments. An older reader must refuse it rather than silently apply its
+former LRRL defaults. Header version remains 2; unknown critical block rejection
+is the compatibility gate. Duplicate IDs and wrong IPAN lengths are refused.
+
+`InsParam::kPan` is appended to the generic instrument schema (existing IDs stay
+stable), Continuous 0..255 in group `pan`, live for every instrument type. The
+generic getter/setter and serializer share those bounds; setters clamp.
+
+Pan precedence is explicit: a held `8xx`/`E8x`/FXPL command overrides saved channel
+pan, which overrides instrument pan. Instrument selection, a note using the
+current instrument, and preview use that instrument's default unless overridden.
+Commands hold across subsequent rows and instrument retriggers, including note-off.
+On a row, instrument defaults apply first, primary commands next, FXPL last.
+Plane slides resume their own accumulator after intervening primary commands;
+it is reseeded at start/seek. Live channel-pan edits replace held overrides;
+clearing the strip pan restores the current instrument. Start/seek clear command
+holds, restore saved channel pan or center, and invalidate FXPL latches even on
+forward seeks. Seek does not scan prior rows; a new instrument column then
+supplies its default. Pause preserves state. Separation defaults to 1 (explicit
+pan fidelity); 0 folds monitoring to mono. Both renderers use the same balance
+helper after sequencing each run; center has unity left and right gains.
+
 **`0x000C` ITUN is an instrument's own tuning**, apart from its transpose: one
 `i16` per instrument, in eighths of a semitone (±1024) — what a recording's
 sample rate means. It multiplies the playback STEP (`instrument_tune_ratio`,
@@ -725,8 +752,7 @@ block is 563 fixed bytes: `u16` version (3), `u16` slots (5), `u16` master gain
 and `u16` width in Q12; per slot — the four sends, then master FX 1 — a `u8`
 kind, a reserved byte and eight `u16` parameters normalised 0..1; a `u8` level
 per channel per send and a `u8` return per slot; master FX 2 and 3 as two more
-slot records; per channel a `u16` Q12 volume, a `u8` pan (0 is the player's own
-LRRL layout), an insert slot record and a `u8` output (0 the master, *n* a send
+slot records; per channel a `u16` Q12 volume, a `u8` pan (0 uses the instrument default), an insert slot record and a `u8` output (0 the master, *n* a send
 in Bus mode); per send a `u8` output (0 the master, or a higher send) and a `u8`
 mode (0 Send, 1 Bus).
 
@@ -893,11 +919,8 @@ plays without it, which is an audible gap rather than a wrong note:
 
 ## Known limitations
 
-- **Panning is a position, not a field.** Output is stereo: `player_start` fills
-  `pan[]` with ProTracker's LRRL, `separation` scales it, and `8xx`/`E8x` move a
-  channel from a pattern. What there is no room for is a *per-sample* stereo
-  source — an instrument is one mono stream that gets placed, which is what an
-  Amiga voice is.
+- **Pan defaults belong to instruments**, initially centered. See IPAN and the
+  precedence rules below. Stereo samples use the same balance law as mono voices.
 - **Volume clamps at 64**, as ProTracker's does. Worth knowing when a tremolo on
   an already-loud note appears to do nothing: its whole upward half is clipped.
 - **Linear interpolation**, not the Amiga's nearest-neighbour. Chosen because a

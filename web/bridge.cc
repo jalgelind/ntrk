@@ -2,6 +2,7 @@
 // Public domain / CC0, like ntrk. No browser headers or desktop dependencies.
 #include "../ntrk_unity.h"
 #include <cstring>
+#include <cstdio>
 #include <vector>
 
 namespace {
@@ -84,6 +85,45 @@ const char *web_instrument_name(int slot) {
 int web_instrument_volume(int slot) {
   return slot >= 1 && slot <= song.instrument_count ? song.instruments[slot - 1].volume : -1;
 }
+
+int web_instrument_pan(int slot) {
+  return slot >= 1 && slot <= song.instrument_count ? song.instruments[slot - 1].pan : -1;
+}
+// Formatting belongs beside the library APIs. lane -1 is the primary note
+// command, 0..fx_columns-1 channel FXPL, channel -1 addresses meta lanes.
+const char *web_cell_text(int pattern, int row, int channel, int lane, int description) {
+  static char out[512];
+  out[0] = 0;
+  if (pattern < 0 || pattern >= song.pattern_count || row < 0 || row >= song.rows) return out;
+  const int at = pattern * song.rows + row;
+  ntrk::FxCell fx;
+  if (channel >= 0) {
+    if (channel >= song.channels) return out;
+    if (lane == -1) {
+      const auto &n = song.patterns[at * song.channels + channel];
+      if (description) ntrk::note_fx_describe(n.effect, n.param, out, sizeof out);
+      else if (n.effect || n.param) ntrk::note_fx_mnemonic(n.effect, n.param, out);
+      else std::strcpy(out, "...");
+      return out;
+    }
+    if (lane < 0 || lane >= song.fx_columns) return out;
+    if (song.fx) fx = song.fx[at * ntrk::module_lanes(&song) + channel * song.fx_columns + lane];
+  } else {
+    if (lane < 0 || lane >= song.meta_columns) return out;
+    if (song.fx) fx = song.fx[at * ntrk::module_lanes(&song) + song.channels * song.fx_columns + lane];
+  }
+  if (description) ntrk::mix::fxpl_describe(&mixer, &song, channel, fx, out, sizeof out);
+  else {
+    char mnemonic[4];
+    if (channel < 0 && fx.cmd && fx.cmd < ntrk::mix::kFxplSlotSet)
+      std::snprintf(mnemonic, sizeof mnemonic, "M%02X", fx.cmd);
+    else ntrk::mix::fxpl_mnemonic(fx, mnemonic);
+    if (fx.cmd || fx.param) std::snprintf(out, sizeof out, "%s %02X", mnemonic, fx.param);
+    else std::strcpy(out, "... ..");
+  }
+  return out;
+}
+const uint8_t *web_fx() { return reinterpret_cast<const uint8_t *>(song.fx); }
 
 int web_demo(int sample_rate) {
   if (sample_rate < 8000 || sample_rate > 96000) return 0;
@@ -186,6 +226,8 @@ int web_info(int field) {
         if (player.muted[c]) bits |= 1 << c;
       return bits;
     }
+    case 12: return song.fx_columns;
+    case 13: return song.meta_columns;
     default: return -1;
   }
 }

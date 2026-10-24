@@ -134,7 +134,7 @@ enum class InsParam {
   kSynthVoice, kSynthTune, kSynthDecay, kSynthSweep, kSynthTone,
   kSynthNoise, kSynthNoiseDecay, kSynthDrive, kSynthCutoff, kSynthReso,
   kSynthEnvMod, kSynthAccent, kSynthDist, kSynthDistMix, kSynthWave,
-  kSliceStop,
+  kSliceStop, kPan,
   kCount
 };
 
@@ -260,6 +260,7 @@ instrument_param_table(int *count) {
       {"synth wave", ParamShape::Choice, 0, kSynthWaveCount - 1,
        kSynthWaveCount, kSynthWaves, "synth"},
       {"slice stop", ParamShape::Choice, 0, 1, 2, kOffOn, "slices"},
+      {"pan", ParamShape::Continuous, 0, 255, 0, nullptr, "pan"},
   };
   static_assert(sizeof(kTable) / sizeof(*kTable) == (size_t) InsParam::kCount,
                 "the table and InsParam are one list");
@@ -391,7 +392,7 @@ instrument_param_state(const Instrument *ins, int id) {
     return ins->slice_count > 0 && type != (uint8_t) InstrumentType::kSynth
                ? ParamState::Live
                : ParamState::Absent;
-  if (p >= InsParam::kSynthVoice) {
+  if (p >= InsParam::kSynthVoice && p <= InsParam::kSynthWave) {
     if (type != (uint8_t) InstrumentType::kSynth)
       return ParamState::Absent;
     return synth_param_read_by_voice(ins, p) ? ParamState::Live
@@ -467,6 +468,7 @@ instrument_param_get(const Instrument *ins, int id) {
     case InsParam::kSynthWave:  return (int) ins->synth_wave;
     case InsParam::kSliceStop:
       return (ins->flags & kInstrumentSliceStop) != 0u ? 1 : 0;
+    case InsParam::kPan: return (int) ins->pan;
     case InsParam::kCount:      break;
   }
   return 0;
@@ -591,6 +593,7 @@ instrument_param_set(Instrument *ins, int id, int value) {
       ins->flags = (uint8_t) (v != 0 ? (ins->flags | kInstrumentSliceStop)
                                      : (ins->flags & ~kInstrumentSliceStop));
       break;
+    case InsParam::kPan: ins->pan = (uint8_t) v; break;
     case InsParam::kCount:      break;
   }
 }
@@ -857,7 +860,7 @@ const int kInstrumentBytes = 32;
 const int kDirectoryEntryBytes = 12;
 const int kMaxBlocks = 32;
 
-// Block ids. FXPL, NAME, SYNP, MACR, MIXR, TUNE, SLIC, SMUT, ITUN, EFXS and EDIT are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
+// Block ids. FXPL, NAME, SYNP, MACR, MIXR, TUNE, SLIC, SMUT, ITUN, IPAN, EFXS and EDIT are understood; 0x0010 AUTO is reserved, — automation lanes were what MACR replaced, and the id
 // stays spent rather than reused so a file written against the older sketch
 // cannot be misread as something else. An id this reader does not know is
 // skipped when the file says it is optional and refused when it says it is
@@ -875,6 +878,9 @@ const uint16_t kBlockSmut = 0x000B;
 // skipped it would play every imported sample out of tune with nothing to point
 // at.
 const uint16_t kBlockItun = 0x000C;
+// Always critical, even for center: older readers must refuse LRRL reinterpretation.
+// One byte per instrument; absence in older input means all instruments centered.
+const uint16_t kBlockIpan = 0x000F;
 const int kMaxTune = 1024;                 // +-128 semitones, in eighths
 // EFXS: `u8` the highest note effect past the nibble the patterns use, `u8`
 // reserved zero. **The loader does not bound `Note::effect`**, so a reader that
@@ -1092,6 +1098,8 @@ module_load(Module *module, const uint8_t *data, size_t size) {
   size_t tune_bytes = 0;
   const uint8_t *smut = nullptr;
   size_t smut_bytes = 0;
+  const uint8_t *ipan = nullptr;
+  size_t ipan_bytes = 0;
   const uint8_t *itun = nullptr;
   size_t itun_bytes = 0;
   const uint8_t *macr = nullptr;
@@ -1189,6 +1197,9 @@ module_load(Module *module, const uint8_t *data, size_t size) {
           read_u16(data + offset + 4) != 0u)
         return false;
       module->hidden_channels = read_u16(data + offset + 2);
+    } else if (id == kBlockIpan) {
+      ipan = data + offset;
+      ipan_bytes = (size_t) bytes;
     } else if (id == kBlockItun) {
       // Judged against the instrument count, parsed below -- NAME's reason.
       itun = data + offset;
@@ -1420,6 +1431,12 @@ module_load(Module *module, const uint8_t *data, size_t size) {
       if (bits != 0u)
         module->has_slot_mute = true;
     }
+  }
+
+  if (ipan != nullptr) {
+    if (ipan_bytes != (size_t) module->instrument_count) return false;
+    for (int i = 0; i < module->instrument_count; ++i)
+      module->instruments[i].pan = ipan[i];
   }
 
   // ITUN, once the instrument table has said how many instruments there are.
@@ -1842,7 +1859,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   const bool want_efxs = efxs_high != 0u;
   const bool want_edit = module->hidden_channels != 0u;   // see kBlockEdit
 
-  const int block_count = (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
+  const int block_count = 1 + (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
                           (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
                           (want_macr ? 1 : 0) + (want_mixr ? 1 : 0) +
                           (want_slic ? 1 : 0) + (want_smut ? 1 : 0) +
@@ -1882,7 +1899,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
                        tune_bytes + name_bytes + synp_bytes + macr_bytes +
                        mixr_bytes + slic_bytes + smut_bytes + itun_bytes +
-                       efxs_bytes + edit_bytes;
+                       efxs_bytes + edit_bytes + (size_t) module->instrument_count;
 
   *written = total;
   if (out == nullptr)
@@ -2045,6 +2062,14 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     write_u16(out + at + 4, 0u);
     at += (size_t) kEditBytes;
   }
+
+  write_u16(out + entry, kBlockIpan);
+  write_u16(out + entry + 2, kBlockCritical);
+  write_u32(out + entry + 4, (uint32_t) at);
+  write_u32(out + entry + 8, module->instrument_count);
+  entry += (size_t) kDirectoryEntryBytes;
+  for (int i = 0; i < module->instrument_count; ++i)
+    out[at++] = module->instruments[i].pan;
 
   if (want_itun) {
     // **Critical, always**: written only when some tune is non-zero, and a tune
@@ -2245,13 +2270,44 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
 // for the edge, and 127/128 of the way there is a channel that never quite
 // arrives.
 //
-// This is `fxpl_to_pan` in the mixer, spelled again because `ntrk.h` is the
-// standalone replayer and cannot reach the mixer. The two writers of
-// `player->pan` have to agree on what a byte means, so if one moves, move both.
 inline float
-pan_from_byte(int v) {
+pan_from_byte(float v) {
   const float p = ((float) v - 128.f) * (1.f / 127.f);
   return p < -1.f ? -1.f : (p > 1.f ? 1.f : p);
+}
+
+// Explicit pan holds until start/seek (or a live strip edit). Instrument triggers
+// only supply the fallback; they never erase saved channel or command intent.
+inline void
+player_set_pan(Player *p, int c, float value) {
+  p->pan[c] = value < -1.f ? -1.f : (value > 1.f ? 1.f : (value == value ? value : 0.f));
+  p->pan_held[c] = true;
+}
+inline void
+player_instrument_pan(Player *p, int c, int instrument) {
+  if (!p->pan_held[c])
+    p->pan[c] = instrument > 0 ? pan_from_byte(p->module->instruments[instrument - 1].pan) : 0.f;
+}
+inline void
+player_reset_pan(Player *p) {
+  ++p->pan_epoch;
+  for (int c = 0; c < kMaxChannels; ++c) {
+    const uint8_t b = p->module ? p->module->mix[kMixrPanAt + c] : 0;
+    p->pan[c] = b ? pan_from_byte(b) : 0.f;
+    p->pan_held[c] = b != 0;
+  }
+}
+// Shared balance law, evaluated after sequencing at every render run.
+inline void
+player_pan_gains(const Player *p, bool stereo, float *left, float *right) {
+  float sep = p->separation;
+  sep = sep == sep ? (sep < 0.f ? 0.f : (sep > 1.f ? 1.f : sep)) : 0.f;
+  for (int c = 0; c < kMaxChannels; ++c) {
+    float v = stereo ? p->pan[c] * sep : 0.f;
+    v = v == v ? (v < -1.f ? -1.f : (v > 1.f ? 1.f : v)) : 0.f;
+    left[c] = v > 0.f ? 1.f - v : 1.f;
+    right[c] = v < 0.f ? 1.f + v : 1.f;
+  }
 }
 
 // Point a player at a module and play it from the top.
@@ -2279,7 +2335,9 @@ player_start(Player *player, const Module *module) {
   for (int i = 0; i < kMaxChannels; ++i)
     muted[i] = player->muted[i];
 
+  const uint64_t epoch = player->pan_epoch;
   *player = Player();
+  player->pan_epoch = epoch;
 
   for (int i = 0; i < kMaxChannels; ++i)
     player->muted[i] = muted[i];
@@ -2297,12 +2355,7 @@ player_start(Player *player, const Module *module) {
       module->rows < 1 || module->order_count < 1)
     return;
 
-  // LRRL, repeating every four: the Amiga's channel arrangement, and the
-  // reason these tunes place their parts the way they do.
-  for (int i = 0; i < kMaxChannels; ++i) {
-    const int slot = i & 3;
-    player->pan[i] = (slot == 0 || slot == 3) ? -1.f : 1.f;
-  }
+  player_reset_pan(player);
 
   player->speed = module->speed;
   player->bpm = module->bpm;
@@ -2347,7 +2400,9 @@ player_stop(Player *player) {
 // plays, with Fxx, so where they stand at any row is a function of every row
 // before it. Landing on a row cannot know them without playing the tune up to
 // there, which is exactly what seeking is avoiding. Same for the effect memory
-// each channel carries. A tune that changes tempo mid-way will therefore play
+// each channel carries. Pan commands reset too: the landing row starts from
+// explicit MIXR pan or center, then its instrument/commands apply. Prior rows
+// are not scanned. A tune that changes tempo mid-way will therefore play
 // its later patterns at the wrong speed until the next Fxx, and an editor that
 // wants better has to render from the start and throw the audio away.
 inline bool
@@ -2362,6 +2417,7 @@ player_seek(Player *player, int order, int row) {
   if (row < 0 || row >= m->rows)
     return false;
 
+  player_reset_pan(player);
   player->order = order;
   player->row = row;
   player->tick = 0;
@@ -2851,6 +2907,7 @@ player_preview(Player *player, int channel, int note, int instrument,
 
   const Instrument &ins = m->instruments[instrument - 1];
   Channel *ch = &player->channels[channel];
+  player_instrument_pan(player, channel, instrument);
   ch->instrument = instrument;
   ch->tune_ratio = instrument_tune_ratio(ins);
   ch->finetune = ins.finetune;
@@ -2992,6 +3049,9 @@ player_row(Player *player, double sample_rate) {
       ch->volume = (float) m->instruments[n.instrument - 1].volume;
       ch->finetune = m->instruments[n.instrument - 1].finetune;
     }
+
+    if ((n.instrument > 0 || (n.note > 0 && n.note <= m->note_max)) && ch->instrument > 0)
+      player_instrument_pan(player, c, ch->instrument);
 
     // E5x overrides the instrument's finetune, and has to be read before the
     // note is turned into a period rather than after.
@@ -3205,7 +3265,7 @@ player_row(Player *player, double sample_rate) {
             // is that no nibble is exactly centre -- E87 and E88 straddle it --
             // which is what every tracker that reads this command does, and
             // preferable to keeping centre and losing an edge.
-            player->pan[c] = pan_from_byte(value * 17);
+            player_set_pan(player, c, pan_from_byte(value * 17));
             break;
           case 0x9:   // retrigger every n ticks
             ch->retrig = (uint8_t) value;
@@ -3249,7 +3309,7 @@ player_row(Player *player, double sample_rate) {
         // accumulator rather than from a pan this command set in between --
         // documented rather than reconciled, because a tune driving one
         // channel's pan from both places at once is asking two things.
-        player->pan[c] = pan_from_byte(param);
+        player_set_pan(player, c, pan_from_byte(param));
         break;
       default:
         break;
@@ -3801,10 +3861,8 @@ channel_sample(Channel *ch, const Instrument &ins) {
 // an output the way `audio_bus.cc`'s own `render_add` does — and for the same
 // reason: a renderer that assigns silently drops whatever was already there.
 //
-// Mono: every output channel gets the same value. ponytail: no stereo, and the
-// upgrade is ProTracker's LRRL panning with a separation knob — the Amiga's
-// hard-panned channels are a big part of how these sound, and a tune played
-// dead centre is a tune with something missing.
+// Stereo uses the instrument/channel/command pan through player_pan_gains;
+// mono receives unity gains on both sides, including stereo-source downmixes.
 // **The sequencer, separated from the mix so more than one mixer can drive it.**
 // `render_add` below is one caller; a mixer that needs each channel's signal
 // before it is summed is the other, and it cannot reuse the mix stage at all --
@@ -3959,34 +4017,8 @@ render_add(Player *player, double *buffer, int frames, int channels,
   const double rate = sample_rate > 0.f ? (double) sample_rate : 48000.0;
   const Module *m = player->module;
 
-  // Pan gains, hoisted: neither pan nor separation moves inside a call, and
-  // recomputing them per frame would be the same numbers 48000 times a second.
-  //
-  // **A balance law with unity centre, not equal power.** A centred voice has
-  // always reached every output at full value here, so any law with a centre
-  // gain below one would quietly drop the whole tune by 3 to 6 dB the day
-  // panning arrived -- which reads as the update having broken the music
-  // rather than as a pan control. What balance costs instead: two voices
-  // panned hard apart sum 3 dB louder than the same two centred. That is the
-  // behaviour a tracker has always had.
-  //
-  // The useful consequence is that this is a provable no-op when it is off: at
-  // `separation == 0`, or for a mono caller, every gain is exactly 1.0f and
-  // `s * 1.0f == s` in IEEE, so the output is bit-for-bit what it was before.
   const bool stereo = channels >= 2;
-  float gain_l[kMaxChannels];
-  float gain_r[kMaxChannels];
-  for (int c = 0; c < kMaxChannels; ++c) {
-    float p = 0.f;
-    if (stereo) {
-      float sep = player->separation;
-      sep = sep < 0.f ? 0.f : (sep > 1.f ? 1.f : sep);
-      p = player->pan[c] * sep;
-      p = p < -1.f ? -1.f : (p > 1.f ? 1.f : p);
-    }
-    gain_l[c] = p > 0.f ? 1.f - p : 1.f;
-    gain_r[c] = p < 0.f ? 1.f + p : 1.f;
-  }
+  float gain_l[kMaxChannels], gain_r[kMaxChannels];
 
   // **Runs of frames, bounded by the next tick, rather than one frame at a
   // time.** This is the shape effects are written against: a filter coefficient
@@ -4012,6 +4044,7 @@ render_add(Player *player, double *buffer, int frames, int channels,
     if (run == 0)
       return;
 
+    player_pan_gains(player, stereo, gain_l, gain_r);
     for (int i = 0; i < run; ++i) {
     const int at = frame + i;
     float left = 0.f;

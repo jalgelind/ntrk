@@ -5,6 +5,7 @@ import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
+import {Engine} from './engine.js';
 const require=createRequire(import.meta.url);
 const {chromium}=require(process.env.NTRK_PLAYWRIGHT||'playwright');
 const root=process.env.NTRK_WEB_ROOT||fileURLToPath(new URL('../out/web/',import.meta.url));
@@ -32,8 +33,8 @@ try {
     };
     // Record the actual paint calls, not DOM surrogates for a canvas.
     const text=CanvasRenderingContext2D.prototype.fillText;
-    window.painted=[];
-    CanvasRenderingContext2D.prototype.fillText=function(s,...args){painted.push(String(s));if(painted.length>12000)painted.splice(0,6000);return text.call(this,s,...args);};
+    window.painted=[];window.drawn=[];
+    CanvasRenderingContext2D.prototype.fillText=function(s,...args){painted.push(String(s));drawn.push({text:String(s),x:args[0],y:args[1]});if(drawn.length>12000)drawn.splice(0,6000);if(painted.length>12000)painted.splice(0,6000);return text.call(this,s,...args);};
   });
   await page.goto(`http://127.0.0.1:${server.address().port}/player/`);
   const demo=JSON.parse(await readFile(path.join(root,'demo.json'),'utf8'));
@@ -51,7 +52,7 @@ try {
   });
   await page.waitForFunction(()=>window.view?.m.ready&&view.hits.some(h=>h.id==='open'));
   const model=()=>page.evaluate(()=>({name:view.m.name,state:view.m.state,message:view.m.message,dirty:view.m.dirty,follow:view.m.follow}));
-  const wait=fn=>page.waitForFunction(fn);
+  const wait=async fn=>{try{return await page.waitForFunction(fn);}catch(error){console.error('Browser state:',await model(),errors);throw error;}};
   const click=async(x,y)=>{await page.evaluate(()=>new Promise(requestAnimationFrame));await page.mouse.click(x,y);assert(await page.evaluate(()=>document.activeElement===document.querySelector('canvas')),'canvas retains keyboard focus');};
   // Toolbar coordinates are independent expectations of the compact bands.
   const button=async id=>{
@@ -64,6 +65,7 @@ try {
   if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.startup.png'});
   await button('demo');await wait(()=>!!view.m.snapshot&&!view.m.busy);
   const cell=async(r,c,f)=>{
+    await page.evaluate(([r,c,f])=>view.reveal(r,c,f),[r,c,f]);await page.evaluate(()=>new Promise(requestAnimationFrame));
     const p=await page.evaluate(([r,c,f])=>{const b=view.cell(r,c,f);return {x:b.x+b.w/2,y:b.y+b.h/2};},[r,c,f]);
     await click(p.x,p.y);
     assert.deepEqual(await page.evaluate(()=>[view.m.row,view.m.channel,view.m.field]),[r,c,f],'pointer maps to intended field');
@@ -89,10 +91,42 @@ try {
   assert.equal(await page.locator('button,table,details,output').count(),0);
   assert.equal(await page.locator('input:visible').count(),0);
   const initialBytes=await download();
-  if(demo)assert.deepEqual(initialBytes,await readFile(path.join(root,demo.url)),'authored demo identity');
+  if(demo){
+    const engine=new Engine(await WebAssembly.compile(await readFile(path.join(root,'ntrk.wasm'))),48000);
+    engine.command('load',[await readFile(path.join(root,demo.url))]);
+    assert.deepEqual(initialBytes,Buffer.from(engine.command('save')),'authored demo plus mandatory IPAN export');
+  }
   const initial=await snapshot();assert.equal(initial.state[0],16);assert.equal(initial.state[1],32);
   const names=Object.values(initial.instruments).map(i=>Buffer.from(Object.values(i.nameBytes)).toString()).filter(Boolean);
   assert(names.length>0);assert(await page.evaluate(names=>names.some(n=>painted.some(t=>t.includes(n))),names),'module-owned instrument names are drawn');
+  // Every authored command column has real paint, hit and navigation geometry.
+  assert.equal(initial.instruments[0].pan,128);
+  assert(await page.evaluate(()=>painted.some(t=>t.startsWith('Pan 80'))),'instrument-owned pan shown');
+  const verifyPaint=async(r,c,f)=>{
+    await cell(r,c,f);
+    const result=await page.evaluate(async([r,c,f])=>{
+      const {commandCell}=await import('/player/canvas.js'+new URL(document.querySelector('script').src).search);
+      const expected=commandCell(view.m.snapshot,view.m.snapshot.orders[view.m.order],r,c,f).text;
+      drawn=[];view.invalidate();await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);
+      const b=view.cell(r,c,f);
+      return {expected,painted:drawn.some(t=>t.text===expected&&t.x===Math.round(b.x+2)&&t.y===Math.round(b.y+b.h/2))};
+    },[r,c,f]);
+    assert(result.painted,`formatted cell ${c}/${f}: ${result.expected}`);
+  };
+  if(demo) {
+    assert.equal(initial.state[12],3);assert.equal(initial.state[13],5);
+    for(const c of [0,1,2,3])for(let f=4;f<7;f++)await verifyPaint(0,c,f);
+    for(let lane=0;lane<5;lane++)await verifyPaint(0,-1,lane);
+    assert(await page.evaluate(()=>view.sx>0),'meta columns reveal horizontally');
+    if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.meta.png'});
+    const before=await download();await button('edit');
+    await cell(0,-1,0);await page.keyboard.press('Delete');await page.keyboard.type('ff');
+    await wait(()=>!view.m.busy);assert.match((await model()).message,/read only/);
+    await cell(0,0,4);await page.keyboard.type('12');await page.keyboard.press('Enter');
+    await wait(()=>!view.m.busy);assert.deepEqual(await download(),before,'read-only lanes cannot corrupt primary bytes');
+    await button('edit');
+  }
+  await cell(0,0,0);
   const idlePixels=await pixels('grid');
   await button('play');await wait(()=>view.m.state[8]===1);
   await page.waitForTimeout(100);
@@ -160,18 +194,28 @@ try {
   const loadFixture=async name=>loadBytes(name+'.ntrk',await readFile(path.join(fixtureRoot,name+'.ntrk')));
   const visible=()=>page.evaluate(()=>view.m.snapshot.channels);
   assert.deepEqual(await visible(),demo?[0,1,2,3]:[0,1,2]);
+  await loadFixture('commands');
+  for(const [c,mnemonic] of [[0,'PAN'],[1,'SLC'],[2,'SOF'],[3,'PAN']]) {
+    await verifyPaint(0,c,2);
+    const label=await page.evaluate(c=>view.m.snapshot.commands[0][c*4].text,c);
+    assert.equal(label,mnemonic);
+  }
+  await verifyPaint(0,-1,0);assert(await page.evaluate(()=>painted.includes('M01 00')));
+  await verifyPaint(0,-1,1);assert(await page.evaluate(()=>painted.includes('... 40')));
   await loadFixture('sparse');
   assert.deepEqual(await visible(),[0,3,11,14]);
   assert.equal((await snapshot()).usedMask,(1<<0)|(1<<3)|(1<<11)|(1<<14));
-  assert.deepEqual(await page.evaluate(()=>view.hits.filter(h=>h.id.startsWith('mute')).map(h=>h.id)),['mute0','mute3','mute11','mute14']);
+  assert(await page.evaluate(()=>view.hits.filter(h=>h.id.startsWith('mute')).every(h=>[0,3,11,14].includes(Number(h.id.slice(4))))));
   assert.equal(await value(0,14,0),0,'FXPL-only track has no primary note');
   if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.sparse.png'});
-  assert(await page.evaluate(()=>['CH 01','CH 04','CH 0C','CH 0F'].every(label=>painted.includes(label))),'original IDs drawn compactly');
+  for(const c of [0,3,11,14]) await cell(0,c,0);
+  assert(await page.evaluate(()=>['CH 01','CH 04','CH 0C','CH 0F'].every(label=>painted.includes(label))),'original IDs drawn with all lanes');
   await cell(0,3,1);await page.keyboard.type('02');await wait(()=>!view.m.busy&&view.m.row===1);
   assert.equal(await value(0,3,1),2);assert.equal(await value(0,1,1),0,'compact slot never edits its numeric slot index');
-  await cell(0,3,3);await page.keyboard.press('ArrowRight');await wait(()=>!view.m.busy);
+  await cell(0,3,5);await page.keyboard.press('ArrowRight');await wait(()=>!view.m.busy);
   assert.deepEqual(await page.evaluate(()=>[view.m.channel,view.m.field]),[11,0]);
-  await page.keyboard.press('ArrowLeft');await wait(()=>!view.m.busy);assert.deepEqual(await page.evaluate(()=>[view.m.channel,view.m.field]),[3,3]);
+  await page.keyboard.press('ArrowLeft');await wait(()=>!view.m.busy);assert.deepEqual(await page.evaluate(()=>[view.m.channel,view.m.field]),[3,5]);
+  await page.evaluate(()=>view.reveal(0,11,0));await page.evaluate(()=>new Promise(requestAnimationFrame));
   const sparseMute=await page.evaluate(()=>({x:view.cell(0,11,0).x+35,y:view.grid.y-14}));
   await click(sparseMute.x,sparseMute.y);await wait(()=>view.m.state[11]===(1<<11));
   assert.equal((await page.evaluate(()=>engineCommand('state')))[11],1<<11);
@@ -184,7 +228,7 @@ try {
   assert.deepEqual(await download(),sparseSaved,'save keeps original channel count, FXPL and unreferenced patterns');
   await loadFixture('empty');assert.deepEqual(await visible(),[0]);assert.equal((await snapshot()).usedMask,0);
   assert.equal((await model()).state[0],16,'empty module keeps its actual channel count');
-  const emptyBlank=await page.evaluate(()=>({x:view.raster.x+view.channelW+30,y:view.grid.y+10}));
+  const emptyBlank=await page.evaluate(()=>({x:view.raster.x+view.channelW+8*view.advance+30,y:view.grid.y+10}));
   await click(emptyBlank.x,emptyBlank.y);assert.equal(await page.evaluate(()=>view.m.channel),0,'empty raster space is not an unused channel');
   await cell(0,0,0);await page.keyboard.press('x');await wait(()=>!view.m.busy&&view.m.row===1);assert.equal(await value(0,0,0),15);
   await cell(0,0,0);await page.keyboard.press('Delete');await wait(()=>!view.m.busy&&view.m.row===1);
@@ -227,6 +271,7 @@ try {
   await page.evaluate(()=>{view.sx=view.sy=0;view.invalidate();});await cell(0,0,0);
   assert.deepEqual(await visible(),demo?[0,1,2,3]:[0,1,2]);
   if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.mobile.png'});
+  if(demo){await cell(0,-1,4);if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.mobile-meta.png'});}
   // Generic local-file checks include actual foreign sampled modules.
   for(const name of ['sampled.mod','sampled.xm','sampled.mod.ntrk','sampled.xm.ntrk']) {
     await loadBytes(name.replace(/\.(mod|xm)$/i,'.ntrk'),await readFile(path.join(fixtureRoot,name)));
@@ -323,6 +368,28 @@ try {
     await isolated.locator('#open').setInputFiles({name:'arbitrary.ntrk',mimeType:'application/octet-stream',buffer:beforeVolume});
     await isolated.waitForFunction(()=>v.m.name==='arbitrary.ntrk');await isolated.close();
   }
+  // Actual AudioWorklet stereo: centered instrument defaults versus explicit
+  // 8FF, through browser audio nodes, with all other voices monitor-muted.
+  const stereoPeaks=()=>page.evaluate(async()=>{
+    const split=testContext.createChannelSplitter(2),analysers=[testContext.createAnalyser(),testContext.createAnalyser()];
+    testNode.connect(split);analysers.forEach((a,i)=>{a.fftSize=2048;split.connect(a,i);});
+    const peaks=[0,0],buffer=new Float32Array(2048);
+    for(let i=0;i<12;++i){await new Promise(r=>setTimeout(r,25));analysers.forEach((a,c)=>{a.getFloatTimeDomainData(buffer);for(const x of buffer)peaks[c]=Math.max(peaks[c],Math.abs(x));});}
+    testNode.disconnect(split);split.disconnect();analysers.forEach(a=>a.disconnect());return peaks;
+  });
+  await page.evaluate(async()=>{
+    const snap=await engineCommand('demo');view.m.snapshot=snap;view.m.state=snap.state;view.m.order=view.m.row=view.m.field=view.m.channel=0;
+    for(let c=1;c<16;++c)await engineCommand('mute',[c]);
+    await testContext.resume();await engineCommand('transport',[1,0,0]);
+  });
+  const center=await stereoPeaks();assert(center[0]>.001 && center[0]===center[1],`centered worklet ${center}`);
+  await page.evaluate(async()=>{
+    await engineCommand('transport',[0,0,0]);
+    await engineCommand('edit',[0,0,0,2,8]);await engineCommand('edit',[0,0,0,3,255]);
+    await engineCommand('transport',[1,0,0]);
+  });
+  const right=await stereoPeaks();assert(right[1]>.001 && right[0]===0,`explicit hard-right worklet ${right}`);
+  console.log('browser worklet stereo:',{center,right});
   const unavailable=await browser.newPage();
   await unavailable.route('**/ntrk.wasm*',route=>route.fulfill({status:404,body:'missing'}));
   await unavailable.goto(`http://127.0.0.1:${server.address().port}/player/`);
@@ -331,7 +398,7 @@ try {
   assert(await unavailable.evaluate(()=>!v.hits.some(h=>h.id==='open'||h.id==='play')));
   await unavailable.close();
   await page.evaluate(()=>testContext.close());assert.deepEqual(errors,[]);
-  console.log(`browser: ${demoName}; exact demo bytes; real worklet peak ${peak.toFixed(3)}; canvas pixels/DPR; pointer fields/mutes/orders/instruments/steppers; keyboard edits/bounds; save/reopen; failed loads; modal help/discard; sparse IDs/FXPL-only/meta-only/empty/stable visibility; wide fixture wheel/scrollbars/pan; desktop/mobile resize/focus; subpath generic startup/bad example recovery; sampled MOD/XM/PCM; burst edits/save/load ordering; actual gain/meter; seek; real touch drag/tap threshold passed`);
+  console.log(`browser: ${demoName}; authored demo migration; all command lanes/read-only paint/hit geometry; centered/explicit stereo; real worklet peak ${peak.toFixed(3)}; canvas pixels/DPR; pointer fields/mutes/orders/instruments/steppers; keyboard edits/bounds; save/reopen; failed loads; modal help/discard; sparse IDs/FXPL-only/meta-only/empty/stable visibility; wide fixture wheel/scrollbars/pan; desktop/mobile resize/focus; subpath generic startup/bad example recovery; sampled MOD/XM/PCM; burst edits/save/load ordering; actual gain/meter; seek; real touch drag/tap threshold passed`);
 } finally {
   if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));
 }

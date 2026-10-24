@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <cmath>
+#include <initializer_list>
 
 using namespace ntrk;
 
@@ -780,9 +781,8 @@ test_plane_pan_sets() {
   Module left_default;
   CHECK(module_load(&left_default, g_bytes, g_size));
   render_mix(&left_default, g_a, frames);
-  // player_start's LRRL puts channel 0 on the left, and the plane has said
-  // nothing — so this is the baseline the two commands below move away from.
-  CHECK(balance(g_a, 0, frames) < -0.5);
+  // No pan was authored, so the instrument baseline is centered.
+  CHECK(balance(g_a, 0, frames) == 0.0);
 
   plane_clear();
   plane_put(0, 0x01, 255);
@@ -1405,9 +1405,13 @@ big_mixer_setup() {
 // asking for a whole file at once produces and the one every other chunking is
 // compared against.
 static void
-big_render(double *out, int frames, int chunk) {
+big_render(double *out, int frames, int chunk, bool legacy = false) {
   Player p;
   player_start(&p, &g_big);
+  if(legacy) {
+    p.separation=.7f;
+    for(int c=0;c<kMaxChannels;++c)player_set_pan(&p,c,(c%4==0||c%4==3)?-1.f:1.f);
+  }
   big_mixer_setup();
   memset(out, 0, (size_t) frames * 2u * sizeof(double));
 
@@ -1599,7 +1603,12 @@ test_everything_at_once() {
   // closed at the glide's rate instead of snapped, and a note out of a silenced or replaced
   // 303 started cold. This tune slides its bass, so it *must* move. The decimator's mirrored
   // ring, the cached zero and the flushed followers moved nothing, and were checked to.
+  // Centered instrument defaults and separation 1 change every unpanned voice
+  // and preserve full stereo for explicitly panned effect-plane commands.
   check_hash("everything at once", hash_stream(g_ref, kBigFrames * 2),
+             0xba7001e4027074bfULL);
+  big_render(g_cur,kBigFrames,0,true);
+  check_hash("explicit legacy mix reference",hash_stream(g_cur,kBigFrames*2),
              0x98d5cdd4d02ce4faULL);
 }
 
@@ -2727,7 +2736,7 @@ test_channel_strip() {
   strip_clear();
   slot_render(6, g_a);
   CHECK(peak_of(g_a, n) < 0.89);           // under the clipper's knee, or halving is not exact
-  CHECK(g_mac_player.pan[0] == -1.f);      // LRRL: the player's own layout
+  CHECK(g_mac_player.pan[0] == 0.f);      // absent instrument/channel pan is centered
 
   // Half the fader on every channel is exactly half the output: *0.5 is exact in floats.
   for (int c = 0; c < kMaxChannels; ++c)
@@ -2746,9 +2755,9 @@ test_channel_strip() {
   g_mixer.channel_pan[0] = 128u;           // explicit centre
   slot_render(6, g_b);
   CHECK(g_mac_player.pan[0] == 0.f);
-  CHECK(g_mac_player.pan[1] == 1.f);       // channel 1 kept the layout: pan 0 writes nothing
-  player_start(&g_mac_player, &g_mac);     // back to LRRL, no mixer_reset
-  CHECK(g_mac_player.pan[0] == -1.f);
+  CHECK(g_mac_player.pan[1] == 0.f);       // channel 1 keeps its centered instrument default
+  player_start(&g_mac_player, &g_mac);     // back to center, no mixer_reset
+  CHECK(g_mac_player.pan[0] == 0.f);
   memset(g_b, 0, sizeof(double) * (size_t) n);
   mix::mixer_render_add(&g_mixer, &g_mac_player, g_b, kTickFrames * 6, 2, 48000.f);
   CHECK(g_mac_player.pan[0] == 0.f);
@@ -2811,8 +2820,8 @@ test_send_modes_and_stereo_taps() {
   CHECK(lr == 0);
   CHECK(peak_of(g_a, n) > 0.0);
 
-  // One channel, hard left. `player_start` sets separation 0.7, so the gains are 1 and 0.3 and
-  // the tap's energy on the right is 0.3^2 = 0.09 of the left's -- a mono tap would be 1.
+  // One channel, explicitly hard left. Separation 1 preserves gains 1 and 0;
+  // the stereo send has no right-side energy. A mono tap would have both.
   mac_build(1, 1);
   for (int c = 1; c < kMacChannels; ++c)
     g_mac_pat[c] = Note();                                            // only channel 0 plays
@@ -2829,7 +2838,7 @@ test_send_modes_and_stereo_taps() {
     dr += (g_b[i + 1] - g_a[i + 1]) * (g_b[i + 1] - g_a[i + 1]);
   }
   CHECK(dl > 0.0);
-  CHECK(dr / dl > 0.089 && dr / dl < 0.091);
+  CHECK(dr == 0.0); // separation 1 preserves explicit hard left
 
   // A Bus takes no taps: the same levels into a Bus change nothing (nothing is routed to it).
   mac_build(1, 1);
@@ -4260,13 +4269,13 @@ test_mixr_one_layout() {
   CHECK(module_load(&m, g_bytes, g_size));
   size_t plain = 0;
   CHECK(module_save(&m, g_saved, sizeof g_saved, &plain));
-  CHECK(plain == g_size);                                    // untouched: no block at all
+  CHECK(plain == g_size + 12u + m.instrument_count);                                    // untouched: no block at all
 
   m.mix[kMixrSendLevelsAt + 1] = 200;                        // a send level
   m.mix[kMixrPanAt + 0] = 1;                                 // an explicit pan
   size_t n = 0;
   CHECK(module_save(&m, g_saved, sizeof g_saved, &n));
-  CHECK(n == g_size + (size_t) kDirectoryEntryBytes + (size_t) kMixrBytes);
+  CHECK(n == g_size + 12u + m.instrument_count + (size_t) kDirectoryEntryBytes + (size_t) kMixrBytes);
   Module back;
   CHECK(module_load(&back, g_saved, n));
   CHECK(memcmp(back.mix, m.mix, kMixrBytes) == 0);
@@ -4900,6 +4909,68 @@ test_config_reads_params_without_a_mixer() {
   CHECK(mix::config_width(&bad) == 1.f);
 }
 
+static void
+test_instrument_pan_precedence() {
+  printf("instrument pan agrees in pure/mixer paths and commands hold across retriggers/reset\n");
+  int8_t wave[32];for(int i=0;i<32;++i)wave[i]=i<16?20:-20;
+  Note notes[4*kMaxChannels]={};uint8_t orders[]={0};
+  Module m;m.channels=kMaxChannels;m.rows=4;m.pattern_count=1;m.order_count=1;
+  m.instrument_count=2;m.patterns=notes;m.order=orders;m.speed=1;
+  for(int i=0;i<2;++i){m.instruments[i].data=wave;m.instruments[i].length=32;
+    m.instruments[i].loop_len=32;m.instruments[i].pan=i?255:0;}
+  for(int r=0;r<4;++r){notes[r*kMaxChannels].note=25;notes[r*kMaxChannels].instrument=r%2+1;}
+  notes[2*kMaxChannels].effect=8;notes[2*kMaxChannels].param=192;
+  for(float rate:{44100.f,48000.f,96000.f}) {
+    for(uint8_t stored:{uint8_t(0),uint8_t(64)}) {
+      m.mix[kMixrPanAt]=stored;
+      Player pure,mixed;player_start(&pure,&m);player_start(&mixed,&m);
+      mix::Mixer mx;CHECK(mix::mixer_config_read(&mx,&m));mx.master_gain=mixed.gain;
+      // Includes all four rows; one-frame calls independently test sequencing pan updates.
+      for(int i=0;i<(int)(rate*.09);++i) {
+        double a[2]={},b[2]={};render_add(&pure,a,1,2,rate);
+        mix::mixer_render_add(&mx,&mixed,b,1,2,rate);
+        CHECK(a[0]==b[0] && a[1]==b[1]);
+      }
+      CHECK(pure.pan[0]==pan_from_byte(192) && mixed.pan[0]==pure.pan[0]);
+      const auto epoch=mixed.pan_epoch;
+      CHECK(player_seek(&mixed,0,1));CHECK(mixed.pan_epoch!=epoch);
+      double b[2]={};mix::mixer_render_add(&mx,&mixed,b,1,2,rate);
+      CHECK(mixed.pan[0]==(stored?pan_from_byte(stored):1.f));
+    }
+  }
+  // A host may request sync before the first note: epoch reseeding still occurs
+  // after that note, so slides start from its pan on either host path.
+  {
+    FxCell plane[4*kMaxChannels]={};m.fx=plane;m.mix[kMixrPanAt]=0;m.speed=6;
+    plane[0].cmd=mix::kFxplPanSlide;plane[0].param=1;
+    Player a,b;player_start(&a,&m);player_start(&b,&m);
+    mix::Mixer ma,mb;mix::fxpl_sync(&mb,&b);
+    for(int i=0;i<1200;++i){double x[2]={},y[2]={};
+      mix::mixer_render_add(&ma,&a,x,1,2,48000);
+      mix::mixer_render_add(&mb,&b,y,1,2,48000);CHECK(x[0]==y[0]&&x[1]==y[1]);}
+    CHECK(a.pan[0]==b.pan[0] && a.pan[0]<-.9f);
+    m.fx=nullptr;m.speed=1;
+  }
+  // Same-row ordering: saved pan < note pan < plane set. Later instrument changes hold it.
+  FxCell fx[4*kMaxChannels]={};m.fx=fx;m.fx_columns=1;m.mix[kMixrPanAt]=64;
+  notes[0].effect=8;notes[0].param=0;fx[0].cmd=mix::kFxplPanSet;fx[0].param=255;
+  Player p;player_start(&p,&m);mix::Mixer mx;CHECK(mix::mixer_config_read(&mx,&m));
+  double audio[2]={};mix::mixer_render_add(&mx,&p,audio,1,2,48000);
+  CHECK(p.pan[0]==1 && p.pan_held[0]);
+  // Forward seek after a held command must resync the plane even though its clock did not decrease.
+  CHECK(player_seek(&p,0,1));audio[0]=audio[1]=0;
+  mix::mixer_render_add(&mx,&p,audio,1,2,48000);CHECK(p.pan[0]==pan_from_byte(64));
+  // A live strip edit replaces an override; clearing it restores the sounding instrument.
+  mix::config_set_channel_pan(m.mix,0,-1);CHECK(mix::mixer_config_read(&mx,&m));
+  audio[0]=audio[1]=0;mix::mixer_render_add(&mx,&p,audio,1,2,48000);CHECK(p.pan[0]==-1);
+  mix::config_clear_channel_pan(m.mix,0);CHECK(mix::mixer_config_read(&mx,&m));
+  audio[0]=audio[1]=0;mix::mixer_render_add(&mx,&p,audio,1,2,48000);CHECK(p.pan[0]==1 && !p.pan_held[0]);
+  CHECK(player_seek(&p,0,0));audio[0]=audio[1]=0;
+  mix::mixer_render_add(&mx,&p,audio,1,2,48000);CHECK(p.pan[0]==1);
+  player_start(&p,&m);audio[0]=audio[1]=0;
+  mix::mixer_render_add(&mx,&p,audio,1,2,48000);CHECK(p.pan[0]==1);
+}
+
 int
 main(void) {
   test_bypass_is_render_add();
@@ -4913,6 +4984,7 @@ main(void) {
   test_no_filter_flag_is_untouched();
   test_max_resonance_stays_finite();
   test_plane_pan_sets();
+  test_instrument_pan_precedence();
   test_plane_pan_slide_walks();
   test_plane_send_level_opens_a_send();
   test_plane_absent_is_render_add();

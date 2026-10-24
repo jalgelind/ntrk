@@ -316,6 +316,7 @@ struct Instrument {
   // accessor, `slice_offset`, is the single reader of a boundary.
   const uint8_t *slices = nullptr;
   uint16_t slice_count = 0;
+  uint8_t pan = 128;              // IPAN: 0 left, 128 center, 255 right
   uint8_t volume = 64;            // 0..64
   int8_t finetune = 0;            // -8..7
 
@@ -486,7 +487,7 @@ const int kFxplValueCount = 8;
 //   per bus slot (the four sends, then master FX 1): u8 kind, u8 reserved, u16 param[8]
 //   u8 send level [channel][send]     u8 return level [bus slot]
 //   master FX 2 and 3: a slot record each
-//   per channel: u16 volume (Q12)     per channel: u8 pan (0 = the player's own layout)
+//   per channel: u16 volume (Q12)     per channel: u8 pan (0 = instrument fallback)
 //   per channel: its insert, a slot record          per channel: u8 output (0 master, n send n)
 //   per send: u8 output (0 master, n a higher send)  per send: u8 mode (0 Send, 1 Bus)
 //
@@ -548,7 +549,7 @@ const int kMixrQUnit = 4096;       // Q12: what 1.0 is stored as
 // no file supplied one.** This is that block: every slot `kNone`, every param
 // zero, master gain, width and every channel volume at unity (`kMixrQUnit`),
 // every send level zero, every return at unity (255), and the rest at its zero
-// -- the player's pan layout, no insert, everything to the master, every send
+// -- instrument pan (center when absent), no insert, everything to the master, every send
 // a Send. It is `config_init`'s own bytes, written here instead, because
 // `Module`'s constructor (below) is the end that cannot see `ntrk_mix.h` — the
 // same reason the layout comment above lives in this file rather than that one.
@@ -979,24 +980,17 @@ struct Player {
   // passed has to read this instead of inferring it, or it silently drops every
   // update during exactly the passages where they are most audible.
   //
-  // Nothing downstream of this counter produces audio, so it cannot move a
-  // fingerprint. It going *backwards* is a free signal that the player was
-  // restarted or seeked.
   uint64_t ticks_elapsed = 0;
 
-  // Where each channel sits, -1 hard left to +1 hard right, scaled by
-  // `separation`. player_start fills these with ProTracker's LRRL, which is
-  // the arrangement the tunes were written for.
-  //
-  // Reset by player_start, unlike `muted`: panning is musical data that a tune
-  // may rewrite as it plays, where a mute is a monitoring control belonging to
-  // whoever is listening.
+  // Effective pan, -1 left, 0 center, +1 right. Instrument triggers update it
+  // unless a saved channel pan or held command overrides them. Start/seek drop
+  // commands and seed explicit MIXR or center; notes then supply their defaults.
   float pan[kMaxChannels] = {};
+  bool pan_held[kMaxChannels] = {}; // explicit channel or command overrides instrument
+  uint64_t pan_epoch = 0;          // start/seek invalidates mixer automation
 
-  // 0 collapses to the mono the player produced before panning existed; 1 is
-  // the Amiga's hard separation, which is fatiguing on headphones and loses a
-  // channel entirely when summed to mono.
-  float separation = 0.7f;
+  // Host stereo width: 0 mono, 1 preserves explicit pan endpoints (default).
+  float separation = 1.f;
 
   // Set when a row asked to jump, applied once the row has finished — a break
   // and a jump on the same row both count, and the order they are written in
