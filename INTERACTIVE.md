@@ -41,7 +41,9 @@ out-of-range values before integer conversion. `layer` takes an explicit fade
 in milliseconds (use the authored fade when desired). Commands take effect at
 the host's declared command boundary, before that render call's first frame.
 Section requests cannot use a row boundary at the same continuous clock as
-receipt. No section request implicitly starts a stopped runtime.
+receipt. Section selection follows FORMAT's idempotent current/pending rules;
+repeated values are not restart commands. No request implicitly starts a stopped
+runtime.
 
 The wrapper observes `until_tick <= 0` and pre-tick `tick == 0`, never apparent
 raw order/row changes during final-tick audio. It renders one frame at a new tick
@@ -53,11 +55,16 @@ after the channel fader/insert, before both dry output and send taps. A null spa
 preserves the ordinary arithmetic. There is only one sequencer.
 
 Entry restores score MIXR configuration, channel/command state and entry tempo.
-Same-kind slot buffers survive `mixer_config_read`; carry never calls
+Same-kind slot buffers survive `mixer_config_read`; a carried entry does not call
 `mixer_reset`. Loop wraps only replace order/row and traversal offset, retaining
 voices, command state, tick residual, gain ramps and shared buffers. Stops cut
 voices and command latches; carry renders only existing effects to the declared
-bounded deadline, then clears them. No new authored row is processed during drain.
+bounded deadline, then clears them. Carried stops freeze current automated mixer
+parameters rather than reloading MIXR/slot bases; no authored row runs during drain.
+`stop(true)` returns `Unsupported` before any mutation when carry was not negotiated.
+`stop(false)` always cuts a bound runtime and is an `Ok` no-op while unbound;
+unbound `stop(true)` returns `Stale`. Validated section end policies use the same
+stop operation and cannot silently downgrade to a cut.
 
 Pause freezes the entire musical renderer and its clock; queued layer values
 coalesce until resume. Accepted rates are exactly 44100, 48000 and 96000 Hz.
@@ -69,8 +76,8 @@ resampling of effect buffers across device changes is not provided. Invalid rate
 leave runtime state unchanged. A render rate mismatch is refused.
 
 `position()` and `pop_cue()` are audio-owner APIs, not concurrent observation
-methods. Cues carry generation, notification sequence, continuous unpaused frame
-clock, traversal, section/ID/type/strength and offset within the current render
+methods. Cues carry generation, notification sequence, continuous musical frame
+clock (active unpaused rendering plus tail drain, not a device/speaker timestamp), traversal, section/ID/type/strength and offset within the current render
 call. Internal feedback holds 256 cues; unread entries are never overwritten and
 its drop counter saturates at `UINT32_MAX`. The host must forward these through
 its own bounded transport. `Position.row_offset` describes the row whose audio

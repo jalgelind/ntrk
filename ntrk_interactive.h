@@ -6,6 +6,7 @@
 #define NTRK_INTERACTIVE_H_
 #include "ntrk_mix.h"
 #include <cmath>
+#include <cassert>
 #include <limits>
 namespace ntrk { namespace interactive {
 enum class Status { Ok, Invalid, Unsupported, Stale, MissingSection, InvalidRate, InvalidSequence };
@@ -164,7 +165,12 @@ public:
   Status request_section(uint64_t gen,uint64_t seq,uint32_t id) {
     Status s=check_(gen,seq); if (s!=Status::Ok) return s;
     for (int i=0;i<binding_->sections_;++i) if (binding_->section_[i].id==id) {
-      sequence_=seq; pending_=i; request_clock_=clock_; return Status::Ok;
+      sequence_=seq;
+      // Selection is state: current cancels a pending transition; repeated
+      // pending targets retain their original strictly-later boundary anchor.
+      if (i==section_) pending_=-1;
+      else if (i!=pending_) { pending_=i; request_clock_=clock_; }
+      return Status::Ok;
     }
     return Status::Invalid;
   }
@@ -210,22 +216,27 @@ public:
     }
     rate_=rate; return Status::Ok;
   }
-  void stop(bool carry) {
-    if (!binding_) return;
+  Status stop(bool carry) {
+    if (!binding_) return carry ? Status::Stale : Status::Ok;
+    if (carry && !binding_->caps_.carry) return Status::Unsupported;
     clear_voices_(); pending_=-1;
-    draining_=carry && binding_->caps_.carry;
+    draining_=carry;
     tail_left_=draining_ ? uint64_t(std::ceil(double(binding_->caps_.tail_deadline_ms)*rate_/1000.0)) : 0;
     active_=draining_;
     if (!draining_) { mix::mixer_reset(mixer_); player_->playing=false; }
     else {
-      // Drain has no new musical tick. Clear command latches without letting the
-      // mixer's first unsynced call execute an authored row a second time.
-      mix::fxpl_sync(mixer_,player_);
+      // Stop is not entry: freeze current automated parameters and buffers.
+      // Clear only commands, then acknowledge the last musical tick so drain
+      // cannot execute an authored row or restore the slot configuration.
+      mix::fxpl_clear_commands(mixer_);
+      mixer_->fxpl_synced=true;
       mixer_->fxpl_epoch=player_->pan_epoch; mixer_->fxpl_seen=player_->ticks_elapsed;
       player_->playing=true; player_->sequencing=false;
     }
+    return Status::Ok;
   }
-  // Adds into interleaved output. The clock counts unpaused frames, including tail drain.
+  // Adds into interleaved output. Musical clock counts active unpaused rendering
+  // including tail drain, not paused/inactive host output or speaker latency.
   Status render(double *out,int frames,int channels,double rate) {
     if (!binding_ || !binding_->matches(player_->module,generation_)) return Status::Stale;
     if (rate!=rate_ || !rate_supported(rate)) return Status::InvalidRate;
@@ -314,7 +325,10 @@ private:
       if (pending_>=0 && clock_>request_clock_ && (end || (grid && row_offset_%grid==0))) {
         section_=pending_; pending_=-1; row_offset_=0; ++traversal_; entry_(section_);
       } else if (end) {
-        if (!s.action) { stop(s.tail!=0); return; }
+        if (!s.action) {
+          const Status status=stop(s.tail!=0); // policy was checked by compile
+          assert(status==Status::Ok); (void)status; return;
+        }
         row_offset_=0; ++traversal_;
         player_->order=int(s.first/uint32_t(player_->module->rows)); player_->row=int(s.first%uint32_t(player_->module->rows));
         // Keep tick residual, monotonic tick count, voices, commands and all tails.

@@ -279,6 +279,12 @@ are `<module.rows`, and `(order_count,0)` is the sole terminal endpoint. No
 zero-length span. Quantization 0=row, 1=beat, 2=bar, using TUNE rows-per-beat/bar
 and anchored to the **outgoing section's start**. A request takes effect at the
 first eligible row boundary strictly after receipt; latest pending request wins.
+Section selection is idempotent state, not an implicit restart: selecting the
+current section cancels any pending transition and continues its traversal,
+voices and clock. Repeating the same pending target acknowledges the newer
+command sequence but retains that target's first receipt boundary anchor.
+Selecting a different pending target replaces it and anchors at the new receipt.
+There is no implicit same-section restart operation.
 The outgoing section end is always eligible, even off-grid. A request received
 at a boundary cannot retroactively take that boundary. With no request,
 end_action 0=stop, 1=loop. A loop wrap keeps the monotonic clock, voices and tails;
@@ -300,7 +306,12 @@ then process the destination row. `tail_policy` 0=cut clears mixer effect buffer
 1=carry retains mixer tail buffers while resetting score parameter/command state, and requires a host with
 explicit carry capability. Stop terminates voices and clears tracker command
 memory; cut clears effect buffers immediately, while a carry host drains effect
-buffers to its bounded tail deadline. A host must declare support for all requested policies and these reset semantics
+buffers to its bounded tail deadline. During a carried stop, current automated
+mixer parameters remain frozen; stop does not reload MIXR or restore slot base
+parameters. Command latches are cleared without executing another authored row.
+An explicit carry request without negotiated carry support must refuse before
+any voice, buffer, pending request or runtime state changes; it cannot fall back
+to cut. A host must declare support for all requested policies and these reset semantics
 before binding playback. The explicit runtime implements bounded tail drain and capability binding;
 carry must never be advertised just because its byte decoded.
 
@@ -316,7 +327,11 @@ Cues are notifications, not scripts, implicit transitions or sound triggers.
 Emit at row start, once per traversal, sorted by stable cue ID for simultaneous
 cues. Their row offsets count rows across order occurrences from section start.
 An interactive host needs a bounded, generation-tagged feedback queue; cue
-sample offsets must be measured against its continuous audio clock.
+sample offsets identify the frame within the runtime render call. The runtime's
+continuous musical frame clock counts active unpaused rendering, including tail
+drain, and freezes during paused/inactive output. It is not a device/speaker
+timestamp; hosts needing that timeline stamp their callback/device clock
+separately (including silent output frames and any device latency).
 
 `ntrk_imus.h` supplies borrowed container/record iterators, typed named views,
 typed body encoding, raw-record container size-query/write, UTF-8/framing and

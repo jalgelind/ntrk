@@ -995,6 +995,10 @@ mixer_config_write(const Mixer *mx, ntrk::Module *module) {
 // default first.
 void fxpl_sync(Mixer *mx, const Player *player);
 
+// Drop row/meta latches and command memory without changing current parameters,
+// accumulators, filter state or effect buffers. A stopped tail has no new tick.
+void fxpl_clear_commands(Mixer *mx);
+
 // Pan commands call player_set_pan and hold over all instrument retriggers.
 // Note 8xx/E8x runs first, FXPL runs afterward and wins on the same tick.
 // Pan slides and macro deltas add to the current audible Player pan. Instrument

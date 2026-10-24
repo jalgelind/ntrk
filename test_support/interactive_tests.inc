@@ -1,5 +1,6 @@
 #include "interactive_fixture.h"
 #include <vector>
+#include <algorithm>
 using namespace ntrk::interactive;
 static void test_interactive_binding() {
   ntrk_test::InteractiveFixture f;
@@ -80,11 +81,10 @@ static void test_interactive_requests_pause() {
   CHECK(b.compile(f.module,42,f.caps,3)==Status::Ok);
   Player p; mix::Mixer mx; Runtime r; CHECK(r.bind(b,p,mx,42,48000)==Status::Ok);
   double out[2048]={};
-  CHECK(r.request_section(42,1,4)==Status::Ok);
-  r.render(out,1,2,48000); CHECK(r.position().current==3 && r.position().pending==4);
+  r.render(out,1,2,48000); CHECK(r.position().current==3 && r.position().pending==0);
   r.render(out,959,2,48000); CHECK(r.position().current==3);
   // Receipt exactly at row boundary excludes that boundary, even if not rendered yet.
-  CHECK(r.request_section(42,2,4)==Status::Ok);
+  CHECK(r.request_section(42,1,4)==Status::Ok);
   r.render(out,1,2,48000); CHECK(r.position().current==3);
   r.render(out,959,2,48000); r.render(out,1,2,48000);
   CHECK(r.position().current==4 && r.position().clock==1921);
@@ -263,7 +263,130 @@ static void test_interactive_loop_continuity() {
   CHECK(pa.ticks_elapsed==pb.ticks_elapsed && pa.until_tick==pb.until_tick);
   CHECK(std::memcmp(oa,ob,sizeof oa)==0 && ta==tb);
 }
+static void test_interactive_stop_capability_and_defaults() {
+  ntrk_test::InteractiveFixture f;
+  Runtime cold; Player untouched; mix::Mixer empty;
+  RuntimeBinding invalid, binding;
+  CHECK(cold.stop(true)==Status::Stale); CHECK(cold.stop(false)==Status::Ok);
+  CHECK(!cold.position().playing && cold.position().clock==0);
+  CHECK(cold.bind(invalid,untouched,empty,1,48000)==Status::Stale);
+  CHECK(!untouched.playing && untouched.module==nullptr);
+  Capabilities defaults; CHECK(binding.compile(f.module,1,defaults,3)==Status::Unsupported);
+  for (int missing=0;missing<8;++missing) {
+    auto caps=f.caps;
+    switch (missing) {
+      case 0: caps.held_controls=false; break; case 1: caps.layer_ramps=false; break;
+      case 2: caps.safe_entry=false; break; case 3: caps.cut=false; break;
+      case 4: caps.pause_freezes=false; break; case 5: caps.rate_remaining_time=false; break;
+      case 6: caps.tail_deadline_ms=0; break; case 7: caps.tail_deadline_ms=60001; break;
+    }
+    CHECK(binding.compile(f.module,1,caps,3)==Status::Unsupported);
+  }
+  ntrk_test::InteractiveFixture required_carry(1,1,true,true);
+  auto cut_only=f.caps; cut_only.carry=false;
+  CHECK(binding.compile(required_carry.module,1,cut_only,3)==Status::Unsupported);
+  mix::Mixer seed; seed.send[0].param[0]=0.0005f; seed.send[0].param[1]=0.8f; seed.send[0].param[3]=1.f;
+  mix::slot_set_kind(&seed.send[0],mix::FxKind::kDelay); seed.send_level[0][0]=1.f; mix::mixer_config_write(&seed,&f.module);
+  CHECK(binding.compile(f.module,1,cut_only,3)==Status::Ok);
+  Player pa,pb; mix::Mixer ma,mb; Runtime ra,rb;
+  const size_t count=fx::delay_bytes_needed(2.f,48000.f)/sizeof(float)+1;
+  std::vector<float> ta(count),tb(count);
+  CHECK(fx::delay_init(&ma.send[0].delay,ta.data(),ta.size()*sizeof(float),48000.f,2.f));
+  CHECK(fx::delay_init(&mb.send[0].delay,tb.data(),tb.size()*sizeof(float),48000.f,2.f));
+  CHECK(ra.bind(binding,pa,ma,1,48000)==Status::Ok); CHECK(rb.bind(binding,pb,mb,1,48000)==Status::Ok);
+  CHECK(ra.position().playing && ra.position().clock==0 && ra.position().current==3);
+  double a[1024]={},b[1024]={}; ra.render(a,512,2,48000); rb.render(b,512,2,48000);
+  CHECK(pa.channels[0].playing && pa.pan[0]==1.f);
+  CHECK(ra.layer(1,1,2,12345,100)==Status::Ok); CHECK(rb.layer(1,1,2,12345,100)==Status::Ok);
+  ra.render(a,128,2,48000); rb.render(b,128,2,48000);
+  CHECK(ra.request_section(1,2,4)==Status::Ok); CHECK(rb.request_section(1,2,4)==Status::Ok);
+  std::vector<unsigned char> runtime_before(sizeof ra),player_before(sizeof pa),mixer_before(sizeof ma);
+  std::memcpy(runtime_before.data(),&ra,sizeof ra); std::memcpy(player_before.data(),&pa,sizeof pa); std::memcpy(mixer_before.data(),&ma,sizeof ma);
+  const auto tail_before=ta;
+  CHECK(ra.stop(true)==Status::Unsupported);
+  CHECK(std::memcmp(runtime_before.data(),&ra,sizeof ra)==0);
+  CHECK(std::memcmp(player_before.data(),&pa,sizeof pa)==0);
+  CHECK(std::memcmp(mixer_before.data(),&ma,sizeof ma)==0 && ta==tail_before);
+  std::memset(a,0,sizeof a); std::memset(b,0,sizeof b);
+  ra.render(a,512,2,48000); rb.render(b,512,2,48000);
+  CHECK(std::memcmp(a,b,sizeof a)==0 && ta==tb);
+  CHECK(ra.position().current==4 && ra.position().clock==rb.position().clock);
+  double energy=0; for (double v : a) energy+=std::fabs(v); CHECK(energy>0);
+  CHECK(ra.stop(false)==Status::Ok); CHECK(!ra.position().playing && !ra.position().draining);
+  CHECK(!pa.channels[0].playing); CHECK(std::all_of(ta.begin(),ta.end(),[](float v){ return v==0.f; }));
+  std::memset(a,0,sizeof a); ra.render(a,512,2,48000);
+  CHECK(std::all_of(a,a+1024,[](double v){ return v==0.0; }));
+}
+static void test_interactive_drain_freezes_automation() {
+  for (bool section_end : {false,true}) {
+  ntrk_test::InteractiveFixture f(1,1,!section_end,true);
+  mix::Mixer seed; seed.send[0].param[0]=0.0005f; seed.send[0].param[1]=0.05f; seed.send[0].param[3]=1.f;
+  mix::slot_set_kind(&seed.send[0],mix::FxKind::kDelay); seed.send_level[0][0]=1.f; mix::mixer_config_write(&seed,&f.module);
+  f.fx[1].cmd=0x41; f.fx[1].param=192; // authored send-0 feedback, different from MIXR
+  RuntimeBinding binding; CHECK(binding.compile(f.module,1,f.caps,3)==Status::Ok);
+  Player p; mix::Mixer mx; Runtime r;
+  const size_t count=fx::delay_bytes_needed(2.f,48000.f)/sizeof(float)+1;
+  std::vector<float> memory(count);
+  CHECK(fx::delay_init(&mx.send[0].delay,memory.data(),memory.size()*sizeof(float),48000.f,2.f));
+  CHECK(r.bind(binding,p,mx,1,48000)==Status::Ok);
+  const int lead=section_end ? 1920 : 512;
+  double warm[3840]={}; r.render(warm,lead,2,48000);
+  const float automated=mx.send[0].param[1]; CHECK(automated>0.7f && mx.send[0].base[1]<0.1f);
+  // Independent reference: leave the mixer's current knobs/buffers alone and
+  // feed silence with the ordinary, nonsequencing player. A reset is a negative control.
+  Module linear=f.module; linear.imus=nullptr; linear.imus_bytes=0;
+  Player ref=p; ref.module=&linear; ref.sequencing=false;
+  for (int c=0;c<kMaxChannels;++c) ref.channels[c].playing=false;
+  mix::Mixer reference=mx,reset=mx; auto ref_memory=memory,reset_memory=memory;
+  reference.send[0].delay.buffer=ref_memory.data(); reset.send[0].delay.buffer=reset_memory.data();
+  mix::slot_revert(&reset.send[0]);
+  const auto before=memory;
+  if (!section_end) {
+    CHECK(r.stop(true)==Status::Ok); CHECK(memory==before && mx.send[0].param[1]==automated);
+  }
+  double actual[800]={},expected[800]={},negative[800]={};
+  r.render(actual,400,2,48000);
+  CHECK(mx.fxpl_cmd[0][0]==0 && mx.fxpl_mem[0][0]==0 && mx.macro_pending==0);
+  mix::mixer_render_add(&reference,&ref,expected,400,2,48000);
+  Player ref_reset=p; ref_reset.module=&linear; ref_reset.playing=true; ref_reset.sequencing=false;
+  mix::mixer_render_add(&reset,&ref_reset,negative,400,2,48000);
+  CHECK(std::memcmp(actual,expected,sizeof actual)==0);
+  CHECK(std::memcmp(actual,negative,sizeof actual)!=0);
+  printf("interactive trace drain-%s %016llx\n",section_end ? "section" : "public",
+         (unsigned long long)interactive_hash(std::vector<double>(actual,actual+800)));
+  double energy=0; for (double v : actual) energy+=std::fabs(v); CHECK(energy>0);
+  CHECK(mx.send[0].param[1]==automated && r.position().draining);
+  r.render(warm,80,2,48000); CHECK(!r.position().draining && r.position().clock==uint64_t(lead+480));
+  }
+}
+static void test_interactive_idempotent_section_selection() {
+  ntrk_test::InteractiveFixture f; RuntimeBinding binding;
+  CHECK(binding.compile(f.module,1,f.caps,3)==Status::Ok);
+  Player pa,pb; mix::Mixer ma,mb; Runtime ra,rb;
+  CHECK(ra.bind(binding,pa,ma,1,48000)==Status::Ok); CHECK(rb.bind(binding,pb,mb,1,48000)==Status::Ok);
+  double a[2048]={},b[2048]={}; ra.render(a,400,2,48000); rb.render(b,400,2,48000);
+  CHECK(ra.request_section(1,1,4)==Status::Ok);
+  CHECK(ra.request_section(1,2,3)==Status::Ok); CHECK(ra.position().pending==0);
+  // Selecting current repeatedly neither restarts nor emits extra row-zero cues.
+  for (uint64_t seq=3;seq<8;++seq) CHECK(ra.request_section(1,seq,3)==Status::Ok);
+  std::memset(a,0,sizeof a); std::memset(b,0,sizeof b); ra.render(a,800,2,48000); rb.render(b,800,2,48000);
+  CHECK(std::memcmp(a,b,sizeof a)==0 && pa.channels[0].pos==pb.channels[0].pos);
+  CHECK(ra.position().current==3 && ra.position().traversal==rb.position().traversal);
+  CueEvent ca,cb; int cues=0;
+  while (ra.pop_cue(&ca)) { CHECK(rb.pop_cue(&cb)); CHECK(ca.id==cb.id && ca.clock==cb.clock && ca.traversal==cb.traversal); ++cues; }
+  CHECK(cues==3 && !rb.pop_cue(&cb));
+  printf("interactive trace selection %016llx\n",
+         (unsigned long long)interactive_hash(std::vector<double>(a,a+1600)));
+  CHECK(ra.request_section(1,8,4)==Status::Ok);
+  ra.render(a,720,2,48000); // first receipt at 1200, eligible end boundary at 1920
+  CHECK(ra.request_section(1,9,4)==Status::Ok); // duplicate at boundary cannot postpone it
+  ra.render(a,1,2,48000); CHECK(ra.position().current==4 && ra.position().clock==1921);
+  CHECK(ra.position().accepted_sequence==9);
+}
 static void test_interactive() {
+  test_interactive_stop_capability_and_defaults();
+  test_interactive_drain_freezes_automation();
+  test_interactive_idempotent_section_selection();
   test_interactive_loop_continuity();
   test_interactive_terminal_and_preview();
   test_interactive_macro_gain_tail();

@@ -1088,6 +1088,23 @@ mixer_config_write(const Mixer *mx, uint8_t *block) {
 }
 
 void
+fxpl_clear_commands(Mixer *mx) {
+  for (int c = 0; c < kMaxChannels; ++c) {
+    for (int i = 0; i < kFxplCmdCount; ++i)
+      mx->fxpl_mem[c][i] = 0;
+    for (int col = 0; col < kMaxFxColumns; ++col) {
+      mx->fxpl_cmd[c][col] = 0;
+      mx->fxpl_param[c][col] = 0;
+    }
+  }
+  // Meta lanes must not fire another delta after their row or transport ends.
+  for (int t = 0; t < kMaxMetaColumns; ++t) {
+    mx->fxpl_meta_cmd[t] = 0;
+    mx->fxpl_meta_param[t] = 0;
+  }
+}
+
+void
 fxpl_sync(Mixer *mx, const Player *player) {
   for (int c = 0; c < kMaxChannels; ++c) {
     mx->fxpl_val[c][kFxplPan] = fxpl_clamp(128.f + player->pan[c] * 127.f);
@@ -1098,23 +1115,10 @@ fxpl_sync(Mixer *mx, const Player *player) {
     mx->fxpl_val[c][kFxplRes] = 0.f;
     for (int s = 0; s < kSends; ++s)
       mx->fxpl_val[c][kFxplSend + s] = fxpl_clamp(mx->send_level[c][s] * 255.f);
-    for (int i = 0; i < kFxplCmdCount; ++i)
-      mx->fxpl_mem[c][i] = 0;
-    for (int col = 0; col < kMaxFxColumns; ++col) {
-      mx->fxpl_cmd[c][col] = 0;
-      mx->fxpl_param[c][col] = 0;
-    }
     mx->fxpl_type[c] = 0;
     mx->fxpl_filter[c] = false;
   }
-  // The meta lanes' latch belongs to a row nobody is on any more, exactly as
-  // the channel columns' does, and is dropped in the same place for the same
-  // reason -- a delta macro left in flight would keep stepping a parameter the
-  // reseed above has just taken back to where the knobs stand.
-  for (int t = 0; t < kMaxMetaColumns; ++t) {
-    mx->fxpl_meta_cmd[t] = 0;
-    mx->fxpl_meta_param[t] = 0;
-  }
+  fxpl_clear_commands(mx);
   // **And every slot goes back to its configuration**, which is the whole
   // reason `Slot::base` exists. The values above re-seed from the knobs they
   // write -- `player->pan`, `master_gain`, `send_level` -- and a slot parameter
