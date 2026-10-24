@@ -45,8 +45,19 @@ self-contained and use payload-relative internal offsets. An editor **cannot
 repair structural references inside unknown opaque payloads**: references to
 pattern/order/channel/instrument IDs may become stale after structural editing.
 Preserving bytes is not a guarantee of preserving such unknown relationships.
-A sound-changing extension must be critical; an optional extension cannot alter
-how an otherwise capable reader renders the song.
+New extensions required to render the intended composition must be critical.
+Historical FXPL and MIXR remain explicit optional-enhancement exceptions: a pure
+replayer can skip FXPL embellishments and still play the base cells, while MIXR
+is interpreted by the separate mixer and may be replaced by host configuration.
+Consequently, skipping either can change audio; optional does not promise an
+identical rendering across those capability levels. Their existing writer flags
+are unchanged. META is strictly non-audio and has no such exception.
+
+Borrowed input storage (order, notes, FXPL, samples, slices, META and extensions)
+must stay readable and unchanged throughout serialization. The output buffer
+must not overlap any of that source storage: in-place saving is unsupported.
+Use a separate output buffer, then replace the original. A loaded Module remains
+a view whose input buffer must outlive every use of its borrowed pointers.
 
 ## META 0x0011 framing
 
@@ -95,9 +106,14 @@ versions conservatively refuse shrinking because names cannot be inspected.
 
 Private, non-audio state. Field 1 is document navigation: exactly eight bytes,
 `u16 subfield_version=1`, `u16 order`, `u16 row`, `u16 channel`. It is pulled from
-the UI on explicit Save and is a remembered view, never playback position,
-transport, mixer or host settings. Absent means the application's ordinary
-initial view; stored indices are advisory and require clamping if consumed.
+the UI on explicit Save as a non-mutating, best-effort metadata overlay and is a
+remembered view, never playback position, transport, mixer or host settings.
+The overlay never consumes history-owned metadata capacity. If its namespace or
+subfield version is unsupported, its framing cannot be edited safely, or META
+or the top-level directory would exceed capacity, the original metadata is
+serialized unchanged instead. Optional navigation never blocks a valid song save
+or prevents names undo. Even successful overlays leave the editor model unchanged.
+Absent means the application's ordinary initial view; stored indices are advisory and require clamping if consumed.
 Unknown namespace/subfield versions survive save and are not overwritten.
 The current UI records this state without automatically restoring it on open.
 No application settings or absolute paths are serialized. Future generator
@@ -147,5 +163,5 @@ Old fixed-sixteen validators refuse smaller songs; they do not misrender them.
 
 EditModule owns and re-points metadata and extension buffers through adopt,
 copy, move, undo and save; destroying a ModuleFile cannot invalidate its copies.
-The player and mixer never interpret META. NTRK-WEB-06 (separating editor data
-from audio snapshots) remains a separate follow-up.
+The player and mixer never interpret META. A host's choice of how to expose
+editor metadata separately from audio snapshots is outside this format contract.
