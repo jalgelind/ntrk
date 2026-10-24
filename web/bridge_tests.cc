@@ -140,6 +140,38 @@ void test_command_metadata(const char *directory) {
   std::puts("web metadata: all note/FXPL bytes, every column/meta lane, macro/00 distinction and pan passed");
 }
 
+void test_large_geometry(const char *directory) {
+  assert(web_demo(48000));
+  assert(web_info(12)==0 && web_info(13)==0); // no fictional FXPL column
+  song.rows=ntrk::kMaxRows;song.pattern_count=198;song.order_count=198;
+  song.fx_columns=ntrk::kMaxFxColumns;song.meta_columns=ntrk::kMaxMetaColumns;song.macro_count=1;
+  std::vector<uint8_t> order(song.order_count);
+  for(int p=0;p<song.order_count;++p)order[p]=p;
+  song.order=order.data();
+  std::memset(notes,0,sizeof(ntrk::Note)*song.pattern_count*song.rows*song.channels);
+  std::vector<ntrk::FxCell> fx(song.pattern_count*song.rows*ntrk::module_lanes(&song));song.fx=fx.data();
+  for(int p=0;p<song.pattern_count;++p)for(int r=0;r<song.rows;++r){
+    for(int c=0;c<song.channels;++c){auto &note=notes[(p*song.rows+r)*song.channels+c];
+      note.effect=p%2?8:ntrk::kFxOffset;note.param=(p*31+r+c)%256;}
+    for(int lane=0;lane<ntrk::module_lanes(&song);++lane){auto &cell=fx[(p*song.rows+r)*ntrk::module_lanes(&song)+lane];
+      cell.cmd=lane<song.channels*song.fx_columns?1+(p+r+lane)%23:0x40+(p+r+lane)%64;
+      cell.param=(p*17+r+lane*3)%256;}
+  }
+  save_fixture(directory,"large",0xFFFF);
+  const int bytes=web_save();assert(bytes>16000000 && bytes<=kFileCap);
+  assert(web_load(bytes));assert(web_info(2)==198 && web_info(1)==256 && web_info(12)==8 && web_info(13)==5);
+  assert(web_edit(197,255,15,3,123));
+  assert(web_save()>16000000);
+  assert(web_demo(48000));
+  // Short successive patterns with unmistakably different command labels.
+  song.rows=2;song.speed=3;song.bpm=125;
+  std::memset(notes,0,sizeof(ntrk::Note)*2*2*song.channels);
+  notes[0].effect=ntrk::kFxOffset;notes[0].param=16;
+  notes[2*song.channels].effect=8;notes[2*song.channels].param=255;
+  save_fixture(directory,"pattern-transition",1);
+  std::puts("web large geometry: 198 patterns x256 rows,8 FXPL+5 meta,16MiB-cap save/load/edit passed");
+}
+
 int main(int argc, char **argv) {
   assert(!web_demo(0));
   assert(web_demo(48000));
@@ -237,6 +269,7 @@ int main(int argc, char **argv) {
   test_imports(argc > 1 ? argv[1] : nullptr);
   test_channel_usage(argc > 1 ? argv[1] : nullptr);
   test_command_metadata(argc > 1 ? argv[1] : nullptr);
+  test_large_geometry(argc > 1 ? argv[1] : nullptr);
   if (argc > 1) {
     assert(web_demo(48000));
     uint8_t orders[128] = {}; song.order = orders; song.order_count = 128;

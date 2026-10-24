@@ -29,27 +29,32 @@ export class Engine {
     }
     return out;
   }
-  commands() {
-    const s = this.state(), cells = [], cache=new Map();
-    const notes=new Uint8Array(this.api.memory.buffer,this.api.web_patterns());
+  // Only the displayed pattern is formatted. The cache is local and capped;
+  // snapshots never contain formatted song-wide objects or descriptions.
+  pattern(pattern) {
+    const s=this.state();
+    if(!Number.isInteger(pattern)||pattern<0||pattern>=s[2])throw new Error('Pattern out of range');
+    const rows=[],cache=new Map(),notes=new Uint8Array(this.api.memory.buffer,this.api.web_patterns());
     const fxPtr=this.api.web_fx(),fx=new Uint8Array(this.api.memory.buffer,fxPtr);
-    const formatted=(p,r,c,lane)=>{
-      const row=p*s[1]+r;
+    const text=(r,c,lane)=>{
+      const row=pattern*s[1]+r;
       const at=lane<0?(row*s[0]+c)*4+2:(row*(s[0]*s[12]+s[13])+(c<0?s[0]*s[12]+lane:c*s[12]+lane))*2;
       const bytes=lane<0?notes:fx;
-      const key=`${c}:${lane}:${lane>=0&&!fxPtr?0:bytes[at]}:${lane>=0&&!fxPtr?0:bytes[at+1]}`;
-      if(!cache.has(key)) cache.set(key,this.formatted(p,r,c,lane));
-      return cache.get(key);
+      const key=`${c}:${lane}:${bytes[at]}:${bytes[at+1]}`;
+      if(cache.has(key))return cache.get(key);
+      const label=this.string(this.api.web_cell_text(pattern,r,c,lane,0));
+      if(cache.size===512)cache.delete(cache.keys().next().value);
+      cache.set(key,label);return label;
     };
-    for (let p=0;p<s[2];p++) for(let r=0;r<s[1];r++) {
+    for(let r=0;r<s[1];r++){
       const row=[];
-      for(let c=0;c<s[0];c++) for(let lane=-1;lane<s[12];lane++)
-        row.push(formatted(p,r,c,lane));
-      for(let lane=0;lane<s[13];lane++) row.push(formatted(p,r,-1,lane));
-      cells.push(row);
+      for(let c=0;c<s[0];c++)for(let lane=-1;lane<s[12];lane++)row.push(text(r,c,lane));
+      for(let lane=0;lane<s[13];lane++)row.push(text(r,-1,lane));
+      rows.push(row);
     }
-    return cells;
+    return {pattern,rows};
   }
+
   formatted(p,r,c,lane) {
     const a=this.api;
     return {text:this.string(a.web_cell_text(p,r,c,lane,0)),
@@ -68,7 +73,9 @@ export class Engine {
     const channels = Array.from({length: state[0]}, (_, c) => c).filter(c => usedMask & (1 << c));
     // An empty song still needs a place to enter its first note.
     if (!channels.length) channels.push(0);
-    return {state, instruments, usedMask, channels, commands: this.commands(),
+    return {state, instruments, usedMask, channels,
+      fx: this.api.web_fx() ? new Uint8Array(this.api.memory.buffer,this.api.web_fx(),
+        state[1]*state[2]*(state[0]*state[12]+state[13])*2).slice() : new Uint8Array(),
       orders: new Uint8Array(this.api.memory.buffer, this.api.web_orders(), state[3]).slice(),
       cells: new Uint8Array(this.api.memory.buffer, this.api.web_patterns(),
         state[0] * state[1] * state[2] * 4).slice()};
@@ -76,6 +83,7 @@ export class Engine {
   command(type, args = []) {
     const a = this.api;
     if (type === 'state') return this.state();
+    if (type === 'pattern') return this.pattern(args[0]);
     if (type === 'formatted') return this.formatted(...args);
     if (type === 'snapshot') return this.snapshot();
     if (type === 'load') {

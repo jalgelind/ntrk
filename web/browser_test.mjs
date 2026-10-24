@@ -29,7 +29,19 @@ try {
     AudioContext.prototype.createGain=function(){const gain=createGain.call(this);window.testGain??=gain;return gain;};
     const Original=window.AudioWorkletNode;
     window.AudioWorkletNode=class extends Original {
-      constructor(...args){super(...args);window.testNode=this;window.testContext=args[0];}
+      constructor(...args){
+        super(...args);window.testNode=this;window.testContext=args[0];
+        const descriptor=Object.getOwnPropertyDescriptor(MessagePort.prototype,'onmessage');
+        window.delayedPatterns=[];window.delayedLoads=[];
+        Object.defineProperty(this.port,'onmessage',{set(fn){descriptor.set.call(this,event=>{
+          const result=event.data.result;
+          if(window.delayPatternReplies&&result?.rows&&Number.isInteger(result.pattern))
+            delayedPatterns.push({pattern:result.pattern,release:()=>fn(event)});
+          else if(window.delayLoadReplies&&result?.cells&&result?.orders)
+            delayedLoads.push(()=>fn(event));
+          else fn(event);
+        });}});
+      }
     };
     // Record the actual paint calls, not DOM surrogates for a canvas.
     const text=CanvasRenderingContext2D.prototype.fillText;
@@ -66,6 +78,7 @@ try {
   await button('demo');await wait(()=>!!view.m.snapshot&&!view.m.busy);
   const cell=async(r,c,f)=>{
     await page.evaluate(([r,c,f])=>view.reveal(r,c,f),[r,c,f]);await page.evaluate(()=>new Promise(requestAnimationFrame));
+    await page.waitForFunction(()=>view.m.snapshot?.commands?.pattern===view.m.snapshot.orders[view.m.order]);
     const p=await page.evaluate(([r,c,f])=>{const b=view.cell(r,c,f);return {x:b.x+b.w/2,y:b.y+b.h/2};},[r,c,f]);
     await click(p.x,p.y);
     assert.deepEqual(await page.evaluate(()=>[view.m.row,view.m.channel,view.m.field]),[r,c,f],'pointer maps to intended field');
@@ -101,7 +114,7 @@ try {
   assert(names.length>0);assert(await page.evaluate(names=>names.some(n=>painted.some(t=>t.includes(n))),names),'module-owned instrument names are drawn');
   // Every authored command column has real paint, hit and navigation geometry.
   assert.equal(initial.instruments[0].pan,128);
-  assert(await page.evaluate(()=>painted.some(t=>t.startsWith('Pan 80'))),'instrument-owned pan shown');
+  assert(await page.evaluate(()=>painted.some(t=>t.startsWith('Pan center'))),'instrument-owned pan shown');
   const verifyPaint=async(r,c,f)=>{
     await cell(r,c,f);
     const result=await page.evaluate(async([r,c,f])=>{
@@ -194,10 +207,58 @@ try {
   const loadFixture=async name=>loadBytes(name+'.ntrk',await readFile(path.join(fixtureRoot,name+'.ntrk')));
   const visible=()=>page.evaluate(()=>view.m.snapshot.channels);
   assert.deepEqual(await visible(),demo?[0,1,2,3]:[0,1,2]);
+  // Large valid files retain compact raw song data and one formatted pattern.
+  await loadFixture('large');
+  assert.equal((await model()).state[2],198);
+  assert(await page.evaluate(()=>view.m.snapshot.commands.rows.length===256&&view.m.snapshot.commands.rows.every(r=>r.length===149)));
+  await cell(255,15,3);await page.keyboard.type('7b');await wait(()=>!view.m.busy);
+  assert.equal(await value(255,15,3),123);
+  const largeSaved=await download();await loadBytes('large-reloaded.ntrk',largeSaved);
+  assert.equal(await value(255,15,3),123);assert.deepEqual(await download(),largeSaved);
+  await loadFixture('pattern-transition');
+  await page.evaluate(()=>{if(!view.m.follow)view.action('entry',{id:'follow',value:true});});
+  await button('play');
+  await wait(()=>view.m.order===1&&view.m.snapshot.commands?.pattern===1&&view.m.snapshot.commands.rows[0][0]==='PAN');
+  await button('pause');await wait(()=>!view.m.busy);
+  await page.evaluate(()=>view.action('order',0));await wait(()=>!view.m.busy&&view.m.order===0&&view.m.snapshot.commands?.pattern===0);
+  assert.equal(await page.evaluate(()=>view.m.snapshot.commands.rows[0][0]),'SOF');
+  // Delay a follow reply, then browse elsewhere. Blank during transition;
+  // releasing the older reply after the new one cannot repaint stale commands.
+  await page.evaluate(()=>{delayPatternReplies=true;view.action('entry',{id:'follow',value:true});});
+  await button('play');await wait(()=>delayedPatterns.some(p=>p.pattern===1));
+  assert(await page.evaluate(()=>view.m.snapshot.commands===null));
+  assert.equal(await page.evaluate(async()=>{const {commandCell}=await import('/player/canvas.js'+new URL(document.querySelector('script').src).search);return commandCell(view.m.snapshot,view.m.snapshot.orders[view.m.order],0,0,2).text;}),'');
+  await button('pause');await wait(()=>!view.m.busy);
+  await page.evaluate(()=>view.action('order',0));await wait(()=>delayedPatterns.some(p=>p.pattern===0));
+  await page.evaluate(()=>{const newest=delayedPatterns.findLast(p=>p.pattern===0);newest.release();});
+  await wait(()=>!view.m.busy&&view.m.snapshot.commands?.pattern===0);
+  await page.evaluate(()=>{delayPatternReplies=false;for(const reply of delayedPatterns)reply.release();delayedPatterns=[];});
+  assert.equal(await page.evaluate(()=>view.m.snapshot.commands.pattern),0);
+  assert.equal(await page.evaluate(()=>view.m.snapshot.commands.rows[0][0]),'SOF');
+  // A pending reply from the old song must also be rejected after a replacement.
+  await page.evaluate(()=>{delayPatternReplies=true;view.action('entry',{id:'follow',value:true});});
+  await button('play');await wait(()=>delayedPatterns.some(p=>p.pattern===1));
+  await page.evaluate(()=>{delayPatternReplies=false;});
+  await loadFixture('commands');
+  await page.evaluate(()=>{for(const reply of delayedPatterns)reply.release();delayedPatterns=[];});
+  assert.equal(await page.evaluate(()=>view.m.snapshot.commands.rows[0][0]),'PAN');
+  assert(await page.evaluate(()=>view.m.snapshot.commands.pattern===0&&view.m.snapshot.commands.rows.length===32));
+  // Simulate an acknowledged engine load whose response takes over ten seconds.
+  // The old UI is hidden and the mutation remains pending instead of timing out.
+  await page.evaluate(()=>{delayLoadReplies=true;});
+  await page.locator('#open').setInputFiles({name:'delayed-load.ntrk',mimeType:'application/octet-stream',buffer:await readFile(path.join(fixtureRoot,'pattern-transition.ntrk'))});
+  await wait(()=>delayedLoads.length>0);
+  assert.equal(await page.evaluate(()=>view.m.snapshot),null);
+  assert.equal((await page.evaluate(()=>engineCommand('state')))[1],2);
+  await page.waitForTimeout(10500);
+  assert(await page.evaluate(()=>view.m.busy&&view.m.snapshot===null&&view.m.ready));
+  await page.evaluate(()=>{delayLoadReplies=false;for(const release of delayedLoads)release();delayedLoads=[];});
+  await wait(()=>!view.m.busy&&view.m.name==='delayed-load.ntrk'&&view.m.snapshot.commands?.pattern===0);
+  console.log('browser bounded commands: large load/edit/save, order/follow, blank transition, reversed replies, load generation and >10s acknowledged load passed');
   await loadFixture('commands');
   for(const [c,mnemonic] of [[0,'PAN'],[1,'SLC'],[2,'SOF'],[3,'PAN']]) {
     await verifyPaint(0,c,2);
-    const label=await page.evaluate(c=>view.m.snapshot.commands[0][c*4].text,c);
+    const label=await page.evaluate(c=>view.m.snapshot.commands.rows[0][c*4],c);
     assert.equal(label,mnemonic);
   }
   await verifyPaint(0,-1,0);assert(await page.evaluate(()=>painted.includes('M01 00')));

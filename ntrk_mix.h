@@ -997,8 +997,8 @@ void fxpl_sync(Mixer *mx, const Player *player);
 
 // Pan commands call player_set_pan and hold over all instrument retriggers.
 // Note 8xx/E8x runs first, FXPL runs afterward and wins on the same tick.
-// Plane slides keep their own accumulator until fxpl_sync/start/seek, so a
-// later slide resumes that accumulator after an intervening note pan command.
+// Pan slides and macro deltas add to the current audible Player pan. Instrument
+// changes, note commands and live strip edits therefore change the next delta base.
 // Start and seek invalidate automation by pan_epoch, including forward seeks.
 //
 // **The master gain is one knob written from per-channel data**, so the last
@@ -1044,10 +1044,9 @@ int slot_delta_row_slot(int row, int *channel);
 // *delta* macro's per-tick step. A macro is wholly one or the other, so exactly
 // one of the two calls per tick does anything and the other returns.
 //
-// **There is no second accumulator for macros.** A delta macro adds into the
-// same `fxpl_val` a plain slide adds into, which is what lets a macro and a
-// slide on one target sum, and what makes the resync path need nothing new:
-// `fxpl_sync` re-seeds `fxpl_val` and a macro resumes from the reseeded base.
+// Macro and slide deltas gather into one sum before a single store. Pan uses
+// the audible Player value as its base; other targets use fxpl_val. A macro
+// never maintains independent parameter memory.
 void fxpl_macro(Mixer *mx, Player *player, const Macro *mac, int input,
                 FxplDeltas *deltas);
 

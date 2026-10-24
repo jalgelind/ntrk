@@ -4971,6 +4971,51 @@ test_instrument_pan_precedence() {
   mix::mixer_render_add(&mx,&p,audio,1,2,48000);CHECK(p.pan[0]==1);
 }
 
+static void
+test_pan_deltas_follow_audible_rows() {
+  printf("multi-row pan deltas follow instruments, 8xx, E8x and live strip edits\n");
+  for(int source=0;source<4;++source) for(int delta : {-8,8}) for(bool macro : {false,true}) {
+    Module m; uint8_t order[]={0}; Note notes[4*kMaxChannels]={};
+    FxCell fx[4*(kMaxChannels+1)]={}; int8_t wave[32];
+    for(int i=0;i<32;++i)wave[i]=i<16?20:-20;
+    m.channels=kMaxChannels;m.rows=4;m.speed=3;m.order_count=m.pattern_count=1;
+    m.instrument_count=2;m.patterns=notes;m.order=order;m.fx=fx;m.fx_columns=1;m.meta_columns=1;
+    for(int i=0;i<2;++i){auto &ins=m.instruments[i];ins.data=wave;ins.length=ins.loop_len=32;ins.pan=i?176:96;}
+    notes[0].note=25;notes[0].instrument=1;
+    if(source==0){notes[kMaxChannels].note=25;notes[kMaxChannels].instrument=2;}
+    if(source==1){notes[kMaxChannels].effect=8;notes[kMaxChannels].param=176;}
+    if(source==2){notes[kMaxChannels].effect=0xE;notes[kMaxChannels].param=0x8A;}
+    notes[3*kMaxChannels].note=25;notes[3*kMaxChannels].instrument=1;
+    if(macro){
+      m.macro_count=1;m.macros[0].flags=kMacroDelta;m.macros[0].target_count=1;
+      auto &t=m.macros[0].targets[0];t.target=mix::kFxplPan;t.scope=0;t.offset=delta*256;
+      fx[2*(kMaxChannels+1)+kMaxChannels].cmd=1;
+      fx[2*(kMaxChannels+1)+kMaxChannels].param=1;
+    }else{
+      fx[2*(kMaxChannels+1)].cmd=mix::kFxplPanSlide;
+      fx[2*(kMaxChannels+1)].param=(uint8_t)(int8_t)delta;
+    }
+    Player p;player_start(&p,&m);mix::Mixer mx;
+    const auto tick=[&](){double audio[960*2]={};mix::mixer_render_add(&mx,&p,audio,960,2,48000);};
+    tick();tick();tick(); // instrument A, complete row 0
+    CHECK(std::fabs(p.pan[0]-pan_from_byte(96))<1e-6f);
+    tick(); // row 1 applies B/8xx/E8x
+    if(source==3){ // first-ever config read DURING playback must apply this edit
+      CHECK(!mx.strip_synced);
+      mix::config_set_channel_pan(m.mix,0,pan_from_byte(176));
+      CHECK(mix::mixer_config_read(&mx,&m));
+    }
+    tick();tick();
+    const int base=source==2?170:176;
+    CHECK(std::fabs(p.pan[0]-pan_from_byte(base))<1e-6f);
+    tick(); // slide/macro row tick zero holds; delta starts on tick 1
+    CHECK(std::fabs(p.pan[0]-pan_from_byte(base))<1e-6f);
+    tick();CHECK(std::fabs(p.pan[0]-pan_from_byte(base+delta))<1e-6f);
+    tick();CHECK(std::fabs(p.pan[0]-pan_from_byte(base+2*delta))<2e-6f);
+    tick();CHECK(std::fabs(p.pan[0]-pan_from_byte(base+2*delta))<2e-6f); // retrigger holds
+  }
+}
+
 int
 main(void) {
   test_bypass_is_render_add();
@@ -4985,6 +5030,7 @@ main(void) {
   test_max_resonance_stays_finite();
   test_plane_pan_sets();
   test_instrument_pan_precedence();
+  test_pan_deltas_follow_audible_rows();
   test_plane_pan_slide_walks();
   test_plane_send_level_opens_a_send();
   test_plane_absent_is_render_add();

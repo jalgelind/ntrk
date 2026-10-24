@@ -1,0 +1,45 @@
+// Stress the real WASM bridge without requiring an audio device or test hooks.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import {Engine} from './engine.js';
+const root=process.argv[2]||'out/web',fixtures=process.argv[3]||'out/web-fixtures';
+const module=await WebAssembly.compile(fs.readFileSync(path.join(root,'ntrk.wasm')));
+const engine=new Engine(module,48000);
+let calls=0;
+const string=engine.string;
+engine.string=function(ptr){calls++;return string.call(this,ptr);};
+const original=fs.readFileSync(path.join(fixtures,'large.ntrk'));
+const snapshot=engine.command('load',[original]);
+assert(original.length>16000000&&original.length<16*1024*1024);
+assert(original.length+256*(16*4+(16*8+5)*2)>16*1024*1024,
+  "another pattern at maximal rows/lanes exceeds the host file cap");
+assert.equal(calls,0,'load/snapshot formats no cells');
+assert.equal(snapshot.commands,undefined);
+assert.equal(snapshot.state[1],256);assert.equal(snapshot.state[2],198);
+assert.equal(snapshot.state[12],8);assert.equal(snapshot.state[13],5);
+assert(snapshot.fx.byteLength>13000000);
+const NativeMap=globalThis.Map;let peakCache=0;
+globalThis.Map=class extends NativeMap{set(k,v){super.set(k,v);peakCache=Math.max(peakCache,this.size);return this;}};
+let commands;
+try{commands=engine.command('pattern',[197]);}finally{globalThis.Map=NativeMap;}
+assert.equal(commands.rows.length,256);
+assert(commands.rows.every(row=>row.length===149&&row.every(s=>typeof s==='string')));
+assert(calls<=256*149);assert(peakCache<=512,'format cache bounded independently of song size');
+const payload=Buffer.byteLength(JSON.stringify(commands));assert(payload<512*1024);
+assert.equal(commands.rows[255][15*9],engine.command('formatted',[197,255,15,-1]).text);
+assert.deepEqual(Buffer.from(engine.command('save')),original);
+calls=0;engine.command('edit',[197,255,15,3,123]);
+engine.command('formatted',[197,255,15,-1]);assert.equal(calls,2,'one edit formats one cell with lazy description');
+const expected=Buffer.from(original);
+const at=32+198+snapshot.state[4]*32+((197*256+255)*16+15)*4+3;expected[at]=123;
+const saved=Buffer.from(engine.command('save'));assert.deepEqual(saved,expected);
+calls=0;const reloaded=engine.command('load',[saved]);assert.equal(calls,0);
+assert.equal(reloaded.cells[((197*256+255)*16+15)*4+3],123);
+assert.deepEqual(Buffer.from(engine.command('save')),saved);
+engine.command('load',[fs.readFileSync(path.join(fixtures,'pattern-transition.ntrk'))]);
+assert.equal(engine.command('pattern',[0]).rows[0][0],'SOF');
+assert.equal(engine.command('pattern',[1]).rows[0][0],'PAN');
+engine.command('demo');assert.equal(engine.state()[12],0);
+assert.equal(engine.command('pattern',[0]).rows[0].length,16,'no FXPL means no fake FX lane');
+console.log(`WASM large geometry passed: ${original.length} bytes, ${256*149} formatted cells maximum, cache peak ${peakCache}, payload ${payload} bytes, exact load/edit/save`);

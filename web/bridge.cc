@@ -226,8 +226,8 @@ int web_info(int field) {
         if (player.muted[c]) bits |= 1 << c;
       return bits;
     }
-    case 12: return song.fx_columns;
-    case 13: return song.meta_columns;
+    case 12: return song.fx ? song.fx_columns : 0;
+    case 13: return song.fx ? song.meta_columns : 0;
     default: return -1;
   }
 }

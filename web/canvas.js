@@ -38,7 +38,7 @@ export function fieldLayout(snapshot) {
 }
 export function commandCell(snapshot, pattern, row, channel, field) {
   const s=snapshot.state,base=channel<0?s[0]*(1+s[12])+field:channel*(1+s[12])+(field<4?0:field-3);
-  return snapshot.commands[pattern*s[1]+row][base];
+  return {text:snapshot.commands?.pattern===pattern?snapshot.commands.rows[row]?.[base]||'':''};
 }
 export class TrackerCanvas {
   constructor(canvas, model, action) {
@@ -160,12 +160,12 @@ export class TrackerCanvas {
       this.label(`INS ${hex(m.instrument)}`,rect(insX,infoY,insW,22),ink.accent);
       if(info) {
         this.label(info.name||'(unnamed)',rect(insX,infoY+22,insW,22),ink.text,11);
-        this.label(`Pan ${hex(info.pan)} · Vol ${info.volume}`,rect(insX,infoY+44,insW,22),ink.dim,narrow?10:12);
+        this.label(`Pan ${info.pan===128?'center':(info.pan<128?'L':'R')+Math.round(Math.min(1,Math.abs(info.pan-128)/127)*100)+'%'} · Vol ${info.volume}`,rect(insX,infoY+44,insW,22),ink.dim,narrow?10:12);
       }
       if(!narrow) {
         this.label('Inspection only',rect(insX,infoY+71,insW,22),ink.dim,11);
-        this.label('Parameters / extra FX:',rect(insX,infoY+94,insW,20),ink.dim,11);
-        this.label('preserved, not editable',rect(insX,infoY+114,insW,20),ink.dim,11);
+        this.label('FX lanes shown read-only',rect(insX,infoY+94,insW,20),ink.dim,11);
+        this.label('Instrument inspection',rect(insX,infoY+114,insW,20),ink.dim,11);
       }
       this.pattern();
     }
@@ -181,7 +181,7 @@ export class TrackerCanvas {
     }
     this.fill(rect(0,h-43,w,43),ink.panel);
     this.label(m.message,rect(0,h-43,w,22),m.error?ink.warn:ink.accent,11);
-    this.label((ready?commandCell(m.snapshot,m.snapshot.orders[m.order],m.row,m.channel,m.field)?.description:'') || this.hits.find(hit=>hit.id===this.hover)?.tip || 'Space play/pause · Arrows move · F1 help · Shift+wheel channels',rect(0,h-21,w,21),ink.dim,10);
+    this.label(m.description || this.hits.find(hit=>hit.id===this.hover)?.tip || 'Space play/pause · Arrows move · F1 help · Shift+wheel channels',rect(0,h-21,w,21),ink.dim,10);
     if(document.activeElement===this.canvas) this.edge(rect(0,0,w,h),ink.line);
     if(m.help || m.confirm) this.overlay();
   }

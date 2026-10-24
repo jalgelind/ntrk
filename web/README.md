@@ -90,7 +90,13 @@ FXPL column and every meta lane. Formatting/descriptions come from ntrk's note,
 FXPL and macro APIs. Meta `M01` means macro 1; `00` is no invocation, not PAN.
 Empty cells show dots; a valid command's zero parameter remains `00`. Arrows,
 hit testing and scrolling use the same fixed character geometry and true channel
-IDs. Extra columns/meta lanes are labeled read-only when selected; typing there
+IDs. Only the displayed pattern is formatted (at most 256 rows ×149 command
+cells, with a 512-entry text cache); selected descriptions are fetched lazily.
+Order browsing and playback follow clear old command labels while fetching the
+next pattern, and stale replies cannot replace a newer selection or loaded song.
+Loads stay pending until acknowledged; a ten-second wait never leaves the old
+song UI controlling a newly loaded engine.
+Extra columns/meta lanes are labeled read-only when selected; typing there
 cannot write primary bytes. The selected instrument shows its persisted pan.
 
 Save uses `module_save` and downloads a complete `.ntrk`. Samples, extra FXPL
@@ -125,9 +131,17 @@ interrupt audio for large modules: pause before file operations.
 
 `make test` includes the native bridge, importer, renderer/mixer and library
 checks. `test-web` generates sampled eight-channel MOD/XM/PCM8/PCM16 fixtures,
-sparse/wide/multi-column FXPL, meta-only empty and long-list fixtures. Checks
+sparse/wide/multi-column FXPL, meta-only empty, long-list, distinct-order and
+maximal 16 MiB geometry fixtures. Checks
 include refused-load preservation, exact save/reopen, bounds/defaults,
 transport, effect memory, true channel IDs and finite/non-silent output.
+
+After building WASM, verify bounded pattern formatting, cache/payload limits and
+exact large-file load/edit/save without an audio device:
+
+```sh
+node web/engine_tests.mjs out/web out/web-fixtures
+```
 
 With an existing Playwright/Chromium installation (no install step):
 
@@ -140,7 +154,9 @@ The script owns and terminates its server/browser. It tests the actual worklet
 and canvas at `/player/`, generic startup, optional/broken examples, sampled
 local files/drop, burst keys and saved bytes, volume/real output levels, seek,
 sparse IDs, modal help/discard, desktop/narrow rendering and CDP touch events on
-long lists. Set `NTRK_WEB_ROOT` to an extracted bundle to test the actual ZIP.
+long lists. It also delays and reverses pattern replies, replaces the song with
+old replies pending, and holds a successful load acknowledgement beyond ten
+seconds. Set `NTRK_WEB_ROOT` to an extracted bundle to test the actual ZIP.
 Logs/screenshots belong outside Git. js-seq's `tools/tracker/check_web_audio.sh`
 rebuilds WASM before comparing desktop/native bridge/WASM audio at 44.1/48/96 kHz
 and removes temporary float audio files afterwards.

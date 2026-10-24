@@ -1020,7 +1020,7 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
     // **Only a pan that CHANGED is pushed into the player**, on the next run. A live edit of
     // anything else must not snap every channel back to its stored pan over the pattern's own
     // `8xx`; a start/seek re-seeds before sequencing via pan_epoch.
-    if (mx->strip_synced && p[kMixrPanAt + c] != mx->channel_pan[c])
+    if (p[kMixrPanAt + c] != mx->channel_pan[c])
       mx->strip_pan_dirty = (uint16_t) (mx->strip_pan_dirty | (1u << c));
     mx->channel_pan[c] = p[kMixrPanAt + c];
     mx->channel_output[c] = p[kMixrOutputAt + c];
@@ -1515,7 +1515,11 @@ fxpl_slide(Mixer *mx, Player *player) {
     for (int i = 0; i < kFxplValues; ++i) {
       if ((d.touched[c] & (uint16_t) (1u << i)) == 0u)
         continue;
-      mx->fxpl_val[c][i] = fxpl_clamp(mx->fxpl_val[c][i] + d.value[c][i]);
+      // Player pan is the audible value, including instruments, note commands
+      // and live strip edits. Cache only the result, never an independent base.
+      const float base = i == kFxplPan ? fxpl_clamp(128.f + player->pan[c] * 127.f)
+                                      : mx->fxpl_val[c][i];
+      mx->fxpl_val[c][i] = fxpl_clamp(base + d.value[c][i]);
       if (i == kFxplCutoff || i == kFxplRes)
         mx->fxpl_filter[c] = true;
       else

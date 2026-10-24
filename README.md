@@ -708,8 +708,8 @@ pan, which overrides instrument pan. Instrument selection, a note using the
 current instrument, and preview use that instrument's default unless overridden.
 Commands hold across subsequent rows and instrument retriggers, including note-off.
 On a row, instrument defaults apply first, primary commands next, FXPL last.
-Plane slides resume their own accumulator after intervening primary commands;
-it is reseeded at start/seek. Live channel-pan edits replace held overrides;
+Pan slides and macro deltas add to the current audible Player pan, including
+intervening instrument changes, primary commands and live strip edits. Live channel-pan edits replace held overrides;
 clearing the strip pan restores the current instrument. Start/seek clear command
 holds, restore saved channel pan or center, and invalidate FXPL latches even on
 forward seeks. Seek does not scan prior rows; a new instrument column then

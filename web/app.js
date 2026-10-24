@@ -4,20 +4,61 @@ const m={snapshot:null,state:null,order:0,row:0,channel:0,field:0,dirty:false,ni
   octave:2,instrument:1,edit:false,follow:true,help:false,confirm:null,name:'Module player',message:'Loading audio engine…',error:false};
 let ctx,node,gain,analysers,seq=0,demo,configReady,queue=Promise.resolve(),queued=0;
 const pending=new Map();
+let loadGeneration=0,patternSerial=0,descriptionSerial=0;
 const view=new TrackerCanvas(canvas,m,(type,arg)=>{if(type==='open'){open.click();return;}if(type==='transport')ctx?.resume();enqueue(()=>action(type,arg));});
 function status(message,error=false) {m.message=message;m.error=error;view.invalidate();}
 function request(type,args=[]) {
   return new Promise((resolve,reject)=>{
-    const id=++seq,timer=setTimeout(()=>{pending.delete(id);reject(new Error('Audio engine did not respond'));},10000);
+    const id=++seq;
+    const mutation=['load','demo','edit','transport','mute'].includes(type);
+    const timer=setTimeout(()=>{
+      // A committed load must be acknowledged, never abandoned behind an old UI.
+      if(mutation){status('Waiting for audio engine…');return;}
+      pending.delete(id);reject(new Error('Audio engine did not respond'));
+    },10000);
     pending.set(id,{resolve,reject,timer});node.port.postMessage({id,type,args});
   });
 }
+function selectedDescription() {
+  const snapshot=m.snapshot,gen=loadGeneration,serial=++descriptionSerial;
+  m.description='';
+  if(!snapshot?.commands)return;
+  const pattern=snapshot.orders[m.order],row=m.row,c=m.channel,f=m.field;
+  const lane=c<0?f:f<4?-1:f-4;
+  request('formatted',[pattern,row,c,lane]).then(cell=>{
+    if(gen!==loadGeneration||serial!==descriptionSerial||snapshot!==m.snapshot)return;
+    m.description=cell.description==='None'?'':cell.description;view.invalidate();
+  }).catch(error=>{if(gen===loadGeneration&&serial===descriptionSerial)status(error.message,true);});
+}
+async function refreshPattern() {
+  const snapshot=m.snapshot;
+  if(!snapshot)return;
+  const pattern=snapshot.orders[m.order],gen=loadGeneration,serial=++patternSerial;
+  snapshot.commands=null;m.description='';++descriptionSerial;view.invalidate();
+  const commands=await request('pattern',[pattern]);
+  if(gen!==loadGeneration||serial!==patternSerial||snapshot!==m.snapshot||snapshot.orders[m.order]!==pattern)return;
+  snapshot.commands=commands;selectedDescription();view.invalidate();
+}
+async function replaceSong(type,args,name) {
+  const previous={snapshot:m.snapshot,state:m.state};
+  ++loadGeneration;++patternSerial;++descriptionSerial;m.snapshot=null;m.state=null;m.description='';view.invalidate();
+  let committed=false;
+  try {
+    const result=await request(type,args);committed=true;
+    await adopt(result,name);
+  } catch(error) {
+    if(!committed&&m.ready){Object.assign(m,previous);if(m.snapshot)await refreshPattern();}
+    throw error;
+  }
+}
 function index(r=m.row,c=m.channel,f=m.field) {return ((m.snapshot.orders[m.order]*m.state[1]+r)*m.state[0]+c)*4+f;}
 function updateState(s) {
-  if(m.state&&s.every((value,i)=>value===m.state[i]))return;
+  if(m.state&&s.every((value,i)=>value===m.state[i])&&!(m.snapshot&&!m.busy&&m.follow&&s[8]&&m.order!==s[6]))return;
   m.state=s;
   if(m.snapshot&&!m.busy&&m.follow&&s[8]) {
+    const oldPattern=m.snapshot.orders[m.order];
     m.order=s[6];
+    if(m.snapshot.orders[m.order]!==oldPattern)refreshPattern().catch(error=>status(error.message,true));
     const horizontal=view.sx;
     view.reveal(s[7],m.channel,m.field);view.sx=horizontal;
     if(view.orders) {
@@ -28,7 +69,8 @@ function updateState(s) {
   }
   view.invalidate();
 }
-function adopt(result,name) {
+async function adopt(result,name) {
+  ++loadGeneration;++patternSerial;++descriptionSerial;m.description="";
   const decoder=new TextDecoder();
   result.instruments=result.instruments.map(ins=>({name:decoder.decode(ins.nameBytes),pan:ins.pan,volume:ins.volume}));
   // Keep this load's channel list stable through edits, including clearing its
@@ -36,7 +78,7 @@ function adopt(result,name) {
   m.snapshot=result;m.state=result.state;m.order=m.row=m.field=0;m.channel=result.channels[0];m.nibble='';
   m.instrument=m.state[4]?1:0;m.name=name;m.dirty=false;
   view.sx=view.sy=view.orderScroll=view.insScroll=0;
-  document.title=`ntrk · ${name}`;view.invalidate();
+  document.title=`ntrk · ${name}`;view.invalidate();await refreshPattern();
 }
 async function loadDemo() {
   await configReady;
@@ -48,8 +90,8 @@ async function loadDemo() {
     if(bytes.byteLength>16*1024*1024)throw new Error('Example exceeds 16 MiB limit');
     const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),n=>n.toString(16).padStart(2,'0')).join('');
     if(hash!==demo.sha256)throw new Error('Example integrity mismatch; reload after deployment completes');
-    adopt(await request('load',[bytes]),demo.name);
-  } else adopt(await request('demo'),'Night circuit');
+    await replaceSong('load',[bytes],demo.name);
+  } else await replaceSong('demo',[],'Night circuit');
 }
 function enqueue(fn) {
   ++queued;m.busy=true;
@@ -67,7 +109,7 @@ function discardThen(fn) {
 }
 async function action(type,arg) {
   if(!m.ready)return;
-  if(type==='select'){Object.assign(m,arg);m.nibble='';status(m.channel<0||m.field>=4?'Selected command lane · read only':'Primary field selected');view.invalidate();return;}
+  if(type==='select'){Object.assign(m,arg);m.nibble='';selectedDescription();status(m.channel<0||m.field>=4?'Selected command lane · read only':'Primary field selected');view.invalidate();return;}
   if(type==='step'){m[arg.id]=Math.max(arg.min,Math.min(arg.max,m[arg.id]+arg.delta));view.invalidate();return;}
   if(type==='entry'){m[arg.id]=arg.toggle?!m[arg.id]:arg.value;view.invalidate();return;}
   if(type==='volume'){m.volume=Math.max(0,Math.min(1,arg));gain.gain.setTargetAtTime(m.volume,ctx.currentTime,.008);view.invalidate();return;}
@@ -78,7 +120,8 @@ async function action(type,arg) {
   if(type==='mute') {updateState(await request('mute',[arg]));return;}
   if(type==='order') {
     m.follow=false;m.order=arg;m.row=0;m.nibble='';view.sy=0;view.invalidate();
-    updateState(await request('transport',[3,arg,0]));return;
+    const formatting=refreshPattern();
+    updateState(await request('transport',[3,arg,0]));await formatting;return;
   }
   if(type==='demo')return discardThen(async()=>{
     try {await loadDemo();status('Example · ready to play');}finally{view.invalidate();}
@@ -96,7 +139,7 @@ async function loadFile(file) {
   if(!file||!m.ready)return;
   if(file.size>16*1024*1024)throw new Error('File exceeds 16 MiB limit');
   return discardThen(async()=>{
-    try {adopt(await request('load',[await file.arrayBuffer()]),file.name.replace(/\.(mod|xm)$/i,'.ntrk'));status('Opened locally · no upload');}
+    try {await replaceSong('load',[await file.arrayBuffer()],file.name.replace(/\.(mod|xm)$/i,'.ntrk'));status('Opened locally · no upload');}
     finally {view.invalidate();}
   });
 }
@@ -107,10 +150,11 @@ async function write(value) {
   await request('edit',[m.snapshot.orders[m.order],m.row,m.channel,m.field,value]);
   m.snapshot.cells[index()]=value;m.dirty=true;
   const pattern=m.snapshot.orders[m.order];
-  m.snapshot.commands[pattern*m.state[1]+m.row][m.channel*(1+m.state[12])]=
-    await request('formatted',[pattern,m.row,m.channel,-1]);
+  const formatted=await request('formatted',[pattern,m.row,m.channel,-1]);
+  if(m.snapshot.commands?.pattern===pattern)
+    m.snapshot.commands.rows[m.row][m.channel*(1+m.state[12])]=formatted.text;
   m.row=(m.row+1)%m.state[1];
-  view.reveal();status('Cell updated');
+  selectedDescription();view.reveal();status('Cell updated');
 }
 async function keydown(event) {
   const key=event.key.toLowerCase();
@@ -139,7 +183,7 @@ async function keydown(event) {
       m.channel=col.channel;m.field=col.field;
       status(col.readOnly?'Selected command lane · read only':'Primary field selected');
     }
-    view.reveal();return;
+    selectedDescription();view.reveal();return;
   }
   if(!m.edit||event.repeat)return;
   if(m.channel<0||m.field>=4){status('Selected command lane · read only');return;}
@@ -184,7 +228,11 @@ run(async()=>{
   const module=await WebAssembly.compile(await response.arrayBuffer());ctx=new AudioContext({sampleRate:48000});
   await ctx.audioWorklet.addModule('worklet.js');
   node=new AudioWorkletNode(ctx,'ntrk',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2],processorOptions:{module}});
-  node.onprocessorerror=()=>{m.ready=false;status('Audio engine failed; reload the page to restart',true);};
+  node.onprocessorerror=()=>{
+    m.ready=false;m.snapshot=null;m.state=null;++loadGeneration;++patternSerial;++descriptionSerial;
+    for(const p of pending.values()){clearTimeout(p.timer);p.reject(new Error('Audio engine failed'));}pending.clear();
+    status('Audio engine failed; reload the page to restart',true);
+  };
   node.port.onmessage=({data})=>{
     if(data.state){updateState(data.state);return;}
     const p=pending.get(data.id);if(!p)return;clearTimeout(p.timer);pending.delete(data.id);
