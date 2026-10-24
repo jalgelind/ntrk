@@ -7,12 +7,14 @@ import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 const require=createRequire(import.meta.url);
 const {chromium}=require(process.env.NTRK_PLAYWRIGHT||'playwright');
-const root=fileURLToPath(new URL('../out/web/',import.meta.url));
+const root=process.env.NTRK_WEB_ROOT||fileURLToPath(new URL('../out/web/',import.meta.url));
 const mime={'.html':'text/html','.js':'text/javascript','.css':'text/css','.wasm':'application/wasm'};
 const server=createServer(async(req,res)=>{
   try {
-    const name=path.basename(new URL(req.url,'http://localhost').pathname)||'index.html';
-    res.writeHead(200,{'Content-Type':mime[path.extname(name)]||'application/octet-stream'}).end(await readFile(path.join(root,name)));
+    const pathname=new URL(req.url,'http://localhost').pathname;
+    const name=pathname.endsWith('/')?'index.html':path.basename(pathname);
+    const bytes=await readFile(path.join(root,name));
+    res.writeHead(200,{'Content-Type':mime[path.extname(name)]||'application/octet-stream'}).end(bytes);
   } catch {res.writeHead(404).end();}
 });
 let browser;
@@ -22,6 +24,8 @@ try {
   const page=await browser.newPage({acceptDownloads:true,viewport:{width:1280,height:720},deviceScaleFactor:2});
   const errors=[];page.on('pageerror',error=>errors.push(error.message));
   await page.addInitScript(()=>{
+    const createGain=AudioContext.prototype.createGain;
+    AudioContext.prototype.createGain=function(){const gain=createGain.call(this);window.testGain??=gain;return gain;};
     const Original=window.AudioWorkletNode;
     window.AudioWorkletNode=class extends Original {
       constructor(...args){super(...args);window.testNode=this;window.testContext=args[0];}
@@ -31,14 +35,12 @@ try {
     window.painted=[];
     CanvasRenderingContext2D.prototype.fillText=function(s,...args){painted.push(String(s));if(painted.length>12000)painted.splice(0,6000);return text.call(this,s,...args);};
   });
-  await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  await page.goto(`http://127.0.0.1:${server.address().port}/player/`);
   const demo=JSON.parse(await readFile(path.join(root,'demo.json'),'utf8'));
   const demoName=demo?.name||'Night circuit';
-  try {await page.waitForFunction(name=>document.title===`ntrk · ${name}`,demoName);}
-  catch(error){console.error('startup',errors,await page.evaluate(()=>painted.slice(-20)));throw error;}
   // Observe the renderer through its module prototype in this harness only.
   await page.evaluate(async()=>{
-    const {TrackerCanvas}=await import('./canvas.js'),draw=TrackerCanvas.prototype.draw;
+    const {TrackerCanvas}=await import('/player/canvas.js'+new URL(document.querySelector('script').src).search),draw=TrackerCanvas.prototype.draw;
     TrackerCanvas.prototype.draw=function(){window.view=this;return draw.call(this);};
     dispatchEvent(new Event('resize'));
     window.engineCommand=(type,args=[])=>new Promise((resolve,reject)=>{
@@ -47,19 +49,26 @@ try {
       testNode.port.addEventListener('message',listener);testNode.port.postMessage({id,type,args});
     });
   });
-  await page.waitForFunction(()=>window.view?.m.snapshot&&painted.includes('Ready · press Play to enable audio'));
+  await page.waitForFunction(()=>window.view?.m.ready&&view.hits.some(h=>h.id==='open'));
   const model=()=>page.evaluate(()=>({name:view.m.name,state:view.m.state,message:view.m.message,dirty:view.m.dirty,follow:view.m.follow}));
   const wait=fn=>page.waitForFunction(fn);
   const click=async(x,y)=>{await page.evaluate(()=>new Promise(requestAnimationFrame));await page.mouse.click(x,y);assert(await page.evaluate(()=>document.activeElement===document.querySelector('canvas')),'canvas retains keyboard focus');};
   // Toolbar coordinates are independent expectations of the compact bands.
-  const toolbar={open:[37,48],save:[107,48],demo:[177,48],help:[247,48],play:[37,81],pause:[107,81],stop:[177,81],edit:[257,81],follow:[354,81]};
-  const button=id=>click(...toolbar[id]);
+  const button=async id=>{
+    await page.evaluate(()=>new Promise(requestAnimationFrame));
+    const box=await page.evaluate(id=>view.hits.find(h=>h.id===id)?.r,id);
+    assert(box,`enabled drawn ${id}`);await click(box.x+box.w/2,box.y+box.h/2);
+  };
+  assert.equal(await page.title(),'ntrk · Module player');
+  assert(await page.evaluate(()=>!view.m.snapshot&&view.hits.some(h=>h.id==='open')&&!view.hits.some(h=>h.id==='play')));
+  if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.startup.png'});
+  await button('demo');await wait(()=>!!view.m.snapshot&&!view.m.busy);
   const cell=async(r,c,f)=>{
     const p=await page.evaluate(([r,c,f])=>{const b=view.cell(r,c,f);return {x:b.x+b.w/2,y:b.y+b.h/2};},[r,c,f]);
     await click(p.x,p.y);
     assert.deepEqual(await page.evaluate(()=>[view.m.row,view.m.channel,view.m.field]),[r,c,f],'pointer maps to intended field');
   };
-  const download=async()=>{const pending=page.waitForEvent('download');await button('save');return readFile(await(await pending).path());};
+  const download=async()=>{const pending=page.waitForEvent('download');await button('save');const file=await pending;assert(file.suggestedFilename().endsWith('.ntrk'));return readFile(await file.path());};
   const snapshot=()=>page.evaluate(()=>engineCommand('snapshot'));
   const value=async(r,c,f)=>page.evaluate(async([r,c,f])=>{const s=await engineCommand('snapshot');return s.cells[((s.orders[view.m.order]*s.state[1]+r)*s.state[0]+c)*4+f];},[r,c,f]);
   const pixels=(region)=>page.evaluate(async region=>{
@@ -160,13 +169,9 @@ try {
   assert(await page.evaluate(()=>['CH 01','CH 04','CH 0C','CH 0F'].every(label=>painted.includes(label))),'original IDs drawn compactly');
   await cell(0,3,1);await page.keyboard.type('02');await wait(()=>!view.m.busy&&view.m.row===1);
   assert.equal(await value(0,3,1),2);assert.equal(await value(0,1,1),0,'compact slot never edits its numeric slot index');
-  await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>view.m.channel),11);
-  await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>view.m.channel),14);
-  await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>view.m.channel),0);
-  await page.keyboard.press('Shift+Tab');assert.equal(await page.evaluate(()=>view.m.channel),14);
-  await cell(0,3,3);await page.keyboard.press('ArrowRight');
+  await cell(0,3,3);await page.keyboard.press('ArrowRight');await wait(()=>!view.m.busy);
   assert.deepEqual(await page.evaluate(()=>[view.m.channel,view.m.field]),[11,0]);
-  await page.keyboard.press('ArrowLeft');assert.deepEqual(await page.evaluate(()=>[view.m.channel,view.m.field]),[3,3]);
+  await page.keyboard.press('ArrowLeft');await wait(()=>!view.m.busy);assert.deepEqual(await page.evaluate(()=>[view.m.channel,view.m.field]),[3,3]);
   const sparseMute=await page.evaluate(()=>({x:view.cell(0,11,0).x+35,y:view.grid.y-14}));
   await click(sparseMute.x,sparseMute.y);await wait(()=>view.m.state[11]===(1<<11));
   assert.equal((await page.evaluate(()=>engineCommand('state')))[11],1<<11);
@@ -176,8 +181,6 @@ try {
   const sparseSaved=await download();await loadBytes('sparse-cleared.ntrk',sparseSaved);
   assert.deepEqual(await visible(),[3,11,14]);assert.equal(await page.evaluate(()=>view.m.channel),3,'new load clamps cursor to first visible original ID');
   assert.equal(await value(0,3,1),2);assert.equal((await model()).state[0],16);
-  await page.keyboard.press('Tab');assert.equal(await page.evaluate(()=>view.m.channel),11);
-  await page.keyboard.press('Shift+Tab');assert.equal(await page.evaluate(()=>view.m.channel),3);
   assert.deepEqual(await download(),sparseSaved,'save keeps original channel count, FXPL and unreferenced patterns');
   await loadFixture('empty');assert.deepEqual(await visible(),[0]);assert.equal((await snapshot()).usedMask,0);
   assert.equal((await model()).state[0],16,'empty module keeps its actual channel count');
@@ -219,24 +222,116 @@ try {
   await page.mouse.move(260,450);await page.mouse.down();await page.mouse.move(200,370,{steps:8});await page.mouse.up();
   assert.deepEqual(await page.evaluate(()=>[view.m.row,view.m.channel,view.m.field]),selected);
   if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.mobile-scrolled.png'});
-  await click(54,114);await wait(()=>view.m.follow);await click(54,114);await wait(()=>!view.m.follow);
+  await button('follow');await wait(()=>view.m.follow);await button('follow');await wait(()=>!view.m.follow);
   await button('demo');await wait(()=>!view.m.name.endsWith('.ntrk'));
   await page.evaluate(()=>{view.sx=view.sy=0;view.invalidate();});await cell(0,0,0);
   assert.deepEqual(await visible(),demo?[0,1,2,3]:[0,1,2]);
   if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.mobile.png'});
-  if(demo) {
-    await page.route(`**/${demo.url}`,route=>route.fulfill({status:404,body:'missing'}));
-    await button('demo');await wait(()=>view.m.message.includes('Cannot load configured demo'));assert.equal((await model()).name,demoName);
-    const failed=await browser.newPage();await failed.route(`**/${demo.url}`,route=>route.fulfill({status:404,body:'missing'}));
-    await failed.goto(`http://127.0.0.1:${server.address().port}/`);
-    await failed.waitForTimeout(700);
-    assert.equal(await failed.title(),'ntrk · Loading demo');
-    const result=await failed.evaluate(async()=>{const {TrackerCanvas}=await import('./canvas.js');const original=TrackerCanvas.prototype.draw;TrackerCanvas.prototype.draw=function(){window.failedView=this;return original.call(this);};dispatchEvent(new Event('resize'));});
-    await failed.waitForFunction(()=>window.failedView?.m.message.includes('Cannot load configured demo'));
-    assert(await failed.evaluate(()=>!failedView.hits.some(h=>h.id==='play')));await failed.close();
+  // Generic local-file checks include actual foreign sampled modules.
+  for(const name of ['sampled.mod','sampled.xm','sampled.mod.ntrk','sampled.xm.ntrk']) {
+    await loadBytes(name.replace(/\.(mod|xm)$/i,'.ntrk'),await readFile(path.join(fixtureRoot,name)));
+    assert((await snapshot()).instruments[0]);
+    const saved=await download();assert.equal(saved.subarray(0,4).toString(),'NTRK');
   }
+  // All keys dispatch synchronously, while worklet edits are still outstanding.
+  await page.setViewportSize({width:1280,height:720});await wait(()=>view.w===1280);
+  await page.evaluate(()=>{view.sx=view.sy=0;view.invalidate();});
+  if(!await page.evaluate(()=>view.m.edit))await button('edit');
+  await cell(0,0,0);
+  const burstPending=page.waitForEvent('download');
+  await page.evaluate(()=>{
+    const canvas=document.querySelector('canvas');
+    for(const key of ['z','x','c','ArrowRight','0','1','ArrowLeft','v'])
+      canvas.dispatchEvent(new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true}));
+    canvas.dispatchEvent(new KeyboardEvent('keydown',{key:'s',ctrlKey:true,bubbles:true,cancelable:true}));
+  });
+  const burstDownload=await burstPending;
+  await wait(()=>!view.m.busy);
+  assert.equal(await value(0,0,0),13);assert.equal(await value(1,0,0),15);assert.equal(await value(2,0,0),17);
+  assert.equal(await value(3,0,1),1);assert.equal(await value(4,0,0),18);
+  const burst=await readFile(await burstDownload.path());
+  await loadBytes('burst.ntrk',burst);
+  assert.equal(await value(4,0,0),18,'saved bytes include the final queued edit');
+  await page.evaluate(()=>document.querySelector('canvas').focus());await page.keyboard.press('Tab');
+  assert(await page.evaluate(()=>document.activeElement!==document.querySelector('canvas')),'Tab leaves canvas');
+  // Local drop uses the browser File/DataTransfer path.
+  const dropBytes=await readFile(path.join(fixtureRoot,'sampled.xm'));
+  await page.evaluate(bytes=>{
+    const canvas=document.querySelector('canvas');
+    for(const key of ['z','x'])canvas.dispatchEvent(new KeyboardEvent('keydown',{key,bubbles:true}));
+    const data=new DataTransfer();data.items.add(new File([new Uint8Array(bytes)],'pending.xm'));
+    canvas.dispatchEvent(new DragEvent('drop',{dataTransfer:data,bubbles:true,cancelable:true}));
+  },Array.from(dropBytes));
+  await wait(()=>!!view.m.confirm&&!view.m.busy);
+  assert.equal((await model()).name,'burst.ntrk','replacement waits for pending edits and their discard decision');
+  assert.equal(await value(0,0,0),13);assert.equal(await value(1,0,0),15);
+  await page.keyboard.press('Escape');await wait(()=>!view.m.confirm);await download();
+  await page.evaluate(bytes=>{
+    const data=new DataTransfer();data.items.add(new File([new Uint8Array(bytes)],'dropped.xm'));
+    document.querySelector('canvas').dispatchEvent(new DragEvent('drop',{dataTransfer:data,bubbles:true,cancelable:true}));
+  },Array.from(dropBytes));
+  await wait(()=>view.m.name==='dropped.ntrk'&&!view.m.busy);
+  // The output meter and host gain observe actual audio; song bytes remain identical.
+  const beforeVolume=await download();await button('play');await wait(()=>view.m.level>.00001);
+  for(let i=0;i<10;i++)await button('volume-');await wait(()=>view.m.volume<.0001&&view.m.level<.00001);
+  for(let i=0;i<10;i++)await button('volume+');await wait(()=>view.m.volume>.999&&view.m.level>.00001);
+  await button('stop');assert.deepEqual(await download(),beforeVolume,'host volume never changes module');
+  await page.evaluate(()=>{
+    const oscillator=testContext.createOscillator(),inverse=testContext.createGain(),merger=testContext.createChannelMerger(2);
+    inverse.gain.value=-1;oscillator.connect(merger,0,0);oscillator.connect(inverse);inverse.connect(merger,0,1);
+    merger.connect(testGain);oscillator.start();window.stereoProbe={oscillator,inverse,merger};
+  });
+  await wait(()=>view.m.level>.5); // Opposite phases must not disappear in a mono meter.
+  await page.evaluate(()=>{stereoProbe.oscillator.stop();for(const node of Object.values(stereoProbe))node.disconnect();});
+  await wait(()=>view.m.level<.00001);
+  // Double-click seeks accurately, both stopped and running.
+  const seek=await page.evaluate(()=>{const b=view.cell(4,0,0);return {x:b.x+5,y:b.y+5};});
+  await page.mouse.dblclick(seek.x,seek.y);await wait(()=>view.m.state[7]===4&&!view.m.busy);
+  await button('play');await page.mouse.dblclick(seek.x,seek.y);await wait(()=>view.m.state[8]===1&&view.m.state[7]===4&&!view.m.busy);await button('stop');
+  if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.generic-desktop.png'});
+  // Real touch events start on hit rows in both long lists.
+  await loadFixture('long');await page.setViewportSize({width:390,height:844});await wait(()=>view.w===390);
+  const cdp=await page.context().newCDPSession(page);
+  await cdp.send('Emulation.setTouchEmulationEnabled',{enabled:true});
+  for(const list of ['orders','instruments']) {
+    const r=await page.evaluate(list=>view[list],list);
+    const selected=await page.evaluate(()=>[view.m.order,view.m.instrument]);
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:r.x+20,y:r.y+r.h-10}]});
+    for(let step=1;step<=8;step++)await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:r.x+20,y:r.y+r.h-10-step*12}]});
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+    await wait(()=>view.orderScroll>0||view.insScroll>0);
+    assert.deepEqual(await page.evaluate(()=>[view.m.order,view.m.instrument]),selected,'drag does not click list row');
+    assert(await page.evaluate(list=>list==='orders'?view.orderScroll>0:view.insScroll>0,list));
+    const target=await page.evaluate(list=>{const r=view[list],scroll=list==='orders'?view.orderScroll:view.insScroll;return {x:r.x+20,y:r.y+10,index:Math.floor((scroll+10)/view.pitch)};},list);
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:target.x,y:target.y}]});
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:target.x+1,y:target.y+1}]});
+    await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+    await page.waitForFunction(([list,index])=>list==='orders'?view.m.order===index:view.m.instrument===index+1,[list,target.index]);
+  }
+  if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.generic-mobile.png'});
+  // Invalid config/asset never prevents generic startup or local Open.
+  for(const config of ['bad',JSON.stringify({url:'missing.ntrk',name:'Missing example',sha256:'0'.repeat(64)}),JSON.stringify({url:'ntrk.wasm',name:'Stale example',sha256:'0'.repeat(64)})]) {
+    const isolated=await browser.newPage({viewport:{width:390,height:844}});
+    await isolated.route('**/demo.json',route=>route.fulfill({body:config,contentType:'application/json'}));
+    await isolated.goto(`http://127.0.0.1:${server.address().port}/player/`);
+    await isolated.evaluate(async()=>{const {TrackerCanvas}=await import('/player/canvas.js'+new URL(document.querySelector('script').src).search);const draw=TrackerCanvas.prototype.draw;TrackerCanvas.prototype.draw=function(){window.v=this;return draw.call(this);};dispatchEvent(new Event('resize'));});
+    await isolated.waitForFunction(()=>window.v?.m.ready);
+    assert.equal(await isolated.title(),'ntrk · Module player');
+    if(process.env.NTRK_SCREENSHOT)await isolated.screenshot({path:process.env.NTRK_SCREENSHOT+'.startup-mobile.png'});
+    await isolated.evaluate(()=>v.action('demo'));await isolated.waitForFunction(()=>v.m.error&&!v.m.busy&&v.hits.some(h=>h.id==='open'));
+    assert(await isolated.evaluate(()=>v.hits.some(h=>h.id==='open')));
+    await isolated.locator('#open').setInputFiles({name:'arbitrary.ntrk',mimeType:'application/octet-stream',buffer:beforeVolume});
+    await isolated.waitForFunction(()=>v.m.name==='arbitrary.ntrk');await isolated.close();
+  }
+  const unavailable=await browser.newPage();
+  await unavailable.route('**/ntrk.wasm*',route=>route.fulfill({status:404,body:'missing'}));
+  await unavailable.goto(`http://127.0.0.1:${server.address().port}/player/`);
+  await unavailable.evaluate(async()=>{const {TrackerCanvas}=await import('/player/canvas.js'+new URL(document.querySelector('script').src).search);const draw=TrackerCanvas.prototype.draw;TrackerCanvas.prototype.draw=function(){window.v=this;return draw.call(this);};dispatchEvent(new Event('resize'));});
+  await unavailable.waitForFunction(()=>window.v?.m.error&&!v.m.ready);
+  assert(await unavailable.evaluate(()=>!v.hits.some(h=>h.id==='open'||h.id==='play')));
+  await unavailable.close();
   await page.evaluate(()=>testContext.close());assert.deepEqual(errors,[]);
-  console.log(`browser: ${demoName}; exact demo bytes; real worklet peak ${peak.toFixed(3)}; canvas pixels/DPR; pointer fields/mutes/orders/instruments/steppers; keyboard edits/bounds; save/reopen; failed loads; modal help/discard; sparse IDs/FXPL-only/meta-only/empty/stable visibility; wide fixture wheel/scrollbars/pan; desktop/mobile resize/focus passed`);
+  console.log(`browser: ${demoName}; exact demo bytes; real worklet peak ${peak.toFixed(3)}; canvas pixels/DPR; pointer fields/mutes/orders/instruments/steppers; keyboard edits/bounds; save/reopen; failed loads; modal help/discard; sparse IDs/FXPL-only/meta-only/empty/stable visibility; wide fixture wheel/scrollbars/pan; desktop/mobile resize/focus; subpath generic startup/bad example recovery; sampled MOD/XM/PCM; burst edits/save/load ordering; actual gain/meter; seek; real touch drag/tap threshold passed`);
 } finally {
   if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));
 }

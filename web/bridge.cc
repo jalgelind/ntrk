@@ -7,12 +7,17 @@
 namespace {
 const int kFileCap = 16 * 1024 * 1024;
 uint8_t files[2][kFileCap];
+// Conversion never writes either live backing buffer. Fixed caps bound memory.
+uint8_t imported[kFileCap], import_scratch[kFileCap];
 int active = 0;
 ntrk::Module song;
 ntrk::Note notes[ntrk::kMaxPatterns * ntrk::kMaxRows * ntrk::kMaxChannels];
 ntrk::Player player;
 ntrk::mix::Mixer mixer;
-std::vector<float> tanks[ntrk::kMaxChannels + ntrk::mix::kSends + ntrk::kMixrMasterSlots];
+// Fixed effect arena keeps arbitrary-file configuration inside the WASM budget.
+const size_t kEffectCap = 40 * 1024 * 1024;
+float effect_memory[kEffectCap / sizeof(float)];
+const int kEffectSlots = ntrk::kMaxChannels + ntrk::mix::kSends + ntrk::kMixrMasterSlots;
 double audio[128 * 2];
 float rate = 48000;
 bool running = false;
@@ -24,27 +29,42 @@ void reset() {
   ntrk::mix::fxpl_sync(&mixer, &player);
 }
 
+ntrk::mix::Slot *effect_slot(ntrk::mix::Mixer &mix, int i) {
+  return i < ntrk::kMaxChannels ? &mix.insert[i] :
+      i < ntrk::kMaxChannels + ntrk::mix::kSends ? &mix.send[i - ntrk::kMaxChannels] :
+      &mix.master_fx[i - ntrk::kMaxChannels - ntrk::mix::kSends];
+}
+size_t effect_bytes(const ntrk::mix::Slot &slot) {
+  size_t bytes = 0;
+  if (slot.kind == ntrk::mix::FxKind::kDelay)
+    bytes = ntrk::fx::delay_bytes_needed(ntrk::mix::kSlotDelayMaxSeconds, rate);
+  if (slot.kind == ntrk::mix::FxKind::kReverb)
+    bytes = ntrk::fx::reverb_bytes_needed(rate, ntrk::mix::kSlotPredelayMaxSeconds);
+  return (bytes + sizeof(float) - 1) / sizeof(float) * sizeof(float);
+}
+bool effects_fit(ntrk::mix::Mixer &mix) {
+  size_t used = 0;
+  for (int i = 0; i < kEffectSlots; ++i) {
+    const size_t bytes = effect_bytes(*effect_slot(mix, i));
+    if (bytes > kEffectCap - used) return false;
+    used += bytes;
+  }
+  return true;
+}
 void configure() {
   running = false;
   mixer = ntrk::mix::Mixer();
   ntrk::mix::mixer_config_read(&mixer, &song);
-  for (int i = 0; i < ntrk::kMaxChannels + ntrk::mix::kSends + ntrk::kMixrMasterSlots; ++i) {
-    auto *slot = i < ntrk::kMaxChannels ? &mixer.insert[i] :
-        i < ntrk::kMaxChannels + ntrk::mix::kSends ?
-        &mixer.send[i - ntrk::kMaxChannels] :
-        &mixer.master_fx[i - ntrk::kMaxChannels - ntrk::mix::kSends];
-    auto &mem = tanks[i];
-    if (slot->kind == ntrk::mix::FxKind::kDelay) {
-      size_t bytes = ntrk::fx::delay_bytes_needed(ntrk::mix::kSlotDelayMaxSeconds, rate);
-      mem.resize((bytes + sizeof(float) - 1) / sizeof(float));
-      ntrk::fx::delay_init(&slot->delay, mem.data(), bytes, rate,
-                           ntrk::mix::kSlotDelayMaxSeconds);
-    } else if (slot->kind == ntrk::mix::FxKind::kReverb) {
-      size_t bytes = ntrk::fx::reverb_bytes_needed(rate, ntrk::mix::kSlotPredelayMaxSeconds);
-      mem.resize((bytes + sizeof(float) - 1) / sizeof(float));
-      ntrk::fx::reverb_init(&slot->reverb, mem.data(), bytes, rate,
-                            ntrk::mix::kSlotPredelayMaxSeconds);
-    }
+  size_t offset = 0;
+  for (int i = 0; i < kEffectSlots; ++i) {
+    auto *slot = effect_slot(mixer, i);
+    const size_t bytes = effect_bytes(*slot);
+    float *memory = effect_memory + offset / sizeof(float);
+    if (slot->kind == ntrk::mix::FxKind::kDelay)
+      ntrk::fx::delay_init(&slot->delay, memory, bytes, rate, ntrk::mix::kSlotDelayMaxSeconds);
+    else if (slot->kind == ntrk::mix::FxKind::kReverb)
+      ntrk::fx::reverb_init(&slot->reverb, memory, bytes, rate, ntrk::mix::kSlotPredelayMaxSeconds);
+    offset += bytes;
   }
   for (int c = 0; c < ntrk::kMaxChannels; ++c) player.muted[c] = false;
   reset();
@@ -97,10 +117,24 @@ int web_demo(int sample_rate) {
 int web_load(int size) {
   if (size <= 0 || size > kFileCap) return 0;
   ntrk::Module candidate;
-  if (!ntrk::module_load(&candidate, web_input(), size)) return 0;
+  const bool foreign = ntrk::import_detect(web_input(), size) != ntrk::ImportFormat::kUnknown;
+  const uint8_t *bytes = web_input();
+  size_t length = static_cast<size_t>(size);
+  if (foreign) {
+    const size_t need = ntrk::import_scratch_needed(bytes, length);
+    if (!need || need > sizeof(import_scratch) ||
+        !ntrk::import_convert(bytes, length, import_scratch, sizeof(import_scratch),
+                              imported, sizeof(imported), &length)) return 0;
+    bytes = imported;
+  }
+  if (!ntrk::module_load(&candidate, bytes, length)) return 0;
   ntrk::mix::Mixer checked;
-  if (!ntrk::mix::mixer_config_read(&checked, &candidate)) return 0;
+  if (!ntrk::mix::mixer_config_read(&checked, &candidate) || !effects_fit(checked)) return 0;
   // Failed loads leave the playing module and all its backing storage intact.
+  if (foreign) {
+    std::memcpy(web_input(), imported, length);
+    if (!ntrk::module_load(&candidate, web_input(), length)) return 0;
+  }
   active = 1 - active;
   song = candidate;
   const size_t count = song.pattern_count * song.rows * song.channels;

@@ -37,7 +37,7 @@ export class Engine {
       const bytes = new Uint8Array(args[0]);
       if (bytes.length > a.web_capacity()) throw new Error('File exceeds 16 MiB limit');
       new Uint8Array(a.memory.buffer, a.web_input(), bytes.length).set(bytes);
-      if (!a.web_load(bytes.length)) throw new Error('Invalid or unsupported ntrk file');
+      if (!a.web_load(bytes.length)) throw new Error('Invalid, unsupported or over-budget ntrk/MOD/XM file');
       return this.snapshot();
     }
     if (type === 'save') {

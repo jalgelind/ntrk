@@ -31,7 +31,7 @@ LIB_CC  := $(filter-out $(TEST_CC),$(ALL_CC))
         test-ntrk-import test-ntrk-mix clean
 
 test: test-ntrk test-ntrk-fx test-ntrk-fx-tu test-ntrk-hdr test-ntrk-import \
-      test-ntrk-mix
+      test-ntrk-mix test-web
 
 # ---- the four self-contained test binaries ---------------------------------
 # Each pulls the library in through a single #include (ntrk.h, ntrk_unity.h,
@@ -115,7 +115,8 @@ WEB_DEMO ?=
 WEB_DEMO_NAME ?=
 WEB_EXPORTS := web_capacity web_input web_patterns web_orders web_audio web_demo web_load web_save web_info web_edit web_transport web_mute web_render web_instrument_name web_instrument_volume web_used_channels
 .PHONY: web test-web
-web: $(WEB_OUT)/ntrk.wasm $(addprefix $(WEB_OUT)/,index.html style.css app.js canvas.js engine.js worklet.js) web-demo
+web: $(WEB_OUT)/ntrk.wasm web-demo
+	python3 web/version_assets.py "$(WEB_OUT)"
 
 # Always stage configuration: changing WEB_DEMO (including back to empty) must not
 # leave a previous build's song selected. Copy before publishing its manifest.
@@ -139,6 +140,16 @@ $(OUT)/test_web: web/bridge_tests.cc web/bridge.cc $(HDRS) $(LIB_CC)
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -Werror -O2 -I. -o $@ web/bridge_tests.cc
 
-test-web: $(OUT)/test_web
+$(OUT)/web_import_fixtures: web/import_fixtures.cc test_ntrk_import.cc ntrk_import.cc $(HDRS)
+	@mkdir -p $(OUT)
+	$(CXX) $(CXXFLAGS) -O1 -I. -o $@ web/import_fixtures.cc
+
+test-web: $(OUT)/test_web $(OUT)/web_import_fixtures
 	@mkdir -p $(OUT)/web-fixtures
+	$(OUT)/web_import_fixtures $(OUT)/web-fixtures
 	$(OUT)/test_web $(OUT)/web-fixtures
+
+# A reproducible upload bundle, with no source/test/build-only files.
+.PHONY: web-dist
+web-dist: web
+	python3 web/bundle.py "$(WEB_OUT)" "$(OUT)/ntrk-player.zip"

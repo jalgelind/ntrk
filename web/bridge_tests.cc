@@ -61,6 +61,46 @@ void test_channel_usage(const char *directory) {
   std::puts("web channel usage: primary fields, sparse IDs, unreferenced patterns, multi-column FXPL, meta exclusion, empty/default mixer, exact save/load passed");
 }
 
+void test_imports(const char *directory) {
+  if (!directory) return;
+  for (const char *name : {"sampled.mod", "sampled.xm"}) {
+    const std::string path = std::string(directory) + "/" + name;
+    FILE *file = std::fopen(path.c_str(), "rb"); assert(file);
+    std::vector<uint8_t> bytes(kFileCap);
+    const size_t length = std::fread(bytes.data(), 1, bytes.size(), file);
+    assert(length && !std::ferror(file)); std::fclose(file); bytes.resize(length);
+    assert(web_demo(48000));
+    const int old_size = web_save();
+    const std::vector<uint8_t> old(web_input(), web_input() + old_size);
+    // Every truncated foreign header/sample leaves the complete prior song intact.
+    for (size_t size : {size_t(1), size_t(60), length / 2, length - 1}) {
+      std::memcpy(web_input(), bytes.data(), size);
+      assert(!web_load(static_cast<int>(size)));
+      assert(web_save() == old_size && !std::memcmp(old.data(), web_input(), old_size));
+    }
+    std::memcpy(web_input(), bytes.data(), length);
+    assert(web_load(static_cast<int>(length)));
+    assert(song.instrument_count > 0 && song.instruments[0].length > 0);
+    const int size = web_save(); assert(size > 0);
+    const std::vector<uint8_t> converted(web_input(), web_input() + size);
+    assert(web_load(size) && web_save() == size);
+    assert(!std::memcmp(converted.data(), web_input(), size));
+    assert(web_transport(1, 0, 0));
+    double energy = 0;
+    for (int block = 0; block < 100; ++block) {
+      web_render(128);
+      for (double value : audio) { assert(std::isfinite(value)); energy += value * value; }
+    }
+    assert(energy > 0);
+    // Also expose arbitrary PCM ntrk modules, not just generated synth music.
+    const std::string ntrk_path = path + ".ntrk";
+    file = std::fopen(ntrk_path.c_str(), "wb"); assert(file);
+    assert(std::fwrite(converted.data(), 1, converted.size(), file) == converted.size());
+    assert(!std::fclose(file));
+  }
+  std::puts("web imports: sampled 8-channel MOD/XM, PCM8/16, truncation preservation, roundtrip and finite audio passed");
+}
+
 int main(int argc, char **argv) {
   assert(!web_demo(0));
   assert(web_demo(48000));
@@ -144,6 +184,24 @@ int main(int argc, char **argv) {
   assert(web_load(static_cast<int>(with_samples.size())));
   assert(web_save() == static_cast<int>(with_samples.size()));
   assert(!std::memcmp(with_samples.data(), web_input(), with_samples.size()));
+  // Worst supported rate with every configured effect slot consumes only its arena.
+  for (auto kind : {ntrk::mix::FxKind::kDelay, ntrk::mix::FxKind::kReverb}) {
+    assert(web_demo(96000));
+    for (int i = 0; i < kEffectSlots; ++i)
+      ntrk::mix::slot_set_kind(effect_slot(mixer, i), kind);
+    assert(effects_fit(mixer));
+    ntrk::mix::mixer_config_write(&mixer, &song);
+    const int bytes = web_save(); assert(bytes > 0 && web_load(bytes));
+    assert(web_transport(1, 0, 0) && web_render(128));
+    for (double value : audio) assert(std::isfinite(value));
+  }
+  test_imports(argc > 1 ? argv[1] : nullptr);
   test_channel_usage(argc > 1 ? argv[1] : nullptr);
+  if (argc > 1) {
+    assert(web_demo(48000));
+    uint8_t orders[128] = {}; song.order = orders; song.order_count = 128;
+    song.instrument_count = 64;
+    save_fixture(argv[1], "long", 7);
+  }
   std::puts("web bridge: bounds, roundtrip, transactional load, transport, mute, finite audio, effect allocation passed");
 }

@@ -1,0 +1,16 @@
+Upload the ZIP's contents together to a static directory, e.g. /player/.
+Use HTTPS externally (localhost HTTP is suitable for testing).
+Serve .js as text/javascript and .wasm as application/wasm.
+No backend, CDN, account, analytics or cross-origin isolation is required.
+Use Cache-Control: no-cache on all assets; replace the full bundle together.
+There is no service worker/offline cache. Relative URLs support subdirectories.
+Open/drop local .ntrk, MOD or XM files (16 MiB input/output/scratch limits).
+Example is optional; demo.json=null selects the generated library example.
+A configured missing/bad example or SHA-256 mismatch reports an error; local Open remains available.
+AudioWorklet, WebAssembly, ES modules and Web Audio are required.
+Chromium is automated; Firefox/Safari/mobile audio need manual verification.
+Volume/mutes are monitoring settings, never written to saved modules.
+Editing covers primary cells only; no undo, instrument/structural editing,
+persistent storage or cell-level screen-reader navigation. Keyboard required
+for note entry. Tab leaves the canvas. Double-click a cell to seek to its row.
+Pause before large file operations: conversion in the worklet can interrupt audio.

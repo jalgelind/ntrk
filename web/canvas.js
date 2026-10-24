@@ -10,13 +10,13 @@ const rect = (x,y,w,h) => ({x,y,w:Math.max(0,w),h:Math.max(0,h)});
 const contains = (r,x,y) => r && x >= r.x && y >= r.y && x < r.x+r.w && y < r.y+r.h;
 const clamp = (v,max) => Math.max(0,Math.min(v,max));
 const help = [
-  ['TRANSPORT & FILES', 'Space plays / pauses. F5 plays; F8 stops and rewinds. Open reads a local .ntrk file (16 MiB maximum). Save downloads the complete song. Demo restores the configured song.'],
-  ['PATTERN EDITING', 'Click a field; arrows move the cursor. Page Up / Down move 16 rows. Home / End jump to the first / last row. Tab moves between channels. Enable Edit to write. Successful entries advance one row.'],
+  ['TRANSPORT & FILES', 'Space plays / pauses. F5 plays; F8 stops and rewinds. Open reads a local .ntrk, .mod or .xm file (16 MiB maximum). Save downloads the complete song. Example opens the optional configured song or a generated example. Output changes host volume; the bar measures actual output peaks.'],
+  ['PATTERN EDITING', 'Click a field; arrows move the cursor. Page Up / Down move 16 rows. Home / End jump to the first / last row. Tab leaves the canvas. Enable Edit to write. Successful entries advance one row.'],
   ['PIANO KEYS', 'Z S X D C V G B H N J M = one octave. Q 2 W 3 E R 5 T 6 Y 7 U = the next. Octave and instrument controls set note entry. Enter writes note-off. Delete / Backspace clears a field. Notes are not auditioned while stopped.'],
   ['HEX FIELDS', 'Instrument, effect and parameter take two hexadecimal digits. Values outside the module range are refused. Only the four primary cell fields are editable here.'],
-  ['NAVIGATION', 'Order rows browse a pattern and seek playback, disabling Follow. Follow tracks the playing row. Click a channel header to mute monitoring (not saved). Wheel or drag the scrollbars to scroll; Shift + wheel scrolls channels. Touch-drag the pattern to pan. Lists scroll separately. Only tracks with primary cells or channel automation are shown, keeping their original numbers. The track list stays fixed until another file or demo is loaded. An empty song keeps track 01 editable.'],
+  ['NAVIGATION', 'Order rows browse a pattern and seek playback, disabling Follow. Double-click a cell to seek its row; selection alone browses. Follow tracks the playing row. Click a channel header to mute monitoring (not saved). Wheel or drag the scrollbars to scroll; Shift + wheel scrolls channels. Touch-drag the pattern to pan. Lists scroll separately. Only tracks with primary cells or channel automation are shown, keeping their original numbers. The track list stays fixed until another file or demo is loaded. An empty song keeps track 01 editable.'],
   ['INSTRUMENTS', 'Select a module instrument in the list to use it for note entry. Names and volume are read from the module. Unnamed slots are labeled explicitly. Parameters, secondary effect planes and mixer settings are preserved in files but have no editor here.'],
-  ['LIMITATIONS', 'No MOD/XM import, undo, instrument creation, structural song editing or browser storage. Large file operations can interrupt audio: pause first. A hardware keyboard is needed for note entry on touch screens. F1 or Escape closes this help.'],
+  ['LIMITATIONS', 'No undo, instrument creation, structural song editing or browser storage. Large file operations can interrupt audio: pause first. A hardware keyboard is needed for note entry on touch screens. F1 or Escape closes this help.'],
 ];
 export class TrackerCanvas {
   constructor(canvas, model, action) {
@@ -64,14 +64,7 @@ export class TrackerCanvas {
       this.grid.y+r*this.pitch-this.sy,widths[f]*this.advance,this.pitch);
   }
   setEntry(id,value) {
-    if(this.m.busy)return;
-    this.m[id]=value;
-    if(id==='instrument') {
-      const info=this.m.snapshot?.instruments[value-1];
-      this.m.message=info?`Instrument ${hex(value)} · ${info.name||'(unnamed)'} · volume ${info.volume}/64`:'Instrument 00 · no instrument';
-      this.m.error=false;
-    }
-    this.invalidate();
+    this.action('entry',{id,value});
   }
   limits() {
     const s=this.m.state;
@@ -98,31 +91,38 @@ export class TrackerCanvas {
     this.label(`${m.name}${m.dirty?'  • UNSAVED':''}`,rect(62,3,w-65,28),m.dirty?ink.fx:ink.text);
     let x=5,y=35;
     const buttons=[['open','Open',()=>this.action('open')],['save','Save',()=>this.action('save')],
-      ['demo','Demo',()=>this.action('demo')],['help','? Help',()=>{m.help=!m.help;this.helpScroll=0;this.invalidate();}]];
-    for(const [id,label,fn] of buttons) { this.button(id,label,rect(x,y,65,26),fn,id==='help'&&m.help,id==='help'||ready);x+=70; }
+      ['demo','Example',()=>this.action('demo')],['help','? Help',()=>{this.action('entry',{id:'help',toggle:true});this.helpScroll=0;}]];
+    for(const [id,label,fn] of buttons) { this.button(id,label,rect(x,y,id==='demo'?75:65,26),fn,id==='help'&&m.help,id==='help'||(id==='open'||id==='demo'?m.ready:ready));x+=id==='demo'?80:70; }
     if(!narrow) this.label(s?`${m.snapshot.channels.length} tracks · ${s[1]} rows · ${s[4]} instruments`:'PATTERN EDITOR',rect(x+5,y,w-x-10,26),ink.dim,11);
     y+=32;x=5;
     for(const [id,label,cmd] of [['play','Play',1],['pause','Pause',2],['stop','Stop',0]]) {
       this.button(id,label,rect(x,y,65,28),()=>this.action('transport',cmd),id==='play'&&!!s?.[8],ready);x+=70;
     }
-    this.button('edit',m.edit?'Edit ON':'Edit OFF',rect(x,y,85,28),()=>{m.edit=!m.edit;this.invalidate();},m.edit,ready,'Enable keyboard writing');x+=90;
+    this.button('edit',m.edit?'Edit ON':'Edit OFF',rect(x,y,85,28),()=>this.action('entry',{id:'edit',toggle:true}),m.edit,ready,'Enable keyboard writing');x+=90;
     if(narrow) {y+=33;x=5;}
-    this.button('follow',m.follow?'Follow ON':'Follow OFF',rect(x,y,99,28),()=>{m.follow=!m.follow;this.invalidate();},m.follow,ready);x+=104;
-    this.label(s?`${s[8]?'PLAY':'IDLE'} ${hex(s[6])}:${hex(s[7])}  ${s[9]} BPM / ${s[10]} TICKS`:'ENGINE LOADING',rect(x,y,w-x-5,28),ink.accent,11);
+    this.button('follow',m.follow?'Follow ON':'Follow OFF',rect(x,y,99,28),()=>this.action('entry',{id:'follow',toggle:true}),m.follow,ready);x+=104;
+    this.label(s?`${s[8]?'PLAY':'IDLE'} ${hex(s[6])}:${hex(s[7])}  ${s[9]} BPM / ${s[10]} TICKS`:(m.ready?'ENGINE READY':'ENGINE LOADING'),rect(x,y,w-x-5,28),ink.accent,11);
     y+=34;x=5;
     for(const [id,label,value,max] of [['octave','Oct',m.octave,8],['instrument','Ins',m.instrument,s?.[4]||0]]) {
       this.label(`${label} ${id==='instrument'?hex(value):value}`,rect(x,y,55,24),ink.dim);
-      this.button(id+'-','−',rect(x+56,y,27,24),()=>this.setEntry(id,Math.max(id==='octave'?1:0,m[id]-1)),false,ready);
-      this.button(id+'+','+',rect(x+85,y,27,24),()=>this.setEntry(id,Math.min(max,m[id]+1)),false,ready);x+=120;
+      this.button(id+'-','−',rect(x+56,y,27,24),()=>this.action('step',{id,delta:-1,min:id==='octave'?1:0,max}),false,ready);
+      this.button(id+'+','+',rect(x+85,y,27,24),()=>this.action('step',{id,delta:1,min:id==='octave'?1:0,max}),false,ready);x+=120;
     }
     this.label(`P${ready?hex(m.snapshot.orders[m.order]):'--'}  ${hex(m.row)} / ${hex(m.channel+1)}  ${['NOTE','INSTRUMENT','EFFECT','PARAMETER'][m.field]}`,rect(x,y,w-x-5,24),ink.dim,11);
     y+=29;
+    this.label(`OUTPUT ${Math.round(m.volume*100)}%`,rect(5,y,98,23),ink.dim,11);
+    this.button('volume-','−',rect(105,y,27,23),()=>this.action('volume',m.volume-.1),false,m.ready);
+    this.button('volume+','+',rect(137,y,27,23),()=>this.action('volume',m.volume+.1),false,m.ready);
+    const meter=rect(174,y+7,Math.min(150,w-184),9);this.fill(meter,ink.line);
+    this.fill(rect(meter.x,meter.y,meter.w*Math.min(1,m.level),meter.h),m.level>1?ink.warn:ink.accent);
+    this.label('LEVEL',rect(330,y,w-335,23),ink.dim,10);
+    y+=29;
     // Narrow windows keep both lists in one rail; the pattern never changes pitch.
-    const left=narrow?103:130,right=narrow?0:218,bottom=h-44;
+    const left=narrow?121:130,right=narrow?0:218,bottom=h-44;
     const bodyH=Math.max(0,bottom-y),orderH=Math.floor(bodyH*(narrow?.43:1));
     this.orders=rect(4,y+25,left-8,Math.max(0,orderH-29));
     const insX=narrow?4:w-right+4,insY=narrow?y+orderH:y,insW=(narrow?left:right)-8;
-    this.instruments=rect(insX,insY+25,insW,Math.max(0,bottom-insY-(narrow?103:156)));
+    this.instruments=rect(insX,insY+25,insW,Math.max(0,bottom-insY-(narrow?103:180)));
     this.fill(rect(0,y,left,bodyH),ink.panel);this.label('ORDER : PAT',rect(0,y,left,23),ink.dim,11);
     this.fill(rect(insX-4,insY,insW+8,bottom-insY),ink.panel);
     this.label(narrow?'INSTRUMENTS':'INSTRUMENT / NAME',rect(insX,insY,insW,23),ink.dim,11);
@@ -140,10 +140,20 @@ export class TrackerCanvas {
       }
       if(!narrow) {
         this.label('Inspection only',rect(insX,infoY+71,insW,22),ink.dim,11);
-        this.label('Parameters / extra FX:',rect(insX,infoY+83,insW,20),ink.dim,11);
-        this.label('preserved, not editable',rect(insX,infoY+103,insW,20),ink.dim,11);
+        this.label('Parameters / extra FX:',rect(insX,infoY+94,insW,20),ink.dim,11);
+        this.label('preserved, not editable',rect(insX,infoY+114,insW,20),ink.dim,11);
       }
       this.pattern();
+    }
+    if(!ready) {
+      this.fill(rect(0,y,w,bodyH),ink.bg);
+      const launch=rect(20,y+35,w-40,Math.max(0,bottom-y-50));
+      this.fill(launch,ink.bg);
+      this.label('MODULE PLAYER',rect(launch.x,launch.y,launch.w,40),ink.accent,20);
+      this.label(!m.ready&&m.error?'Audio engine unavailable':m.ready?'Open or drop a module':'Loading audio engine…',rect(launch.x,launch.y+48,launch.w,32),ink.text,15);
+      this.label('.ntrk · MOD · XM / up to 16 MiB',rect(launch.x,launch.y+88,launch.w,28),ink.dim,11);
+      this.label('Local files stay in your browser.',rect(launch.x,launch.y+120,launch.w,28),ink.dim,11);
+      this.label('Example is optional. Play enables audio.',rect(launch.x,launch.y+152,launch.w,28),ink.dim,11);
     }
     this.fill(rect(0,h-43,w,43),ink.panel);
     this.label(m.message,rect(0,h-43,w,22),m.error?ink.warn:ink.accent,11);
@@ -247,7 +257,7 @@ export class TrackerCanvas {
   down(e) {
     if(e.button!==0) return;e.preventDefault();this.canvas.focus({preventScroll:true});
     const p=this.point(e),hit=this.at(p.x,p.y);
-    this.drag={...p,startX:p.x,startY:p.y,hit,sx:this.sx,sy:this.sy,moved:false};
+    this.drag={...p,startX:p.x,startY:p.y,hit,sx:this.sx,sy:this.sy,orderScroll:this.orderScroll,insScroll:this.insScroll,moved:false};
     if(hit?.id==='xscroll'||hit?.id==='yscroll') {
       this.drag.axis=hit.id[0];this.scrollTo(p,this.drag.axis);
       this.drag.sx=this.sx;this.drag.sy=this.sy;
@@ -265,7 +275,10 @@ export class TrackerCanvas {
       const d=this.drag,dx=p.x-d.startX,dy=p.y-d.startY;
       if(Math.abs(dx)+Math.abs(dy)>5)d.moved=true;
       if(d.axis) {const b=this[d.axis+'bar'];this['s'+d.axis]=clamp(d['s'+d.axis]+(d.axis==='x'?dx:dy)*b.max/(b.length-b.size),b.max);}
-      else if(d.moved&&!d.hit) {
+      else if(d.moved) {
+        if(!this.m.help&&!this.m.confirm&&contains(this.orders,d.startX,d.startY))this.orderScroll=d.orderScroll-dy;
+        else if(!this.m.help&&!this.m.confirm&&contains(this.instruments,d.startX,d.startY))this.insScroll=d.insScroll-dy;
+        else if(d.hit)return;
         if(this.m.help)this.helpScroll=clamp(this.helpScroll+p.y*-1+d.y,this.helpMax||0);
         else if(contains(this.grid,d.startX,d.startY)) {this.sx=clamp(d.sx-dx,this.maxX);this.sy=clamp(d.sy-dy,this.maxY);}
         d.y=p.y;
@@ -279,14 +292,17 @@ export class TrackerCanvas {
     if(d.moved||d.axis)return;
     const p=this.point(e),hit=this.at(p.x,p.y);
     if(hit&&hit.id===d.hit?.id)hit.fn();
-    else if(!this.m.help&&!this.m.confirm&&!this.m.busy&&this.m.snapshot&&contains(this.raster,p.x,p.y)) {
+    else if(!this.m.help&&!this.m.confirm&&this.m.snapshot&&contains(this.raster,p.x,p.y)) {
       const slot=Math.floor((p.x-this.raster.x+this.sx)/this.channelW);
       const c=this.m.snapshot.channels[slot];
       const r=Math.floor((p.y-this.grid.y+this.sy)/this.pitch);
       if(c===undefined||r>=this.m.state[1])return;
       const local=p.x-this.cell(r,c,0).x;
       const f=local<4*this.advance?0:local<7*this.advance?1:local<10*this.advance?2:3;
-      this.m.row=r;this.m.channel=c;this.m.field=f;this.m.nibble='';this.invalidate();
+      this.action('select',{row:r,channel:c,field:f,follow:false});
+      const now=performance.now();
+      if(this.lastCell?.r===r&&this.lastCell?.c===c&&now-this.lastCell.time<350)this.action('seek',r);
+      this.lastCell={r,c,time:now};
     }
   }
   wheel(e) {

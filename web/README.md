@@ -1,129 +1,142 @@
-# ntrk in the browser
+# ntrk module player
 
-A static tracker page: the actual ntrk replayer and mixer run inside an
-AudioWorklet, with a single Canvas2D tracker and basic keyboard cell editor.
-No desktop code, framework, CDN, service, filesystem shim or extra library is
-linked. The C++ core is unchanged. Everything stays in the browser.
+A static, fully Canvas2D player and small cell editor. The actual ntrk replayer,
+importer and mixer run inside an AudioWorklet; the C++ core is unchanged.
+Open/drop local modules first; **Example** is optional. No backend, CDN, account,
+analytics, framework or new runtime dependency. Files stay in the browser.
 
-## Build and run
+## Build and bundle
 
-Use an existing Emscripten SDK (tested with 6.0.8), a C++11 compiler for the
-native checks, and Python 3.8+ for demo staging and a local static server:
+Use an existing Emscripten SDK (tested with 6.0.8), a C++11 compiler and Python
+3.8+. From the standalone ntrk checkout:
 
 ```sh
-source ~/emsdk/emsdk_env.sh
-make web
-make test test-web
+make web-dist EMXX=$HOME/emsdk/upstream/emscripten/em++
+make test                       # includes test-web; no SDK needed for tests
 python3 -m http.server 8080 --bind 127.0.0.1 --directory out/web
-# Open http://127.0.0.1:8080, then press Play.
-# Stop the server with Ctrl-C when finished.
+# Open http://127.0.0.1:8080/ ; terminate the server with Ctrl-C.
 ```
 
-Alternatively, `make web EMXX=$HOME/emsdk/upstream/emscripten/em++`.
-The target emits `out/web/{index.html,style.css,app.js,canvas.js,engine.js,worklet.js,ntrk.wasm,demo.json}`.
-Copy that directory as a unit to any static host; HTTPS is required outside
-localhost. Serve `.js` as JavaScript and `.wasm` as `application/wasm`.
-No cross-origin isolation headers are needed. `file://` does not work.
-`make clean` removes generated output. The SDK is a build tool, never a runtime
-dependency; its version and compiler flags determine the generated WASM bytes.
+`out/ntrk-player.zip` is the upload artifact; `out/web/` is its runnable staging
+directory. The ZIP contains only HTML/CSS/JS/WASM, example configuration, optional
+example song, hosting instructions and a CC0 notice. ZIP order/timestamps/modes
+are fixed: identical inputs and toolchain yield identical ZIP bytes. `make web`
+stages the same player without packaging. All output is ignored by Git.
 
-To ship a host-owned song instead of the generated demo:
+To include a host-owned song as an optional example:
 
 ```sh
-make web WEB_DEMO=/absolute/path/to/song.ntrk WEB_DEMO_NAME='Song name'
+make web-dist EMXX=$HOME/emsdk/upstream/emscripten/em++ \
+  WEB_DEMO=/absolute/path/to/song.ntrk WEB_DEMO_NAME='Example name'
 ```
 
-This copies the input to `out/web/demo.ntrk` and writes its identity to
-`demo.json`. The name defaults to the input filename without its extension.
-Startup and **Demo** load this same asset; failed configuration/song loads show
-an error, with no generated-song fallback. A later plain `make web` explicitly
-returns to the generated demo and removes the staged song. No parent repository
-or music asset is required for the standalone build.
+The name defaults to the input stem. This writes `demo.json` and `demo.ntrk`;
+**nothing loads automatically**. Example verifies its SHA-256 and loads that exact asset or reports its
+failure, with no silent fallback to another tune. Invalid/missing example
+configuration never disables Open. A later plain `make web` or `make web-dist`
+removes a previously staged example and selects the generated library example
+(**Night circuit**) for the Example button. No parent checkout/music asset is
+required. A missing `WEB_DEMO` source makes the build fail.
 
-## Use
+In js-seq, `make tracker-web` stages the authored song as the optional example;
+`make tracker-web-dist` packages that configuration. Both still launch a generic
+player. Source music is never modified or duplicated into the library checkout.
 
-By default the original, generated **Night circuit** demo opens without
-shipping a music asset. It has two 32-row patterns, a bass, kick and hat, with
-only those three populated tracks shown. Press Play to resume the browser's
-audio context through a user gesture. Pause holds voices and timing; Stop
-silences tails and rewinds. Playback loops at the module's restart order.
-The order/row display follows the sequencer with a 40 ms polling interval,
-plus the browser/device's output latency. Channel headers toggle monitoring
-mutes, which survive Stop but are not saved.
+## Hosting
 
-Click an order row to browse and seek; this turns Follow off. Enable Follow
-to track playback again. Select a cell with the pointer or arrows, enable
-**Edit**, and type notes using the piano keys listed in the page's
-drawn **? Help** overlay (also F1). Choose an octave and instrument first, using the ± controls or the module-named instrument list. Instrument, effect and parameter
-fields accept two hexadecimal digits; Enter in a note field writes note-off,
-Delete clears a field. Successful entries advance one row. Note entry edits the
-song; it does not audition a note while stopped.
+Unzip the artifact into any static directory, including `/player/`. Keep its
+files together. HTTPS is required externally; localhost HTTP works. Serve `.js`
+as JavaScript and `.wasm` as `application/wasm`. Use `Cache-Control: no-cache`
+on the entry HTML and other assets; replace the bundle together. JS/CSS/WASM
+references carry a content-derived build query, and example configuration/song
+fetches bypass caches. A mismatched example digest is refused, never mislabeled. There is no service worker. `file://` does not work.
+No cross-origin isolation headers are required. See bundled `HOSTING.txt`.
 
-Open reads `.ntrk` files locally, with a 16 MiB limit and transactional
-validation: a rejected file leaves the current song intact. Save downloads a
-complete `.ntrk` using `module_save`; reopening it preserves the edits.
-Sample data, secondary effect planes, instrument parameters, macros, mixer
-settings and editor metadata are carried through even though this small page
-only edits the four primary cell fields. Files using unsupported format
-versions are refused by the same loader as native ntrk. MOD/XM import,
-instrument creation, undo, structural pattern/order editing and persistent
-browser storage are outside this editor's scope. Track visibility comes from
-primary note, instrument,
-effect or parameter cells and channel FXPL data across all stored patterns,
-including patterns outside the order list. Mixer gain/pan defaults and meta
-lanes do not mark tracks used. The grid compacts used tracks while preserving
-their original numbers and full stored channel data, regardless of visibility
-settings from other editors. The visible list stays fixed until loading a file
-or demo, so clearing a track's last cell leaves it editable. Reopening recomputes
-the list and places the cursor on its first track. An empty song shows track 01.
-Adding another unused track is outside this editor's scope.
+The host and generated library music are public domain / CC0. An optional
+host-owned example retains its own rights: obtain permission before shipping it.
 
-All visible controls, lists, status, help and discard confirmation are drawn on one
-canvas; HTML only hosts the canvas and hidden local file plumbing. The row gutter
-stays pinned while channels scroll horizontally. Use the wheel for rows and
-Shift + wheel for channels, or drag the drawn scrollbars. Touch-drag pans the
-pattern. Orders and instruments have their own scroll regions. Narrow windows
-stack the instrument list below the order list; channel widths stay fixed.
-Rendering uses a dirty flag at browser refresh and a DPR-sized backing store.
-Clicking controls keeps keyboard focus on the canvas. There are no native text
-inputs or on-screen piano: a hardware keyboard is required for note editing.
-The canvas currently provides only a host accessibility label; screen-reader
-navigation of individual cells and controls is not implemented.
+## Playback and editing
 
-## Host boundary and checks
+Open or drop `.ntrk`, ProTracker MOD or FastTracker XM files. Input, converted
+output and import scratch each have a 16 MiB cap. Import uses the library API;
+not every foreign tracker dialect/effect is supported, and conversion follows
+ntrk's semantics rather than promising an exact original-replayer emulation.
+Unsupported/truncated/over-budget files leave the current song and playback
+intact. A converted `song.mod` or `song.xm` saves as `song.ntrk`.
 
-`bridge.cc` is platform-free C++ and is compiled both natively and to a
-standalone WASM module. It owns two bounded file buffers, mutable primary cells,
-the player, mixer and effect memory in a fixed 128 MiB WASM memory. It
-initializes delay/reverb storage for
-every configured insert, send and master slot at the audio context's rate
-(8–96 kHz). Memory allocation, parsing and serialization happen only in worklet
-message handlers, separate from `process()`. Loading/saving large modules can
-still interrupt audio; pause before file operations for uninterrupted output.
-Rendering uses preallocated buffers, and all edits and playback share one
-worklet owner. The canvas host never touches live WASM state.
+Play resumes browser audio through a user gesture. Pause holds voices/timing;
+Stop silences tails and rewinds playback. Order/row/BPM/speed are actual engine
+state, polled every 40 ms, plus browser/device output latency. The song loops at
+its restart order. Click an order to seek to its first row. Select a cell to
+browse; **double-click a cell to seek to its row**, stopped or playing. These
+operations disable Follow; enable it to follow playback again.
 
-`make test-web` checks the same bridge natively: bounds and defaults, failed
-load preservation, repeated save/load, note-off, transport/seek, mute, effect
-memory, and finite non-silent generated audio. `make test` runs ntrk's existing
-native suite. `make test-web` also generates sparse, wide and meta-only empty
-module fixtures under `out/web-fixtures/` for the browser checks. With a local Playwright installation and Chromium, run the
-browser smoke test (the script starts and terminates its own server/browser):
+Output volume is 0–100%, initially unity, applied by a browser GainNode after
+the unmodified engine. The level bar measures post-volume output peaks, with
+red indicating values above unity. Volume and channel-header monitoring mutes
+are host settings and are never saved in the module.
+
+Enable Edit, select a cell, then use the keyboard. Successful entries advance
+one row. Arrows/Page Up/Page Down/Home/End navigate. Tab leaves the canvas.
+Use the module's instrument list and octave controls for note entry. The drawn
+**? Help** overlay (F1) lists piano keys and two-digit hexadecimal entry for
+instrument/effect/parameter. Enter writes note-off; Delete clears a field.
+Notes are not auditioned while stopped. Edits, navigation, save and replacement
+loads are queued in input order, so rapid typing is retained while the worklet
+responds. Unsaved replacement has a drawn discard/cancel dialog.
+
+Save uses `module_save` and downloads a complete `.ntrk`. Samples, extra FXPL
+columns, instrument parameters, macros, mixer settings and editor metadata are
+preserved, though only the four primary cell fields are editable here. No undo,
+instrument creation, structural song/pattern editing or persistent browser
+storage. A hardware keyboard is needed for editing on touch screens.
+
+Only tracks with primary cells or channel FXPL data in any stored pattern are
+shown, including unreferenced patterns, with their true IDs. Default mixer
+settings/meta lanes do not mark tracks used. The visible list stays fixed through
+edits until the next load, and an empty song keeps track 01 editable. Full stored
+channels survive saves. Adding an unused track is outside this editor's scope.
+
+Wheel scrolls rows; Shift+wheel scrolls channels. Drag the drawn grid scrollbars
+or touch-drag to pan. Orders/instruments scroll independently by wheel or touch,
+even when a drag starts on a row; dragging does not select it. Narrow windows
+stack these lists in a rail while preserving fixed cell pitch. Names clip to
+the available width. Every visible control/status/dialog is drawn on one canvas;
+HTML hosts only that canvas and hidden file plumbing. Canvas focus is retained
+after pointer operations; cell-level screen-reader navigation is not implemented.
+
+## Boundary and verification
+
+`bridge.cc` builds natively and as standalone WASM, with fixed 128 MiB memory:
+two file backing buffers, bounded conversion/scratch buffers, mutable primary
+cells and a bounded 40 MiB effect arena. File/mixer validation precedes adopting
+a candidate. The bridge owns all live state in the worklet; rendering allocates
+nothing. Parsing, conversion and serialization run in message handlers and can
+interrupt audio for large modules: pause before file operations.
+
+`make test` includes the native bridge, importer, renderer/mixer and library
+checks. `test-web` generates sampled eight-channel MOD/XM/PCM8/PCM16 fixtures,
+sparse/wide/multi-column FXPL, meta-only empty and long-list fixtures. Checks
+include refused-load preservation, exact save/reopen, bounds/defaults,
+transport, effect memory, true channel IDs and finite/non-silent output.
+
+With an existing Playwright/Chromium installation (no install step):
 
 ```sh
-NTRK_PLAYWRIGHT=/absolute/path/to/node_modules/playwright node web/browser_test.mjs
+NTRK_PLAYWRIGHT=/absolute/path/to/node_modules/playwright \
+  NTRK_SCREENSHOT=/tmp/ntrk-player node web/browser_test.mjs
 ```
 
-It checks real worklet audio, editing, transport, order selection, mutes,
-downloads and reopening, rejected files, canvas pixels/DPR, actual pointer hit
-geometry, sparse channel IDs, automation-only tracks, empty songs, help, focus,
-scrolling and narrow-window resizing. Test logs and
-screenshots belong outside Git. The page requires a modern browser with
-WebAssembly, ES modules, Web Audio and AudioWorklet. Only Chromium is covered
-by the automated browser check; Safari/Firefox and mobile audio need manual
-verification. There is no independent review verdict in these tests.
+The script owns and terminates its server/browser. It tests the actual worklet
+and canvas at `/player/`, generic startup, optional/broken examples, sampled
+local files/drop, burst keys and saved bytes, volume/real output levels, seek,
+sparse IDs, modal help/discard, desktop/narrow rendering and CDP touch events on
+long lists. Set `NTRK_WEB_ROOT` to an extracted bundle to test the actual ZIP.
+Logs/screenshots belong outside Git. js-seq's `tools/tracker/check_web_audio.sh`
+rebuilds WASM before comparing desktop/native bridge/WASM audio at 44.1/48/96 kHz
+and removes temporary float audio files afterwards.
 
-The compact header bands, order rail, instrument list and fixed-pitch raster follow
-js-seq's tracker design; no2's tracker drawing and theme informed the palette;
-the browser host here does not depend on no2. New web sources and generated
-demo music are public domain / CC0, matching ntrk.
+Requires WebAssembly, ES modules, Web Audio and AudioWorklet. Only Chromium is
+automated; Firefox/Safari and physical mobile/audio devices need manual checks.
+The compact bands, order rail, instrument list and fixed-pitch raster follow
+js-seq; no2 informed the palette. No desktop/no2 code is linked into the host.
