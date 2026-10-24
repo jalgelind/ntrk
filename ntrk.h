@@ -3078,11 +3078,9 @@ channel_trigger(const Module *m, Channel *ch, int note, double start_frame,
 inline bool
 player_preview(Player *player, int channel, int note, int instrument,
                double sample_rate) {
-  if (player == nullptr)
+  if (!player_playback_allowed(player))
     return false;
   const Module *m = player->module;
-  if (m == nullptr)
-    return false;
   if (channel < 0 || channel >= m->channels)
     return false;
   if (note < 1 || note > m->note_max)

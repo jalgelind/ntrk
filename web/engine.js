@@ -91,7 +91,7 @@ export class Engine {
       if (bytes.length > a.web_capacity()) throw new Error('File exceeds 16 MiB limit');
       new Uint8Array(a.memory.buffer, a.web_input(), bytes.length).set(bytes);
       const loaded = a.web_load(bytes.length);
-      if (loaded === -2) throw new Error('Interactive IMUS playback is unsupported');
+      if (loaded === -2) throw new Error('This module requires interactive music support, which is not available in this player yet.');
       if (!loaded) throw new Error('Invalid, unsupported or over-budget ntrk/MOD/XM file');
       return this.snapshot();
     }

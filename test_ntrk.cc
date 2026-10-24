@@ -8479,6 +8479,96 @@ static void test_extensions_metadata_counts() {
 }
 
 // Required interactive data is a schema, never implicit playback authorization.
+static void test_imus_body_bounds() {
+  using namespace ntrk;
+  const uint8_t name='x', fixed=7;
+  ImusNamedView v; v.name=&name; v.name_bytes=1;
+  uint8_t out[16], untouched[16]; memset(out,0xa5,sizeof(out)); memcpy(untouched,out,sizeof(out));
+  const size_t oversized[]={SIZE_MAX,SIZE_MAX-1,kMaxImusBytes-1};
+  size_t n=99;
+  for (size_t i=0;i<sizeof(oversized)/sizeof(oversized[0]);++i) {
+    CHECK(!imus_body_write(v,&fixed,oversized[i],nullptr,0,&n)); CHECK(n==0);
+    n=99; CHECK(!imus_body_write(v,&fixed,oversized[i],out,sizeof(out),&n));
+    CHECK(n==0 && !memcmp(out,untouched,sizeof(out)));
+  }
+  // Null fixed bytes must fail even for a size query, before output can be touched.
+  CHECK(!imus_body_write(v,nullptr,1,nullptr,0,&n) && n==0);
+  CHECK(!imus_body_write(v,nullptr,1,out,sizeof(out),&n) && n==0);
+  CHECK(!memcmp(out,untouched,sizeof(out)));
+  // A short buffer reports the exact size, but writes neither the prefix nor the payload.
+  CHECK(imus_body_write(v,&fixed,1,nullptr,0,&n) && n==3);
+  CHECK(!imus_body_write(v,&fixed,1,out,2,&n) && n==3);
+  CHECK(!memcmp(out,untouched,sizeof(out)));
+  CHECK(imus_body_write(v,&fixed,1,out,3,&n) && n==3);
+  CHECK(out[0]==1 && out[1]=='x' && out[2]==7 && out[3]==0xa5);
+  CHECK(imus_body_write(v,nullptr,0,nullptr,0,&n) && n==2);
+  // The exact byte ceiling is accepted; one more fixed byte is refused above.
+  static uint8_t maximum[kMaxImusBytes];
+  CHECK(!imus_body_write(v,maximum,kMaxImusBytes-2,out,sizeof(out),&n));
+  CHECK(n==kMaxImusBytes); // short output must leave prefix and payload untouched
+  CHECK(out[0]==1 && out[1]=='x' && out[2]==7 && out[3]==0xa5);
+  CHECK(maximum[0]==0 && maximum[kMaxImusBytes-1]==0);
+  CHECK(imus_body_write(v,maximum,kMaxImusBytes-2,nullptr,0,&n) && n==kMaxImusBytes);
+  v.extra_bytes=8;
+  CHECK(imus_fields(v)==ImusStatus::Invalid);
+  CHECK(!imus_body_write(v,&fixed,1,out,sizeof(out),&n) && n==0);
+  v.extra_bytes=SIZE_MAX;
+  CHECK(imus_fields(v)==ImusStatus::Invalid);
+  v.extra=&fixed; CHECK(imus_fields(v)==ImusStatus::Invalid);
+  v.extra_bytes=0; CHECK(imus_fields(v)==ImusStatus::Supported);
+}
+
+static void test_imus_dependency_and_scope() {
+  using namespace ntrk;
+  uint8_t section[]={1,'S',0,0,0,0,1,0,0,0,170,0,6,0,2,1,1};
+  uint8_t cue[]={1,'Q',1,0,0,0,0,0,0,0,1,0,0,0};
+  ImusRecord records[2];
+  records[0].kind=kImusSection; records[0].id=1; records[0].version=2;
+  records[0].body=section; records[0].bytes=sizeof(section); // optional future section
+  records[1].kind=kImusCue; records[1].id=2; records[1].flags=1;
+  records[1].body=cue; records[1].bytes=sizeof(cue);
+  uint8_t wire[256], saved[4096], again[4096]; size_t n=0, written=0, rewritten=0;
+  uint8_t order[]={0}; Note notes[2]={}; FxCell fx[2]={};
+  Module m; m.channels=2; m.rows=1; m.order_count=1; m.pattern_count=1;
+  m.order=order; m.patterns=notes; m.fx=fx; m.instrument_count=1;
+  CHECK(imus_encode(1,1,3,records,2,wire,sizeof(wire),&n,&m));
+  CHECK(imus_decode(wire,n,nullptr,&m)==ImusStatus::Opaque);
+  m.imus=wire; m.imus_bytes=uint32_t(n);
+  CHECK(module_save(&m,saved,sizeof(saved),&written));
+  Module loaded; ModuleLoadError error;
+  CHECK(!module_load_ex(&loaded,saved,written,ModuleLoadMode::InteractiveV1,&error));
+  CHECK(error==ModuleLoadError::UnsupportedProfile);
+  CHECK(module_load_ex(&loaded,saved,written,ModuleLoadMode::EditorPreserve));
+  CHECK(module_save(&loaded,again,sizeof(again),&rewritten));
+  CHECK(written==rewritten && !memcmp(saved,again,written));
+  Player player; player_start(&player,&loaded);
+  CHECK(!player_preview(&player,0,1,1,48000) && !player.playing);
+  player_start_ex(&player,&loaded,PlaybackMode::LinearPreview);
+  CHECK(player_preview(&player,0,1,1,48000));
+
+  uint8_t control_a[]={1,'A',1,0,0,0,0}, control_b[]={1,'B',2,0,0,0,0};
+  records[0]=ImusRecord(); records[1]=ImusRecord();
+  records[0].kind=records[1].kind=kImusControl; records[0].id=1; records[1].id=2;
+  records[0].body=control_a; records[1].body=control_b;
+  records[0].bytes=sizeof(control_a); records[1].bytes=sizeof(control_b);
+  m.macro_count=2;
+  for (int i=0;i<2;++i) {
+    m.macros[i].target_count=1; m.macros[i].targets[0].target=uint8_t(0x40+(kMacroSlotInsert<<3));
+    m.macros[i].targets[0].scope=uint8_t(i);
+  }
+  // Insert slots on different channels are distinct; globals and overlapping scopes collide.
+  CHECK(imus_encode(1,1,3,records,2,nullptr,0,&n,&m));
+  m.macros[1].targets[0].scope=0;
+  CHECK(!imus_encode(1,1,3,records,2,nullptr,0,&n,&m));
+  m.macros[1].targets[0].scope=kMacroScopeAll;
+  CHECK(!imus_encode(1,1,3,records,2,nullptr,0,&n,&m));
+  m.macros[1].targets[0].scope=1;
+  m.macros[0].targets[0].target=m.macros[1].targets[0].target=0x40;
+  CHECK(!imus_encode(1,1,3,records,2,nullptr,0,&n,&m));
+  m.macros[0].targets[0].target=m.macros[1].targets[0].target=1;
+  CHECK(!imus_encode(1,1,3,records,2,nullptr,0,&n,&m));
+}
+
 static void test_imus() {
   using namespace ntrk;
   uint8_t control[]={1,'C',1,0xff,0xff,0,0};
@@ -8696,6 +8786,8 @@ main(void) {
   test_instrument_param_round_trip();
   test_module_param_table();
   test_imus();
+  test_imus_body_bounds();
+  test_imus_dependency_and_scope();
 
   test_slic_block();
   test_itun_block();

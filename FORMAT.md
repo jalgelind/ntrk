@@ -238,13 +238,39 @@ evaluator (`smoothing_ms=0`); row latency and byte quantization are explicit.
 
 Layer gain is a separate host factor, multiplied with score channel gain before
 routing into dry output and sends. It never overwrites authored automation or
-SMUT/user mute state. A request ramps linearly from the current gain to the
-normalized target over `ceil(fade_ms*sample_rate/1000)` output frames (wide
-arithmetic); zero means immediate. A new request restarts from the current gain.
-Both stereo samples use the same frame gain. Default gain applies at entry;
-channels outside masks use unity. A zero-gain layer keeps sequencing and voices
-running; no new signal feeds sends but existing shared tails continue. This
-library does **not** implement these gain ramps yet.
+SMUT/user mute state. Normalized gain is the wire u16 divided by 65535. At initial
+binding only, initialize each layer's current gain and target to `default_gain`,
+with no active ramp; channels outside masks use unity. Section transitions and
+loop wraps preserve current gains, targets and ramps, including their progress.
+They never reapply defaults. Unbinding discards that host state; a new binding
+initializes defaults again.
+
+A layer request becomes effective at the host's declared audio command boundary.
+`fade_ms=0` sets current gain and target immediately before the first affected
+output frame and cancels a prior ramp. For `fade_ms>0`, use wide arithmetic to
+compute `N=ceil(fade_ms*sample_rate/1000)` at the current finite positive sample
+rate. Starting from current normalized gain `g0`, affected frame `k` (1..N) uses
+`g0+(target-g0)*k/N`, with frame N set exactly to target. Every channel in the
+mask and both stereo samples use the same frame gain. A replacement request
+starts from the current gain, without a discontinuity. This is per output frame,
+not per sample or callback; block partitioning cannot change the result.
+
+Pause freezes music sequencing, voices, musical effect state and ramp progress;
+paused output frames do not consume ramp frames. Coalesce layer requests while
+paused and apply them at the first resume command boundary, before its first
+output frame. A host's output mute/fade is separate from these musical gains. On resume, continue from the frozen state,
+without retroactive cue emission. Hosts must declare this pause behavior before
+interactive binding. For a sample-rate change, quiesce rendering at a frame
+boundary and preserve current gain/target; convert a running ramp's remaining
+time `remaining_frames/old_rate` to `ceil(remaining_time*new_rate)` frames and
+resume linear interpolation from current gain. This rounds completion by less
+than one new-rate frame; never restart the full fade or restore defaults. Reject
+invalid/unsupported rates before binding or resuming. Rate changes while paused
+use the same conversion but do not advance the ramp.
+
+A zero-gain layer keeps sequencing and voices running during unpaused rendering;
+no new signal feeds sends but existing shared tails continue. The library does
+**not** implement these ramps, rate-change or pause processing yet.
 
 Section coordinates refer to order **occurrences**, not pattern IDs. Spans are
 half-open lexicographic `[start,end)`: start order is in the order list, rows
@@ -258,15 +284,22 @@ end_action 0=stop, 1=loop. A loop wrap keeps the monotonic clock, voices and tai
 it does not perform a fresh section entry. Cues at row offset zero fire again
 on the new traversal.
 
+An interactive binding with any section records requires the host to supply an
+initial stable section ID, which must resolve to an understood section. There
+is no first-record or lowest-ID default; a missing, unknown or opaque selection
+refuses binding. With no sections, a supported interactive host follows the
+ordinary order/restart arrangement while applying controls and layers; cues
+cannot exist without section references. LinearPreview always follows the
+ordinary arrangement and ignores all interactive data, regardless of sections.
+
 On an initial entry or a transition to another section, reset voice and tracker
 channel/effect command memory, reload score MIXR state, set entry bpm/speed,
-restore held controls and current host layer gains, then process the destination
-row. `tail_policy` 0=cut clears mixer effect buffers; 1=carry retains mixer tail
-buffers while resetting score parameter/command state, and requires a host with
-explicit carry capability. Stop terminates voices and clears tracker command memory; cut clears effect
-buffers immediately, while a carry host drains effect buffers to its bounded
-tail deadline.
-A host must declare support for all requested policies and these reset semantics
+restore held controls, preserve current host layer gains/targets/ramp progress,
+then process the destination row. `tail_policy` 0=cut clears mixer effect buffers;
+1=carry retains mixer tail buffers while resetting score parameter/command state, and requires a host with
+explicit carry capability. Stop terminates voices and clears tracker command
+memory; cut clears effect buffers immediately, while a carry host drains effect
+buffers to its bounded tail deadline. A host must declare support for all requested policies and these reset semantics
 before binding playback. There is no implemented tail processor or binding in
 this library yet; carry must never be advertised just because its byte decoded.
 

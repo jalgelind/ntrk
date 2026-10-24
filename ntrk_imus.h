@@ -117,6 +117,7 @@ inline bool imus_cue(const ImusRecord &r, ImusCueView *v) {
 }
 // Unknown optional field TLVs are retained; required ones require a future host.
 inline ImusStatus imus_fields(const ImusNamedView &v) {
+  if ((v.extra_bytes && !v.extra) || v.extra_bytes>kMaxImusBytes) return ImusStatus::Invalid;
   size_t at=0; bool opaque=false;
   while (at<v.extra_bytes) {
     if (v.extra_bytes-at<8) return ImusStatus::Invalid;
@@ -147,7 +148,8 @@ inline bool imus_body_write(const ImusNamedView &v, const uint8_t *fixed, size_t
                             uint8_t *out, size_t cap, size_t *written) {
   if (!written) return false;
   *written=0;
-  if (!imus_utf8(v.name,v.name_bytes) || (v.extra_bytes && !v.extra) ||
+  if (!imus_utf8(v.name,v.name_bytes) || (n && !fixed) ||
+      n>kMaxImusBytes-1-v.name_bytes || (v.extra_bytes && !v.extra) ||
       v.extra_bytes>kMaxImusBytes-1-v.name_bytes-n || imus_fields(v)==ImusStatus::Invalid) return false;
   *written=1+v.name_bytes+n+v.extra_bytes;
   if (!out) return true;
