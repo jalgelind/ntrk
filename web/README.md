@@ -149,7 +149,10 @@ request), at most 49 per batch and one batch in flight, tagged with the bound
 generation and a strictly increasing sequence. Each load or section choice
 compiles a new generation; commands for a replaced generation are refused as
 stale and counted. The worklet applies a batch in its message handler, so it
-takes effect before the next render quantum.
+takes effect before the next render quantum. Until a command is acknowledged,
+the UI keeps its intended value: further steps and toggles build on that intent
+rather than on older feedback; the acknowledgement (accepted or refused), a
+failed request or a new generation releases it, so no phantom value remains.
 Score IDs are any u32 and cross the WASM boundary as exact numbers. Before
 anything reaches WASM, IDs must be integers in u32 range, values finite in 0–1,
 fades integer milliseconds up to 60,000 and generations/sequences positive safe
@@ -194,8 +197,10 @@ reaches the pattern, and answers each section from those flags in O(orders): a
 decode costs at most one pass over pattern storage plus 64 × 256 order checks.
 Worst case, 256 distinct 256-row patterns with 144 lanes and 64 whole-song
 sections, one decode takes 5.2–5.7 ms natively (`test_ntrk`); load runs three
-decodes and section choice two. The 8-row pattern window is likewise an interruption: 3.6–4.6 ms here, 9.1 ms
-once under load, against a 2.67 ms quantum at 48 kHz.
+decodes and section choice two. The 8-row pattern window is likewise an interruption: 3.1–4.6 ms here, 9.1 ms
+once under load, against a 2.67 ms quantum at 48 kHz. `engine_tests.mjs` prints
+the slowest window but asserts only deterministic bounds (window count/size,
+cache, payload), since wall time varies with machine load.
 
 `make test` includes the native bridge, importer, renderer/mixer and library
 checks. `test-web` generates sampled eight-channel MOD/XM/PCM8/PCM16 fixtures,
@@ -234,7 +239,8 @@ local files/drop, burst keys and saved bytes, volume/real output levels, seek,
 sparse IDs, modal help/discard, desktop/narrow rendering and CDP touch events on
 long lists. With the interactive fixture it chooses the initial section, requests
 another, fades a layer to measured silence and back, steps a control, and checks
-cues, frozen pause clock, seek/edit/profile refusals and stale reload commands. It also delays and reverses pattern replies, replaces the song with
+cues, frozen pause clock, seek/edit/profile refusals and stale reload commands,
+and holds worklet replies to check that steps/toggles compound on unacknowledged intent. It also delays and reverses pattern replies, replaces the song with
 old replies pending, and holds a successful load acknowledgement beyond ten
 seconds. Set `NTRK_WEB_ROOT` to an extracted bundle to test the actual ZIP.
 Logs/screenshots belong outside Git. js-seq's `tools/tracker/check_web_audio.sh`

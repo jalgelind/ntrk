@@ -32,13 +32,17 @@ try {
       constructor(...args){
         super(...args);window.testNode=this;window.testContext=args[0];
         const descriptor=Object.getOwnPropertyDescriptor(MessagePort.prototype,'onmessage');
-        window.delayedPatterns=[];window.delayedLoads=[];
+        window.delayedPatterns=[];window.delayedLoads=[];window.delayedScores=[];
         Object.defineProperty(this.port,'onmessage',{set(fn){descriptor.set.call(this,event=>{
           const result=event.data.result;
           if(window.delayPatternReplies&&result?.rows&&result.start===0&&Number.isInteger(result.pattern))
             delayedPatterns.push({pattern:result.pattern,release:()=>fn(event)});
           else if(window.delayLoadReplies&&result?.cells&&result?.orders)
             delayedLoads.push(()=>fn(event));
+          // A slow worklet: from a held score reply on, every later reply waits
+          // behind it in port order, including feedback polls.
+          else if(window.delayScoreReplies&&(Array.isArray(result?.results)||delayedScores.length))
+            delayedScores.push({score:Array.isArray(result?.results),release:()=>fn(event)});
           else fn(event);
         });}});
       }
@@ -370,6 +374,20 @@ try {
     await button('layer2:0');await wait(()=>view.m.feedback.layers[0].current===1);
     assert((await outputPeak())>.001,'layer restored');
     await button('control1:0');await wait(()=>Math.abs(view.m.feedback.controls[0].held-.875)<1e-3);
+    // Unacknowledged batches: a step or toggle builds on the latest intent, not
+    // on feedback that predates the batch still in flight.
+    await page.evaluate(()=>{delayScoreReplies=true;});
+    const heldScores=()=>page.evaluate(()=>delayedScores.filter(r=>r.score).length);
+    const releaseHeld=()=>page.evaluate(()=>{for(const r of delayedScores.splice(0))r.release();});
+    await button('layer2:0');await wait(()=>delayedScores.some(r=>r.score));  // layer -> 0, unacknowledged
+    await button('control1:0');await button('layer2:0');                       // staged: .75, layer -> 1
+    await releaseHeld();await wait(()=>delayedScores.some(r=>r.score));        // second batch unacknowledged
+    assert.equal(await heldScores(),1);
+    await button('control1:0');                                                // .625 from the .75 intent
+    await page.evaluate(()=>{delayScoreReplies=false;});await releaseHeld();
+    await wait(()=>!view.m.busy&&Math.abs(view.m.feedback.controls[0].held-.625)<1e-3&&view.m.feedback.layers[0].target===1&&view.m.feedback.accepted>0);
+    await page.waitForTimeout(100);
+    assert(await page.evaluate(()=>Math.abs(view.m.feedback.controls[0].held-.625)<1e-3&&view.m.feedback.layers[0].target===1),'in-flight intents compound');
     await button('pause');await wait(()=>view.m.feedback.paused&&!view.m.busy);
     const clock=(await feedback()).clock;await page.waitForTimeout(150);
     assert.equal((await page.evaluate(()=>engineCommand('feedback'))).feedback.clock,clock,'pause freezes the musical clock');

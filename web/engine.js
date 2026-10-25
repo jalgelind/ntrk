@@ -21,6 +21,44 @@ export function validScoreCommand(c) {
   return isUnit(c.value) && (c.kind === 'control' ? fade === 0 :
     Number.isInteger(fade) && fade >= 0 && fade <= MAX_FADE_MS);
 }
+// UI-side producer for score commands (pure; no WASM or DOM). Coalesces staged
+// commands by identity, keeps one batch in flight, and remembers the latest
+// INTENDED value per control/layer until its acknowledgement, so steps and
+// toggles made while a batch is unacknowledged build on the intent, not on
+// older feedback. Intents belong to one bound generation; any acknowledgement
+// (accepted or refused) or failure of the command that carried an intent drops
+// it, so feedback is again the only source and no phantom value survives.
+export class ScoreCommands {
+  constructor() { this.staged = new Map(); this.intent = new Map(); this.generation = 0; this.sequence = 0; this.inflight = null; }
+  // Called with every feedback (0 when unbound): a new generation drops all intents.
+  bind(generation) {
+    if (generation === this.generation) return;
+    this.generation = generation; this.staged.clear(); this.intent.clear();
+  }
+  intended(kind, id) { return this.intent.get(`${kind}:${id}`)?.value; }
+  stage(kind, id, value = 0, fadeMs = 0) {
+    const key = kind === 'section' ? kind : `${kind}:${id}`;
+    this.staged.delete(key); this.staged.set(key, {kind, id, value, fadeMs});
+    if (kind !== 'section') this.intent.set(key, {value, sequence: 0});
+  }
+  // The next batch to send, or null (one in flight, nothing staged or unbound).
+  take() {
+    if (this.inflight || !this.staged.size || !this.generation) return null;
+    const batch = [...this.staged.values()].map(c => ({...c, generation: this.generation, sequence: ++this.sequence}));
+    for (const c of batch) { const it = this.intent.get(`${c.kind}:${c.id}`); if (it) it.sequence = c.sequence; }
+    this.staged.clear(); this.inflight = batch; return batch;
+  }
+  // Acknowledged (results) or failed (null): release the batch's own intents.
+  settle(batch) {
+    if (batch !== this.inflight) return;
+    this.inflight = null;
+    for (const c of batch) {
+      const key = `${c.kind}:${c.id}`;
+      if (this.intent.get(key)?.sequence === c.sequence) this.intent.delete(key);
+    }
+  }
+  clear() { this.staged.clear(); this.intent.clear(); }
+}
 export class Engine {
   constructor(module, rate) {
     this.api = new WebAssembly.Instance(module, {

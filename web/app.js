@@ -1,15 +1,14 @@
 import {TrackerCanvas,fieldLayout} from './canvas.js';
-import {PATTERN_CHUNK_ROWS} from './engine.js';
+import {PATTERN_CHUNK_ROWS,ScoreCommands} from './engine.js';
 const canvas=document.getElementById('tracker'),open=document.getElementById('open');
 const m={snapshot:null,state:null,order:0,row:0,channel:0,field:0,dirty:false,nibble:'',busy:false,ready:false,volume:1,level:0,
   octave:2,instrument:1,edit:false,follow:true,help:false,confirm:null,name:'Module player',message:'Loading audio engine…',error:false,
   feedback:null,cues:[],rate:48000};
 let ctx,node,gain,analysers,seq=0,demo,configReady,queue=Promise.resolve(),queued=0;
 const pending=new Map();
-// Score commands: one producer, coalesced by identity (latest value wins), at most
-// one batch in flight, each tagged with the bound generation and a strictly
-// increasing sequence. A batch for a replaced generation is refused as stale.
-const staged=new Map();let scoreSeq=0,scoreInflight=false;
+// Score commands: one producer (see ScoreCommands). A batch for a replaced
+// generation is refused as stale by the engine.
+const commands=new ScoreCommands();
 let loadGeneration=0,patternSerial=0,descriptionSerial=0,editSerial=0;
 const view=new TrackerCanvas(canvas,m,(type,arg)=>{if(type==='open'){open.click();return;}if(type==='transport')ctx?.resume();enqueue(()=>action(type,arg));});
 function status(message,error=false) {m.message=message;m.error=error;view.invalidate();}
@@ -90,28 +89,23 @@ function updateState(s) {
 }
 function applyFeedback(feedback) {
   if(!m.snapshot?.score)return;
-  m.feedback=feedback;
+  m.feedback=feedback;commands.bind(feedback.bound?feedback.generation:0);
   if(feedback.cues.length)m.cues=[...m.cues,...feedback.cues].slice(-6);
   view.invalidate();
 }
-function stage(kind,id,value=0,fadeMs=0) {
-  const key=kind==='section'?kind:`${kind}:${id}`;
-  staged.delete(key);staged.set(key,{kind,id,value,fadeMs});flush();
-}
-function stagedValue(kind,id) {return staged.get(`${kind}:${id}`)?.value;}
+function stage(kind,id,value=0,fadeMs=0) {commands.stage(kind,id,value,fadeMs);flush();}
 async function flush() {
-  if(scoreInflight||!staged.size)return;
-  const generation=m.feedback?.bound?m.feedback.generation:0;
-  if(!generation){staged.clear();status('Choose an initial section first',true);return;}
-  const batch=[...staged.values()].map(c=>({...c,generation,sequence:++scoreSeq}));
-  staged.clear();scoreInflight=true;
+  if(!commands.generation&&commands.staged.size){commands.clear();status('Choose an initial section first',true);return;}
+  const batch=commands.take();
+  if(!batch)return;
   try {
     const {results,feedback}=await request('score',[batch]);
-    if(feedback.generation===generation)applyFeedback(feedback);
+    commands.settle(batch);
+    if(feedback.generation===batch[0].generation)applyFeedback(feedback);
     const refused=results.find(r=>r!=='ok');
     if(refused)status(refused==='stale'?'Score command for a replaced song was ignored':`Score command refused: ${refused}`,refused!=='stale');
-  } catch(error){status(error.message,true);}
-  finally{scoreInflight=false;flush();}
+  } catch(error){commands.settle(batch);status(error.message,true);}
+  finally{flush();}
 }
 async function refreshFeedback() {
   if(!m.snapshot?.score)return;
@@ -121,7 +115,7 @@ async function refreshFeedback() {
 }
 async function adopt(result,name) {
   ++loadGeneration;++patternSerial;++descriptionSerial;m.description="";
-  staged.clear();m.feedback=null;m.cues=[];
+  commands.bind(0);m.feedback=null;m.cues=[];
   const decoder=new TextDecoder();
   result.instruments=result.instruments.map(ins=>({name:decoder.decode(ins.nameBytes),pan:ins.pan,volume:ins.volume}));
   // Keep this load's channel list stable through edits, including clearing its
@@ -179,11 +173,11 @@ async function action(type,arg) {
   }
   if(type==='control'&&m.feedback?.bound) {
     const held=m.feedback.controls.find(c=>c.id===arg.id)?.held??0;
-    stage('control',arg.id,Math.max(0,Math.min(1,(stagedValue('control',arg.id)??held)+arg.delta)));return;
+    stage('control',arg.id,Math.max(0,Math.min(1,(commands.intended('control',arg.id)??held)+arg.delta)));return;
   }
   if(type==='layer'&&m.feedback?.bound) {
     const layer=m.feedback.layers.find(l=>l.id===arg),authored=m.snapshot.score.layers.find(l=>l.id===arg);
-    const target=stagedValue('layer',arg)??(layer?.held?layer.heldValue:layer?.target??1);
+    const target=commands.intended('layer',arg)??(layer?.held?layer.heldValue:layer?.target??1);
     stage('layer',arg,target>.5?0:1,authored?.fadeMs||0);return;
   }
   if(type!=='demo'&&type!=='open'&&!m.snapshot)return;
