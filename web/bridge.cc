@@ -1,11 +1,14 @@
 // Standalone browser host. Only this adapter owns memory; ntrk stays a view.
 // Public domain / CC0, like ntrk. No browser headers or desktop dependencies.
 #include "../ntrk_unity.h"
+#include "../ntrk_interactive.h"
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <vector>
 
 namespace {
+namespace ia = ntrk::interactive;
 const int kFileCap = 16 * 1024 * 1024;
 uint8_t files[2][kFileCap];
 // Conversion never writes either live backing buffer. Fixed caps bound memory.
@@ -23,6 +26,64 @@ double audio[128 * 2];
 float rate = 48000;
 bool running = false;
 uint8_t demo_order[] = {0, 1};
+
+// Interactive scores play only through the capability-bound runtime. The worklet
+// is the single audio owner: message handlers and web_render never overlap, so
+// a handler retires the old binding before any buffer it borrows is replaced.
+bool interactive = false; // adopted song carries a supported IMUS score
+bool bound = false;       // runtime bound to `binding` and `generation`
+bool started = false;     // Play entered the initial section; Stop clears it
+uint64_t generation = 0;  // monotonic, never reused; one per compiled binding
+uint32_t initial_section = 0, stale_commands = 0;
+ia::RuntimeBinding binding, probe; // probe validates without touching `binding`
+ia::Runtime runtime;
+ia::Position position;
+ia::CueEvent cue;
+// Off-render description of the adopted score; names are copied, never borrowed.
+struct ScoreEntry { uint8_t kind; uint32_t id; int field[7]; char name[64]; };
+ScoreEntry score[ntrk::kMaxImusRecords];
+int score_count = 0;
+
+ia::Capabilities capabilities() {
+  ia::Capabilities caps;
+  caps.held_controls = caps.layer_ramps = caps.safe_entry = caps.cut = caps.carry = true;
+  caps.pause_freezes = caps.rate_remaining_time = true;
+  caps.tail_deadline_ms = 2000;
+  return caps;
+}
+void retire() {
+  if (bound) runtime.unbind();
+  bound = started = false;
+}
+void describe() {
+  score_count = 0;
+  ntrk::ImusView view;
+  if (!song.imus_bytes ||
+      ntrk::imus_decode(song.imus, song.imus_bytes, &view, &song) != ntrk::ImusStatus::Supported) return;
+  size_t at = 12; ntrk::ImusRecord r;
+  while (ntrk::imus_next(view, &at, &r)) {
+    ScoreEntry e = ScoreEntry(); e.kind = r.kind; e.id = r.id;
+    const ntrk::ImusNamedView *named = nullptr;
+    ntrk::ImusControlView c; ntrk::ImusLayerView l; ntrk::ImusSectionView s; ntrk::ImusCueView q;
+    uint32_t first = 0, end = 0;
+    if (r.version != 1) continue; // optional future records are not part of this host
+    if (r.kind == ntrk::kImusControl && ntrk::imus_control(r, &c)) {
+      named = &c; e.field[0] = c.macro_index; e.field[1] = c.default_value;
+    } else if (r.kind == ntrk::kImusLayer && ntrk::imus_layer(r, &l)) {
+      named = &l; e.field[0] = l.channel_mask; e.field[1] = l.default_gain; e.field[2] = l.fade_ms;
+    } else if (r.kind == ntrk::kImusSection && ntrk::imus_section(r, &s) && ntrk::imus_span(song, s, &first, &end)) {
+      named = &s; e.field[0] = int(first); e.field[1] = int(end); e.field[2] = s.entry_bpm;
+      e.field[3] = s.entry_speed; e.field[4] = s.quantization; e.field[5] = s.end_action; e.field[6] = s.tail_policy;
+    } else if (r.kind == ntrk::kImusCue && ntrk::imus_cue(r, &q)) {
+      named = &q; e.field[0] = int(q.section_id); e.field[1] = int(q.row_offset);
+      e.field[2] = q.type; e.field[3] = q.strength;
+    }
+    if (!named) continue;
+    std::memcpy(e.name, named->name, named->name_bytes); e.name[named->name_bytes] = 0;
+    score[score_count++] = e;
+  }
+}
+bool whole(double x) { return x >= 1 && x <= 9007199254740991.0 && x == std::floor(x); }
 
 void reset() {
   ntrk::player_start(&player, &song);
@@ -69,6 +130,19 @@ void configure() {
   }
   for (int c = 0; c < ntrk::kMaxChannels; ++c) player.muted[c] = false;
   reset();
+}
+// Commit point of a validated load: the old runtime is retired before its
+// borrowed buffer becomes the next input buffer.
+void adopt(const ntrk::Module &candidate, bool score_file) {
+  retire();
+  active = 1 - active;
+  song = candidate;
+  const size_t count = song.pattern_count * song.rows * song.channels;
+  std::memcpy(notes, song.patterns, count * sizeof(ntrk::Note));
+  song.patterns = notes;
+  interactive = score_file;
+  configure();
+  describe();
 }
 }
 
@@ -127,6 +201,7 @@ const uint8_t *web_fx() { return reinterpret_cast<const uint8_t *>(song.fx); }
 
 int web_demo(int sample_rate) {
   if (sample_rate < 8000 || sample_rate > 96000) return 0;
+  retire(); interactive = false; score_count = 0;
   rate = static_cast<float>(sample_rate);
   song = ntrk::Module();
   song.channels = ntrk::kMaxChannels; song.rows = 32; song.pattern_count = 2;
@@ -177,14 +252,111 @@ int web_load(int size) {
     std::memcpy(web_input(), imported, length);
     if (!ntrk::module_load(&candidate, web_input(), length)) return 0;
   }
-  active = 1 - active;
-  song = candidate;
-  const size_t count = song.pattern_count * song.rows * song.channels;
-  std::memcpy(notes, song.patterns, count * sizeof(ntrk::Note));
-  song.patterns = notes;
-  configure();
+  adopt(candidate, false);
   return 1;
 }
+
+int web_ia_select(int section);
+// Explicit interactive host path; web_load keeps refusing scores. 1 adopted,
+// 0 invalid or not a score, -3 unsupported profile/capability, -5 device rate
+// outside the runtime's rates. Every refusal leaves the current song intact.
+// Sections exist: Play waits for web_ia_select. None: bound over the arrangement.
+int web_load_interactive(int size) {
+  if (size <= 0 || size > kFileCap) return 0;
+  if (!ia::rate_supported(rate)) return -5;
+  ntrk::Module candidate;
+  ntrk::ModuleLoadError load_error;
+  if (!ntrk::module_load_ex(&candidate, web_input(), static_cast<size_t>(size),
+                            ntrk::ModuleLoadMode::InteractiveV1, &load_error))
+    return load_error == ntrk::ModuleLoadError::UnsupportedProfile ? -3 : 0;
+  if (!candidate.imus_bytes) return 0;
+  ntrk::mix::Mixer checked;
+  if (!ntrk::mix::mixer_config_read(&checked, &candidate) || !effects_fit(checked)) return 0;
+  const ia::Status status = probe.compile(candidate, 1, capabilities(), 0);
+  if (status == ia::Status::Unsupported) return -3;
+  if (status != ia::Status::Ok && status != ia::Status::MissingSection) return 0;
+  adopt(candidate, true);
+  if (status == ia::Status::Ok) web_ia_select(0);
+  return 1;
+}
+
+// Chooses the initial section while stopped (0 only for section-less scores).
+// Compiles a fresh generation off render; refusals keep the previous binding.
+// Returns the runtime Status value (0 Ok), or -1 when not interactive/stopped.
+int web_ia_select(int section) {
+  if (!interactive || started || section < 0) return -1;
+  const ia::Status checked = probe.compile(song, generation + 1, capabilities(), uint32_t(section));
+  if (checked != ia::Status::Ok) return int(checked);
+  retire();
+  binding.compile(song, ++generation, capabilities(), uint32_t(section));
+  const ia::Status status = runtime.bind(binding, player, mixer, generation, rate);
+  bound = status == ia::Status::Ok;
+  initial_section = uint32_t(section);
+  return int(status);
+}
+
+// Generation-tagged, strictly sequenced score commands applied at the next
+// render boundary: 0 control (value 0..1), 1 layer (value 0..1, fade ms),
+// 2 section request. Returns the runtime Status value; stale ones are counted.
+int web_ia_command(int kind, double gen, double seq, int id, double value, int fade_ms) {
+  if (!bound) { if (stale_commands != UINT32_MAX) ++stale_commands; return int(ia::Status::Stale); }
+  if (!whole(gen) || !whole(seq) || id < 0) return int(ia::Status::Invalid);
+  const uint64_t g = uint64_t(gen), q = uint64_t(seq);
+  uint16_t normalized = 0;
+  ia::Status status = ia::Status::Invalid;
+  if ((kind == 0 || kind == 1) && !(value >= 0 && value <= 1 && ia::normalized(float(value), &normalized)))
+    return int(status);
+  if (kind == 0) status = runtime.control(g, q, uint32_t(id), normalized);
+  else if (kind == 1) {
+    if (fade_ms < 0 || fade_ms > 65535) return int(status);
+    status = runtime.layer(g, q, uint32_t(id), normalized, uint16_t(fade_ms));
+  } else if (kind == 2) status = runtime.request_section(g, q, uint32_t(id));
+  if (status == ia::Status::Stale && stale_commands != UINT32_MAX) ++stale_commands;
+  return int(status);
+}
+
+// Audio-owner feedback, read between render calls. web_ia_snapshot copies one
+// consistent Position; web_ia_info reads only that copy.
+int web_ia_snapshot() {
+  position = bound ? runtime.position() : ia::Position();
+  return bound;
+}
+double web_ia_info(int field, int index) {
+  const ia::Position &p = position;
+  const bool c = index >= 0 && index < p.controls, l = index >= 0 && index < p.layers;
+  switch (field) {
+    case 0: return double(bound ? generation : 0); case 1: return double(p.clock);
+    case 2: return double(p.traversal); case 3: return double(p.accepted_sequence);
+    case 4: return p.current; case 5: return p.pending; case 6: return p.row_offset;
+    case 7: return p.cue_drops; case 8: return p.order; case 9: return p.row;
+    case 10: return p.playing; case 11: return p.paused; case 12: return p.draining;
+    case 13: return p.controls; case 14: return p.layers;
+    case 15: return c ? p.control[index].id : -1; case 16: return c ? p.control[index].held : -1;
+    case 17: return c ? p.control[index].applied : -1;
+    case 18: return l ? p.layer[index].id : -1; case 19: return l ? p.layer[index].current : -1;
+    case 20: return l ? p.layer[index].target : -1; case 21: return l ? double(p.layer[index].remaining) : -1;
+    case 22: return l ? p.layer[index].held : -1; case 23: return l ? p.layer[index].held_value : -1;
+    case 24: return l ? p.layer[index].held_fade_ms : -1;
+    case 25: return initial_section; case 26: return started; case 27: return stale_commands;
+    default: return -1;
+  }
+}
+int web_ia_pop() { return bound && runtime.pop_cue(&cue); }
+double web_ia_cue(int field) {
+  switch (field) {
+    case 0: return double(cue.generation); case 1: return double(cue.sequence);
+    case 2: return double(cue.clock); case 3: return double(cue.traversal);
+    case 4: return cue.id; case 5: return cue.section; case 6: return cue.sample_offset;
+    case 7: return cue.type; case 8: return cue.strength;
+    default: return -1;
+  }
+}
+int web_score_count() { return interactive ? score_count : 0; }
+int web_score_info(int i, int field) {
+  if (!interactive || i < 0 || i >= score_count || field < 0 || field > 8) return -1;
+  return field == 0 ? score[i].kind : field == 1 ? int(score[i].id) : score[i].field[field - 2];
+}
+const char *web_score_name(int i) { return interactive && i >= 0 && i < score_count ? score[i].name : ""; }
 
 int web_save() {
   size_t size = 0;
@@ -230,12 +402,14 @@ int web_info(int field) {
     }
     case 12: return song.fx ? song.fx_columns : 0;
     case 13: return song.fx ? song.meta_columns : 0;
+    case 14: return interactive;
     default: return -1;
   }
 }
 
+// A bound score borrows these cells; edits would need a new generation.
 int web_edit(int pattern, int row, int channel, int field, int value) {
-  if (pattern < 0 || pattern >= song.pattern_count || row < 0 || row >= song.rows ||
+  if (interactive || pattern < 0 || pattern >= song.pattern_count || row < 0 || row >= song.rows ||
       channel < 0 || channel >= song.channels || field < 0 || field > 3 || value < 0)
     return 0;
   if ((field == 0 && value > song.note_max && value != ntrk::kNoteOff) ||
@@ -249,7 +423,25 @@ int web_edit(int pattern, int row, int channel, int field, int value) {
   return 1;
 }
 
+// Interactive: Play enters the selected initial section (fresh defaults) or
+// resumes; Pause freezes the runtime; Stop cuts. Sections own position: no seek.
+int interactive_transport(int command) {
+  if (!bound) return 0;
+  if (command == 0) { runtime.stop(false); started = running = false; }
+  else if (command == 1) {
+    const ia::Position now = runtime.position();
+    if (!started || (!now.playing && !now.draining)) { // fresh, stopped or ended by its section
+      runtime.unbind();
+      if (runtime.bind(binding, player, mixer, generation, rate) != ia::Status::Ok) { bound = false; return 0; }
+      started = true;
+    }
+    runtime.pause(false); running = true;
+  } else if (command == 2) { runtime.pause(true); running = false; }
+  else return 0;
+  return 1;
+}
 int web_transport(int command, int order, int row) {
+  if (interactive) return interactive_transport(command);
   if (command == 0) { running = false; reset(); }
   else if (command == 1) running = true;
   else if (command == 2) running = false;
@@ -268,7 +460,9 @@ int web_mute(int channel) {
 int web_render(int frames) {
   if (frames < 1 || frames > 128) return 0;
   std::memset(audio, 0, frames * 2 * sizeof(double));
-  if (running) ntrk::mix::mixer_render_add(&mixer, &player, audio, frames, 2, rate);
+  // Neither path allocates, formats or decodes; feedback is read by handlers.
+  if (running && interactive) runtime.render(audio, frames, 2, rate);
+  else if (running) ntrk::mix::mixer_render_add(&mixer, &player, audio, frames, 2, rate);
   return 1;
 }
 }

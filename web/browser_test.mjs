@@ -346,6 +346,52 @@ try {
     assert((await snapshot()).instruments[0]);
     const saved=await download();assert.equal(saved.subarray(0,4).toString(),'NTRK');
   }
+  // Interactive score through the actual worklet and drawn panel: explicit entry,
+  // section requests, layer fade to silence and back, held control, cues, refusals.
+  {
+    const feedback=()=>page.evaluate(()=>view.m.feedback);
+    const outputPeak=()=>page.evaluate(async()=>{
+      const analyser=testContext.createAnalyser();analyser.fftSize=2048;testNode.connect(analyser);
+      const data=new Float32Array(2048);let peak=0;
+      for(let i=0;i<8;i++){await new Promise(r=>setTimeout(r,25));analyser.getFloatTimeDomainData(data);for(const x of data){if(!Number.isFinite(x))throw new Error('Non-finite audio');peak=Math.max(peak,Math.abs(x));}}
+      testNode.disconnect(analyser);return peak;
+    });
+    await loadFixture('interactive');
+    await wait(()=>!!view.m.snapshot.score&&painted.includes('INTERACTIVE SCORE')&&painted.includes('Choose an initial section'));
+    assert(await page.evaluate(()=>!view.hits.some(h=>h.id==='play')),'Play waits for an explicit initial section');
+    await button('section3');await wait(()=>view.m.feedback?.bound&&view.m.feedback.initial===3&&view.hits.some(h=>h.id==='play'));
+    await button('play');await wait(()=>view.m.feedback?.playing&&view.m.feedback.current===3);
+    assert((await outputPeak())>.001,'interactive worklet audio');
+    await wait(()=>view.m.cues.length>0);
+    await button('section4');await wait(()=>view.m.feedback.current===4&&view.m.feedback.pending===0);
+    assert(await page.evaluate(()=>painted.some(t=>t.startsWith('▶ test #4'))),'current section drawn');
+    await button('layer2:0');await wait(()=>view.m.feedback.layers[0].current===0);
+    assert.equal(await outputPeak(),0,'layer at zero silences every masked channel');
+    await button('layer2:0');await wait(()=>view.m.feedback.layers[0].current===1);
+    assert((await outputPeak())>.001,'layer restored');
+    await button('control1:0');await wait(()=>Math.abs(view.m.feedback.controls[0].held-.875)<1e-3);
+    await button('pause');await wait(()=>view.m.feedback.paused&&!view.m.busy);
+    const clock=(await feedback()).clock;await page.waitForTimeout(150);
+    assert.equal((await page.evaluate(()=>engineCommand('feedback'))).feedback.clock,clock,'pause freezes the musical clock');
+    const seekCell=await page.evaluate(()=>{const b=view.cell(1,0,0);return {x:b.x+5,y:b.y+5};});
+    await page.mouse.dblclick(seekCell.x,seekCell.y);await wait(()=>/section requests/.test(view.m.message));
+    if(!await page.evaluate(()=>view.m.edit))await button('edit');
+    await cell(0,0,0);await page.keyboard.press('x');await wait(()=>/read-only/.test(view.m.message));
+    await button('edit');
+    if(process.env.NTRK_SCREENSHOT)await page.screenshot({path:process.env.NTRK_SCREENSHOT+'.interactive.png'});
+    const before=await download();
+    await page.locator('#open').setInputFiles({name:'future.ntrk',mimeType:'application/octet-stream',buffer:await readFile(path.join(fixtureRoot,'interactive-future.ntrk'))});
+    await wait(()=>/newer profile/.test(view.m.message)&&!view.m.busy);
+    assert.equal((await model()).name,'interactive.ntrk');assert.deepEqual(await download(),before,'refused profile keeps the score');
+    // Reload publishes a new generation: an old-generation command is stale.
+    const old=(await feedback()).generation;
+    await loadFixture('interactive');await wait(()=>!view.m.feedback?.bound);
+    await button('section3');await page.waitForFunction(old=>view.m.feedback?.bound&&view.m.feedback.generation>old,old);
+    assert.deepEqual((await page.evaluate(old=>engineCommand('score',[[{kind:'control',generation:old,sequence:1e9,id:1,value:.5}]]),old)).results,['stale']);
+    await button('stop');
+    await loadBytes('sampled.xm.ntrk',await readFile(path.join(fixtureRoot,'sampled.xm.ntrk')));
+    console.log('browser interactive: explicit entry, section request, layer silence/restore, held control, cues, pause clock, seek/edit/profile refusals, stale reload passed');
+  }
   // All keys dispatch synchronously, while worklet edits are still outstanding.
   await page.setViewportSize({width:1280,height:720});await wait(()=>view.w===1280);
   await page.evaluate(()=>{view.sx=view.sy=0;view.invalidate();});

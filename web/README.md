@@ -122,6 +122,35 @@ the available width. Every visible control/status/dialog is drawn on one canvas;
 HTML hosts only that canvas and hidden file plumbing. Canvas focus is retained
 after pointer operations; cell-level screen-reader navigation is not implemented.
 
+## Interactive scores
+
+A file with a required interactive score (IMUS, see FORMAT.md) never plays as an
+ordinary song. The ordinary bridge load still refuses it; the host then takes
+the explicit interactive path, which binds the capability-bound runtime
+([INTERACTIVE.md](../INTERACTIVE.md)) with held controls, layer ramps, safe
+entry, cut/carry (2-second tail deadline), pause freeze and rate conversion.
+Unsupported required profiles/capabilities and device rates other than
+44.1/48/96 kHz are refused with their reason, leaving the current song intact.
+
+While stopped, click a section in the **INTERACTIVE SCORE** panel to choose the
+initial section; Play stays disabled until one is chosen (a score without
+sections binds over its ordinary arrangement at load). While playing, a click
+requests that section at its next row/beat/bar boundary; `→` marks the pending
+request, `▶` the current one. Controls step held values in eighths and show the
+byte actually applied at the latest row. Layer On/Off uses the authored fade and
+shows current → target gain and remaining time. Pause freezes the score; Stop
+cuts, and the next Play re-enters the chosen section with default controls and
+layers. Cues list the latest markers with traversal and musical frame clock (not
+speaker time). Interactive scores are read-only and cannot be seeked; Save keeps
+their bytes. All shown values are audio-owned runtime feedback.
+
+Commands are coalesced per control/layer (latest value wins; one pending section
+request), at most 49 per batch and one batch in flight, tagged with the bound
+generation and a strictly increasing sequence. Each load or section choice
+compiles a new generation; commands for a replaced generation are refused as
+stale and counted. The worklet applies a batch in its message handler, so it
+takes effect before the next render quantum.
+
 ## Boundary and verification
 
 `bridge.cc` builds natively and as standalone WASM, with fixed 128 MiB memory:
@@ -130,6 +159,13 @@ cells and a bounded 40 MiB effect arena. File/mixer validation precedes adopting
 a candidate. The bridge owns all live state in the worklet; rendering allocates
 nothing. Parsing, conversion and serialization run in message handlers and can
 interrupt audio for large modules: pause before file operations.
+Interactive decode, validation, score description and binding compilation also
+run in message handlers, never inside `process()`; the render call only renders
+and the handler reads feedback afterwards. An AudioWorklet's handlers share the
+audio rendering thread, and moving that work to another thread would need shared
+memory (cross-origin isolation), which this host deliberately does not require.
+The runtime binding and score table are fixed-size; a load retires the old
+binding before its backing buffer is reused.
 
 `make test` includes the native bridge, importer, renderer/mixer and library
 checks. `test-web` generates sampled eight-channel MOD/XM/PCM8/PCM16 fixtures,
@@ -137,6 +173,14 @@ sparse/wide/multi-column FXPL, meta-only empty, long-list, distinct-order and
 maximal 16 MiB geometry fixtures. Checks
 include refused-load preservation, exact save/reopen, bounds/defaults,
 transport, effect memory, true channel IDs and finite/non-silent output.
+A procedural interactive score (no sample files) is played through the bridge
+and through direct runtime calls with one command script (layer fade, control,
+section requests, pause, stop/restart); audio and cues must be identical, with
+zero heap allocation across bridge commands/render/feedback. It also covers the
+explicit initial section, sequencing/normalization, stale reload, unsupported
+profile and rate, a section that stops at its end, section-less scores and
+retirement by an ordinary load. `engine_tests.mjs` replays the same script in
+WASM against the native standalone-runtime output.
 
 After building WASM, verify bounded pattern formatting, cache/payload limits and
 exact large-file load/edit/save without an audio device:
@@ -156,7 +200,9 @@ The script owns and terminates its server/browser. It tests the actual worklet
 and canvas at `/player/`, generic startup, optional/broken examples, sampled
 local files/drop, burst keys and saved bytes, volume/real output levels, seek,
 sparse IDs, modal help/discard, desktop/narrow rendering and CDP touch events on
-long lists. It also delays and reverses pattern replies, replaces the song with
+long lists. With the interactive fixture it chooses the initial section, requests
+another, fades a layer to measured silence and back, steps a control, and checks
+cues, frozen pause clock, seek/edit/profile refusals and stale reload commands. It also delays and reverses pattern replies, replaces the song with
 old replies pending, and holds a successful load acknowledgement beyond ten
 seconds. Set `NTRK_WEB_ROOT` to an extracted bundle to test the actual ZIP.
 Logs/screenshots belong outside Git. js-seq's `tools/tracker/check_web_audio.sh`

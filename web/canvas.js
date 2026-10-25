@@ -16,6 +16,7 @@ const help = [
   ['HEX FIELDS', 'Instrument, effect and parameter take two hexadecimal digits. Values outside the module range are refused. Only the four primary cell fields are editable here.'],
   ['NAVIGATION', 'Order rows browse a pattern and seek playback, disabling Follow. Double-click a cell to seek its row; selection alone browses. Follow tracks the playing row. Click a channel header to mute monitoring (not saved). Wheel or drag the scrollbars to scroll; Shift + wheel scrolls channels. Touch-drag the pattern to pan. Lists scroll separately. Only tracks with primary cells or channel automation are shown, keeping their original numbers. The track list stays fixed until another file or demo is loaded. An empty song keeps track 01 editable.'],
   ['INSTRUMENTS', 'Select a module instrument in the list to use it for note entry. Names, volume and pan are read from the module. Unnamed slots are labeled explicitly. All secondary effect columns and meta lanes are displayed read-only; parameters and mixer settings are preserved.'],
+  ['INTERACTIVE SCORES', 'Files with an interactive score play only through the interactive runtime, never as an ordinary song. While stopped, click a section to choose where Play enters; while playing, a click requests it at that section\'s next row, beat or bar boundary (the arrow marks a pending request). Control − / + change held values in eighths; the second value is the byte actually applied at the latest row. Layer On / Off fades with the authored time. Pause freezes the score; Stop cuts tails and the next Play restarts from the chosen section with default controls and layers. Cues list the latest score markers with their traversal and musical frame clock. These scores are read-only here and cannot be seeked.'],
   ['LIMITATIONS', 'No undo, instrument creation, structural song editing or browser storage. Large file operations can interrupt audio: pause first. A hardware keyboard is needed for note entry on touch screens. F1 or Escape closes this help.'],
 ];
 // Character positions are the sole geometry for draw, hit, reveal and keyboard.
@@ -120,12 +121,14 @@ export class TrackerCanvas {
     if(!narrow) this.label(s?`${m.snapshot.channels.length} tracks · ${s[1]} rows · ${s[4]} instruments`:'PATTERN EDITOR',rect(x+5,y,w-x-10,26),ink.dim,11);
     y+=32;x=5;
     for(const [id,label,cmd] of [['play','Play',1],['pause','Pause',2],['stop','Stop',0]]) {
-      this.button(id,label,rect(x,y,65,28),()=>this.action('transport',cmd),id==='play'&&!!s?.[8],ready);x+=70;
+      this.button(id,label,rect(x,y,65,28),()=>this.action('transport',cmd),id==='play'&&!!s?.[8],ready&&(!m.snapshot.score||!!m.feedback?.bound));x+=70;
     }
     this.button('edit',m.edit?'Edit ON':'Edit OFF',rect(x,y,85,28),()=>this.action('entry',{id:'edit',toggle:true}),m.edit,ready,'Enable keyboard writing');x+=90;
     if(narrow) {y+=33;x=5;}
     this.button('follow',m.follow?'Follow ON':'Follow OFF',rect(x,y,99,28),()=>this.action('entry',{id:'follow',toggle:true}),m.follow,ready);x+=104;
-    this.label(s?`${s[8]?'PLAY':'IDLE'} ${hex(s[6])}:${hex(s[7])}  ${s[9]} BPM / ${s[10]} TICKS`:(m.ready?'ENGINE READY':'ENGINE LOADING'),rect(x,y,w-x-5,28),ink.accent,11);
+    const f=m.feedback,score=m.snapshot?.score,section=id=>score.sections.find(c=>c.id===id)?.name||`#${id}`;
+    const scoreLine=score&&(f?.started?`${f.paused?'PAUSED':f.playing?'PLAY':f.draining?'TAIL':'ENDED'} ${score.sections.length?section(f.current):'arrangement'}${f.pending?' → '+section(f.pending):''}  ${hex(f.order)}:${hex(f.row)}`:f?.bound?'INTERACTIVE · STOPPED':'INTERACTIVE · CHOOSE SECTION');
+    this.label(scoreLine||(s?`${s[8]?'PLAY':'IDLE'} ${hex(s[6])}:${hex(s[7])}  ${s[9]} BPM / ${s[10]} TICKS`:(m.ready?'ENGINE READY':'ENGINE LOADING')),rect(x,y,w-x-5,28),ink.accent,11);
     y+=34;x=5;
     for(const [id,label,value,max] of [['octave','Oct',m.octave,8],['instrument','Ins',m.instrument,s?.[4]||0]]) {
       this.label(`${label} ${id==='instrument'?hex(value):value}`,rect(x,y,55,24),ink.dim);
@@ -146,15 +149,18 @@ export class TrackerCanvas {
     const bodyH=Math.max(0,bottom-y),orderH=Math.floor(bodyH*(narrow?.43:1));
     this.orders=rect(4,y+25,left-8,Math.max(0,orderH-29));
     const insX=narrow?4:w-right+4,insY=narrow?y+orderH:y,insW=(narrow?left:right)-8;
-    this.instruments=rect(insX,insY+25,insW,Math.max(0,bottom-insY-(narrow?103:180)));
+    this.instruments=rect(insX,insY+25,insW,Math.max(0,bottom-insY-(score?30:narrow?103:180)));
     this.fill(rect(0,y,left,bodyH),ink.panel);this.label('ORDER : PAT',rect(0,y,left,23),ink.dim,11);
     this.fill(rect(insX-4,insY,insW+8,bottom-insY),ink.panel);
-    this.label(narrow?'INSTRUMENTS':'INSTRUMENT / NAME',rect(insX,insY,insW,23),ink.dim,11);
+    this.label(score?'INTERACTIVE SCORE':narrow?'INSTRUMENTS':'INSTRUMENT / NAME',rect(insX,insY,insW,23),ink.dim,11);
     this.grid=rect(left,y+28,Math.max(0,w-left-right-12),Math.max(0,bodyH-40));
     this.raster=rect(this.grid.x+this.gutter,this.grid.y,Math.max(0,this.grid.w-this.gutter),this.grid.h);
     this.limits();
     if(ready) {
       this.list(this.orders,m.snapshot.orders,this.orderScroll,(p,i)=>`${hex(i)} : ${hex(p)}`,m.order,'order',i=>this.action('order',i));
+      if(score) {this.scorePanel(this.instruments);this.pattern();}
+    }
+    if(ready&&!score) {
       this.list(this.instruments,m.snapshot.instruments,this.insScroll,(ins,i)=>`${hex(i+1)} ${ins.name||'(unnamed)'}`,m.instrument-1,'ins',i=>this.setEntry('instrument',i+1));
       const info=m.snapshot.instruments[m.instrument-1],infoY=this.instruments.y+this.instruments.h+6;
       this.label(`INS ${hex(m.instrument)}`,rect(insX,infoY,insW,22),ink.accent);
@@ -184,6 +190,44 @@ export class TrackerCanvas {
     this.label(m.description || this.hits.find(hit=>hit.id===this.hover)?.tip || 'Space play/pause · Arrows move · F1 help · Shift+wheel channels',rect(0,h-21,w,21),ink.dim,10);
     if(document.activeElement===this.canvas) this.edge(rect(0,0,w,h),ink.line);
     if(m.help || m.confirm) this.overlay();
+  }
+  // Score panel rows share the instrument list's rect and scroll, so wheel and
+  // touch scrolling work unchanged. Every value shown is runtime feedback.
+  scorePanel(r) {
+    const m=this.m,score=m.snapshot.score,f=m.feedback,rows=[],pct=v=>`${Math.round(v*100)}%`;
+    const section=id=>score.sections.find(s=>s.id===id)?.name||`#${id}`;
+    rows.push({text:f?.bound?`GEN ${f.generation}${f.stale?` · ${f.stale} stale`:''}`:'Choose an initial section',color:f?.bound?ink.dim:ink.warn});
+    if(score.sections.length)rows.push({text:f?.started?'SECTIONS · click requests':'SECTIONS · click sets entry',color:ink.dim});
+    for(const s of score.sections) {
+      const mark=f?.started?(f.current===s.id?'▶':f.pending===s.id?'→':' '):(f?.bound&&f.initial===s.id?'•':' ');
+      rows.push({id:'section'+s.id,text:`${mark} ${s.name} #${s.id}`,on:mark!==' ',fn:()=>this.action('section',s.id),
+        tip:`${s.name}: ${s.loops?'loops':'stops'} at its end · requests wait for the next ${['row','beat','bar'][s.quantization]}`});
+    }
+    if(score.controls.length)rows.push({text:'CONTROLS · held / applied',color:ink.dim});
+    for(const c of score.controls) {
+      const p=f?.controls.find(x=>x.id===c.id);
+      rows.push({id:'control'+c.id,text:`${c.name} ${p?pct(p.held)+' / '+hex(p.applied):'--'}`,
+        buttons:[['−',()=>this.action('control',{id:c.id,delta:-.125})],['+',()=>this.action('control',{id:c.id,delta:.125})]]});
+    }
+    if(score.layers.length)rows.push({text:'LAYERS · current → target',color:ink.dim});
+    for(const l of score.layers) {
+      const p=f?.layers.find(x=>x.id===l.id),target=p?(p.held?p.heldValue:p.target):l.gain;
+      const ms=p?.remaining?` ${Math.ceil(p.remaining*1000/m.rate)}ms`:'';
+      rows.push({id:'layer'+l.id,text:`${l.name} ${p?pct(p.current)+' → '+pct(target)+ms:'--'}`,buttons:[[target>.5?'Off':'On',()=>this.action('layer',l.id)]]});
+    }
+    rows.push({text:`CUES${f?.cueDrops?` · ${f.cueDrops} dropped`:''}`,color:ink.dim});
+    for(const c of [...m.cues].reverse())
+      rows.push({text:`${score.cues.find(x=>x.id===c.id)?.name||'#'+c.id} · ${section(c.section)} T${c.traversal} @${c.clock}`});
+    const max=Math.max(0,rows.length*this.pitch-r.h);this.insScroll=clamp(this.insScroll,max);
+    this.clip(r,()=>rows.forEach((row,i)=>{
+      const y=r.y+i*this.pitch-this.insScroll,inside=y>=r.y&&y+this.pitch<=r.y+r.h,bw=(row.buttons?.length||0)*30;
+      if(y+this.pitch<r.y||y>r.y+r.h)return;
+      const box=rect(r.x,y,r.w-5-bw,this.pitch);
+      if(row.on)this.fill(box,ink.select);
+      this.label(row.text,box,row.color||(row.on?ink.accent:ink.text),11);
+      if(row.fn)this.hit(row.id,box,row.fn,inside,row.tip);
+      row.buttons?.forEach(([label,fn],k)=>this.button(`${row.id}:${k}`,label,rect(r.x+r.w-5-bw+k*30,y+1,28,this.pitch-2),fn,false,inside&&!!f?.bound));
+    }));
   }
   list(r,items,scroll,label,selected,prefix,fn) {
     const max=Math.max(0,items.length*this.pitch-r.h);

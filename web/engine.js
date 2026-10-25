@@ -1,5 +1,11 @@
 // Shared worklet/test adapter. C++ owns the song and all playback state.
 export const PATTERN_CHUNK_ROWS = 8;
+// Score commands per message: every control (32) and layer (16) plus one section
+// request, i.e. the coalesced identities a UI transaction can hold.
+export const MAX_SCORE_COMMANDS = 49;
+export const STATUS = ['ok', 'invalid', 'unsupported', 'stale', 'missing-section', 'invalid-rate', 'invalid-sequence'];
+const KIND = {control: 0, layer: 1, section: 2};
+const RECORD = {1: 'controls', 2: 'layers', 3: 'sections', 4: 'cues'};
 export class Engine {
   constructor(module, rate) {
     this.api = new WebAssembly.Instance(module, {
@@ -11,7 +17,45 @@ export class Engine {
     if (!this.api.web_demo(rate)) throw new Error('Supported sample rates: 8–96 kHz');
     this.audio = new Float64Array(this.api.memory.buffer, this.api.web_audio(), 256);
   }
-  state() { return Array.from({length: 14}, (_, i) => this.api.web_info(i)); }
+  state() { return Array.from({length: 15}, (_, i) => this.api.web_info(i)); }
+  // Names and fields come from the adopted module's score, decoded off render.
+  score() {
+    const a = this.api, out = {generation: 0, controls: [], layers: [], sections: [], cues: []};
+    for (let i = 0; i < a.web_score_count(); i++) {
+      const f = k => a.web_score_info(i, k), kind = RECORD[f(0)];
+      const entry = {id: f(1), name: this.string(a.web_score_name(i))};
+      if (kind === 'controls') Object.assign(entry, {macro: f(2), value: f(3) / 65535});
+      if (kind === 'layers') Object.assign(entry, {mask: f(2), gain: f(3) / 65535, fadeMs: f(4)});
+      if (kind === 'sections') Object.assign(entry, {first: f(2), end: f(3), bpm: f(4), speed: f(5), quantization: f(6), loops: !!f(7), carry: !!f(8)});
+      if (kind === 'cues') Object.assign(entry, {section: f(2), row: f(3), type: f(4), strength: f(5)});
+      out[kind].push(entry);
+    }
+    return out;
+  }
+  // One audio-owned Position copy plus every queued cue (at most the runtime's 256).
+  feedback() {
+    const a = this.api, bound = !!a.web_ia_snapshot(), i = (f, k = 0) => a.web_ia_info(f, k);
+    const cues = [];
+    while (cues.length < 256 && a.web_ia_pop()) {
+      const c = f => a.web_ia_cue(f);
+      cues.push({generation: c(0), sequence: c(1), clock: c(2), traversal: c(3), id: c(4), section: c(5), offset: c(6), type: c(7), strength: c(8)});
+    }
+    return {bound, generation: i(0), clock: i(1), traversal: i(2), accepted: i(3), current: i(4), pending: i(5),
+      rowOffset: i(6), cueDrops: i(7), order: i(8), row: i(9), playing: !!i(10), paused: !!i(11), draining: !!i(12),
+      initial: i(25), started: !!i(26), stale: i(27),
+      controls: Array.from({length: i(13)}, (_, k) => ({id: i(15, k), held: i(16, k) / 65535, applied: i(17, k)})),
+      layers: Array.from({length: i(14)}, (_, k) => ({id: i(18, k), current: i(19, k), target: i(20, k), remaining: i(21, k),
+        held: !!i(22, k), heldValue: i(23, k) / 65535, heldFadeMs: i(24, k)})),
+      cues};
+  }
+  // Applies a bounded, already-coalesced batch in producer order before the next
+  // render quantum. Each result is the runtime's verdict; nothing is retried.
+  scoreCommands(commands) {
+    if (!Array.isArray(commands) || commands.length > MAX_SCORE_COMMANDS) throw new Error('Score command batch out of bounds');
+    return commands.map(({kind, generation, sequence, id, value = 0, fadeMs = 0}) =>
+      KIND[kind] === undefined ? 'invalid' :
+        STATUS[this.api.web_ia_command(KIND[kind], generation, sequence, id, value, fadeMs)] ?? 'invalid');
+  }
   string(ptr) {
     const bytes = new Uint8Array(this.api.memory.buffer, ptr);
     // AudioWorkletGlobalScope has no TextDecoder. Library labels are UTF-8;
@@ -77,7 +121,7 @@ export class Engine {
     const channels = Array.from({length: state[0]}, (_, c) => c).filter(c => usedMask & (1 << c));
     // An empty song still needs a place to enter its first note.
     if (!channels.length) channels.push(0);
-    return {state, instruments, usedMask, channels,
+    return {state, instruments, usedMask, channels, score: state[14] ? this.score() : null,
       fx: this.api.web_fx() ? new Uint8Array(this.api.memory.buffer,this.api.web_fx(),
         state[1]*state[2]*(state[0]*state[12]+state[13])*2).slice() : new Uint8Array(),
       orders: new Uint8Array(this.api.memory.buffer, this.api.web_orders(), state[3]).slice(),
@@ -94,10 +138,30 @@ export class Engine {
       const bytes = new Uint8Array(args[0]);
       if (bytes.length > a.web_capacity()) throw new Error('File exceeds 16 MiB limit');
       new Uint8Array(a.memory.buffer, a.web_input(), bytes.length).set(bytes);
-      const loaded = a.web_load(bytes.length);
-      if (loaded === -2) throw new Error('This module requires interactive music support, which is not available in this player yet.');
-      if (!loaded) throw new Error('Invalid, unsupported or over-budget ntrk/MOD/XM file');
+      let loaded = a.web_load(bytes.length);
+      // A score never plays as an ordinary song: it either binds to the
+      // interactive runtime or is refused with the reason.
+      if (loaded === -2) {
+        loaded = a.web_load_interactive(bytes.length);
+        if (loaded === -3) throw new Error('This interactive score needs a newer profile or capability than this player supports.');
+        if (loaded === -5) throw new Error('Interactive scores need a 44.1, 48 or 96 kHz audio device.');
+      }
+      if (loaded !== 1) throw new Error('Invalid, unsupported or over-budget ntrk/MOD/XM file');
       return this.snapshot();
+    }
+    if (type === 'select') {
+      const status = a.web_ia_select(args[0]);
+      if (status === -1) throw new Error('Stop playback before choosing the initial section');
+      if (status) throw new Error(status === 4 ? 'No such section in this score' : `Section refused: ${STATUS[status]}`);
+      return {state: this.state(), feedback: this.feedback()};
+    }
+    if (type === 'score') return {results: this.scoreCommands(args[0]), feedback: this.feedback()};
+    if (type === 'feedback') return {state: this.state(), feedback: this.feedback()};
+    if (this.state()[14] && type === 'edit') throw new Error('Interactive scores are read-only in this player');
+    if (this.state()[14] && type === 'transport') {
+      if (args[0] === 3) throw new Error('Interactive scores move by section requests, not seeking');
+      if (!a.web_transport(...args)) throw new Error('Choose an initial section first');
+      return this.state();
     }
     if (type === 'save') {
       const size = a.web_save();

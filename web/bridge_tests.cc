@@ -1,9 +1,21 @@
 #include "bridge.cc"
+#include "../test_support/interactive_fixture.h"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <new>
 #include <string>
 #include <algorithm>
+
+static size_t g_allocations = 0;
+void *operator new(size_t n) {
+  ++g_allocations;
+  if (void *p = std::malloc(n ? n : 1)) return p;
+  throw std::bad_alloc();
+}
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete(void *p, size_t) noexcept { std::free(p); }
 
 void save_fixture(const char *directory, const char *name, int mask) {
   assert(web_used_channels() == mask);
@@ -220,6 +232,205 @@ void test_active_counts(const char* directory) {
   }
 }
 
+// One procedural score and one command script drive both the standalone
+// runtime reference and the bridge; the WASM test replays the written script.
+const char *kInteractiveScript =
+    "0 play\n20 layer 2 0.25 40\n45 control 1 0\n60 section 4\n140 pause\n"
+    "150 layer 2 1 0\n160 play\n200 section 3\n230 control 1 0.5\n260 stop\n270 play\n";
+const int kInteractiveQuanta = 320, kCueFields = 8, kMaxTraceCues = 1024;
+struct Step { int quantum; char op[16]; double a, b, c; };
+std::vector<Step> interactive_steps() {
+  std::vector<Step> steps;
+  for (const char *line = kInteractiveScript; *line;) {
+    Step s = Step();
+    assert(std::sscanf(line, "%d %15s %lf %lf %lf", &s.quantum, s.op, &s.a, &s.b, &s.c) >= 2);
+    steps.push_back(s); line = std::strchr(line, '\n') + 1;
+  }
+  return steps;
+}
+struct Trace {
+  std::vector<float> audio = std::vector<float>(kInteractiveQuanta * 256);
+  uint64_t cues[kMaxTraceCues][kCueFields] = {};
+  int count = 0;
+  void cue(const ia::CueEvent &e) {
+    assert(count < kMaxTraceCues);
+    const uint64_t row[kCueFields] = {e.clock, e.id, e.section, e.traversal, e.sequence, e.sample_offset, e.type, e.strength};
+    std::memcpy(cues[count++], row, sizeof row);
+  }
+};
+ntrk::Player ref_player; ntrk::mix::Mixer ref_mixer; ia::Runtime ref_runtime; ia::RuntimeBinding ref_binding;
+// Direct runtime calls only: always renders, so paused/stopped silence comes
+// from the runtime itself rather than the bridge's transport gate.
+void standalone_trace(const ntrk::Module &m, Trace *t) {
+  const uint64_t gen = 7; uint64_t seq = 0; bool started = false;
+  assert(ref_binding.compile(m, gen, capabilities(), 3) == ia::Status::Ok);
+  ref_player = ntrk::Player(); ref_mixer = ntrk::mix::Mixer();
+  assert(ref_runtime.bind(ref_binding, ref_player, ref_mixer, gen, 48000) == ia::Status::Ok);
+  const std::vector<Step> steps = interactive_steps();
+  for (int q = 0; q < kInteractiveQuanta; ++q) {
+    for (const Step &s : steps) {
+      if (s.quantum != q) continue;
+      const std::string op = s.op; uint16_t v = 0;
+      if (op == "play") {
+        const ia::Position p = ref_runtime.position();
+        if (!started || (!p.playing && !p.draining)) {
+          ref_runtime.unbind();
+          assert(ref_runtime.bind(ref_binding, ref_player, ref_mixer, gen, 48000) == ia::Status::Ok);
+          started = true;
+        }
+        ref_runtime.pause(false);
+      } else if (op == "pause") ref_runtime.pause(true);
+      else if (op == "stop") { assert(ref_runtime.stop(false) == ia::Status::Ok); started = false; }
+      else if (op == "control") { assert(ia::normalized(float(s.b), &v)); assert(ref_runtime.control(gen, ++seq, uint32_t(s.a), v) == ia::Status::Ok); }
+      else if (op == "layer") { assert(ia::normalized(float(s.b), &v)); assert(ref_runtime.layer(gen, ++seq, uint32_t(s.a), v, uint16_t(s.c)) == ia::Status::Ok); }
+      else if (op == "section") assert(ref_runtime.request_section(gen, ++seq, uint32_t(s.a)) == ia::Status::Ok);
+      else assert(!"unknown script op");
+    }
+    double out[256] = {};
+    assert(ref_runtime.render(out, 128, 2, 48000) == ia::Status::Ok);
+    for (int i = 0; i < 256; ++i) t->audio[q * 256 + i] = float(out[i]);
+    ia::CueEvent e;
+    while (ref_runtime.pop_cue(&e)) t->cue(e);
+  }
+  ref_runtime.unbind();
+}
+// The bridge path, measured for heap allocation across commands, render and feedback.
+void bridge_trace(Trace *t) {
+  const std::vector<Step> steps = interactive_steps();
+  const double gen = web_ia_info(0, 0); double seq = 0;
+  const size_t allocations = g_allocations;
+  for (int q = 0; q < kInteractiveQuanta; ++q) {
+    for (const Step &s : steps) {
+      if (s.quantum != q) continue;
+      if (!std::strcmp(s.op, "play")) assert(web_transport(1, 0, 0));
+      else if (!std::strcmp(s.op, "pause")) assert(web_transport(2, 0, 0));
+      else if (!std::strcmp(s.op, "stop")) assert(web_transport(0, 0, 0));
+      else if (!std::strcmp(s.op, "control")) assert(web_ia_command(0, gen, ++seq, int(s.a), s.b, 0) == 0);
+      else if (!std::strcmp(s.op, "layer")) assert(web_ia_command(1, gen, ++seq, int(s.a), s.b, int(s.c)) == 0);
+      else if (!std::strcmp(s.op, "section")) assert(web_ia_command(2, gen, ++seq, int(s.a), 0, 0) == 0);
+    }
+    assert(web_render(128));
+    for (int i = 0; i < 256; ++i) t->audio[q * 256 + i] = float(audio[i]);
+    while (web_ia_pop()) t->cue(cue);
+    web_ia_snapshot();
+  }
+  assert(g_allocations == allocations);
+}
+std::vector<uint8_t> saved_module(const ntrk::Module &m) {
+  size_t size = 0; assert(ntrk::module_save(&m, nullptr, 0, &size));
+  std::vector<uint8_t> bytes(size); assert(ntrk::module_save(&m, bytes.data(), size, &size));
+  return bytes;
+}
+int load_bytes(const std::vector<uint8_t> &bytes, bool score_path) {
+  std::memcpy(web_input(), bytes.data(), bytes.size());
+  return score_path ? web_load_interactive(int(bytes.size())) : web_load(int(bytes.size()));
+}
+bool current_song_is(const std::vector<uint8_t> &bytes) {
+  const int size = web_save();
+  return size == int(bytes.size()) && !std::memcmp(web_input(), bytes.data(), bytes.size());
+}
+void write_file(const char *directory, const char *name, const void *data, size_t size) {
+  const std::string path = std::string(directory) + "/" + name;
+  FILE *file = std::fopen(path.c_str(), "wb"); assert(file);
+  assert(std::fwrite(data, 1, size, file) == size); assert(!std::fclose(file));
+}
+static ntrk_test::InteractiveFixture *score_fixture(bool loop) {
+  // Fixtures point into themselves: construct in place, never copy.
+  static ntrk_test::InteractiveFixture looping(2, 2, true, true), ending(2, 2, false, false);
+  ntrk_test::InteractiveFixture *f = loop ? &looping : &ending;
+  f->notes[1 * 2 + 1].note = 20; f->notes[1 * 2 + 1].instrument = 1;
+  f->notes[3 * 2 + 0].note = 18; f->notes[3 * 2 + 0].instrument = 1;
+  f->encode();
+  return f;
+}
+void test_interactive(const char *directory) {
+  using ia::Status;
+  const std::vector<uint8_t> score = saved_module(score_fixture(true)->module);
+  assert(web_demo(48000));
+  const std::vector<uint8_t> demo(web_input(), web_input() + web_save());
+  // Ordinary loading still refuses; the explicit path adopts without playing.
+  assert(load_bytes(score, false) == -2 && current_song_is(demo));
+  assert(load_bytes(demo, true) == 0 && current_song_is(demo)); // no ordinary song as a score
+  assert(web_ia_command(0, 1, 1, 1, 0.5, 0) == int(Status::Stale));
+  assert(load_bytes(score, true) == 1 && web_info(14) == 1 && current_song_is(score));
+  assert(!web_ia_snapshot() && !web_transport(1, 0, 0)); // sections need an explicit initial choice
+  assert(web_score_count() == 8 && web_score_info(2, 0) == ntrk::kImusSection && web_score_info(2, 1) == 3);
+  assert(!std::strcmp(web_score_name(2), "test") && web_score_info(2, 2) == 0 && web_score_info(2, 3) == 2);
+  assert(web_score_info(1, 0) == ntrk::kImusLayer && web_score_info(1, 2) == 3 && web_score_info(9, 0) == -1);
+  assert(web_ia_select(99) == int(Status::MissingSection) && !web_ia_snapshot());
+  assert(web_ia_select(3) == 0 && web_ia_snapshot() && web_ia_info(25, 0) == 3);
+  assert(!web_edit(0, 0, 0, 0, 25) && !web_transport(3, 0, 0) && current_song_is(score));
+  // Bridge output and cues equal direct runtime calls on the same saved bytes.
+  ntrk::Module reference; ntrk::ModuleLoadError error;
+  assert(ntrk::module_load_ex(&reference, score.data(), score.size(), ntrk::ModuleLoadMode::InteractiveV1, &error));
+  static Trace expected, actual;
+  standalone_trace(reference, &expected);
+  bridge_trace(&actual);
+  assert(actual.audio == expected.audio && actual.count == expected.count);
+  assert(!std::memcmp(actual.cues, expected.cues, sizeof(uint64_t) * kCueFields * size_t(expected.count)));
+  double energy = 0; for (float x : expected.audio) { assert(std::isfinite(x)); energy += double(x) * x; }
+  bool fourth = false, retraversed = false;
+  for (int i = 0; i < expected.count; ++i) {
+    fourth = fourth || expected.cues[i][2] == 4;
+    retraversed = retraversed || (expected.cues[i][2] == 3 && expected.cues[i][3] > 1);
+  }
+  assert(energy > 0 && expected.count >= 6 && fourth && retraversed);
+  // Silence while paused (quanta 140..159) and right after the stop at 260.
+  for (int i = 141 * 256; i < 160 * 256; ++i) assert(expected.audio[i] == 0);
+  if (directory) {
+    write_file(directory, "interactive.ntrk", score.data(), score.size());
+    write_file(directory, "interactive-script.txt", kInteractiveScript, std::strlen(kInteractiveScript));
+    write_file(directory, "interactive.f32", expected.audio.data(), expected.audio.size() * sizeof(float));
+    write_file(directory, "interactive-cues.bin", expected.cues, sizeof(uint64_t) * kCueFields * size_t(expected.count));
+  }
+  // Sequencing, normalization and selection bounds.
+  const double gen = web_ia_info(0, 0);
+  assert(web_ia_command(0, gen, 100, 1, 0.5, 0) == 0);
+  assert(web_ia_command(0, gen, 100, 1, 0.5, 0) == int(Status::InvalidSequence));
+  assert(web_ia_command(0, gen, 101, 1, std::nan(""), 0) == int(Status::Invalid));
+  assert(web_ia_command(1, gen, 101, 2, 1.5, 0) == int(Status::Invalid));
+  assert(web_ia_command(1, gen, 101, 2, 1, 70000) == int(Status::Invalid));
+  assert(web_ia_command(0, gen, 101, 99, 0.5, 0) == int(Status::Invalid));
+  assert(web_ia_command(0, gen, 0.5, 1, 0.5, 0) == int(Status::Invalid));
+  assert(web_ia_select(4) == -1); // initial selection only while stopped
+  // Reload publishes a new generation; commands for the old one are refused.
+  const uint32_t stale = uint32_t(web_ia_info(27, 0));
+  assert(load_bytes(score, true) == 1 && web_ia_select(3) == 0 && web_ia_info(0, 0) > gen);
+  assert(web_ia_command(0, gen, 200, 1, 0.5, 0) == int(Status::Stale) && web_ia_info(27, 0) == stale + 1);
+  assert(web_ia_command(0, web_ia_info(0, 0), 1, 1, 0.5, 0) == 0);
+  // Unsupported required profiles refuse distinctly and keep the current score.
+  ntrk_test::InteractiveFixture future(2, 2, true, true);
+  future.records[0].version = 2; future.records[0].flags = 1; future.encode();
+  const std::vector<uint8_t> unsupported = saved_module(future.module);
+  assert(load_bytes(unsupported, false) == -2 && load_bytes(unsupported, true) == -3);
+  if (directory) write_file(directory, "interactive-future.ntrk", unsupported.data(), unsupported.size());
+  assert(current_song_is(score) && web_ia_snapshot());
+  // A section that stops at its end leaves playback ended; Play re-enters it.
+  const std::vector<uint8_t> ending = saved_module(score_fixture(false)->module);
+  assert(load_bytes(ending, true) == 1 && web_ia_select(3) == 0 && web_transport(1, 0, 0));
+  for (int q = 0; q < 40; ++q) web_render(128);
+  web_ia_snapshot(); assert(!web_ia_info(10, 0) && web_info(8));
+  for (double x : audio) assert(x == 0);
+  assert(web_transport(1, 0, 0) && web_render(128)); web_ia_snapshot();
+  assert(web_ia_info(10, 0) && web_ia_info(1, 0) == 128);
+  // Section-less scores bind at load and control the ordinary arrangement.
+  ntrk_test::InteractiveFixture plain(2, 2, true, true); plain.count = 2; plain.encode();
+  assert(load_bytes(saved_module(plain.module), true) == 1 && web_ia_snapshot() && web_ia_info(25, 0) == 0);
+  assert(web_transport(1, 0, 0)); energy = 0;
+  for (int q = 0; q < 20; ++q) { web_render(128); for (double x : audio) energy += x * x; }
+  assert(energy > 0);
+  // Unsupported device rate refuses before adoption.
+  assert(web_demo(22050));
+  const std::vector<uint8_t> slow(web_input(), web_input() + web_save());
+  assert(load_bytes(score, true) == -5 && current_song_is(slow));
+  // Ordinary adoption retires the runtime; later score commands are stale.
+  assert(web_demo(48000) && load_bytes(score, true) == 1 && web_ia_select(3) == 0 && web_transport(1, 0, 0));
+  assert(load_bytes(demo, false) == 1 && !web_ia_snapshot() && !web_info(14));
+  assert(web_ia_command(0, web_ia_info(0, 0), 999, 1, 0.5, 0) == int(Status::Stale) && !web_score_count());
+  assert(web_transport(1, 0, 0) && web_render(128));
+  std::puts("web interactive: explicit path/initial section, standalone-runtime audio+cue parity, zero render allocation, sequencing, stale reload, unsupported profile/rate, end/restart, section-less, ordinary retirement passed");
+}
+
 int main(int argc, char **argv) {
   assert(!web_demo(0));
   assert(web_demo(48000));
@@ -330,6 +541,7 @@ int main(int argc, char **argv) {
   test_channel_usage(argc > 1 ? argv[1] : nullptr);
   test_command_metadata(argc > 1 ? argv[1] : nullptr);
   test_large_geometry(argc > 1 ? argv[1] : nullptr);
+  test_interactive(argc > 1 ? argv[1] : nullptr);
   if (argc > 1) {
     assert(web_demo(48000));
     uint8_t orders[128] = {}; song.order = orders; song.order_count = 128;

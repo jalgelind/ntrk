@@ -107,6 +107,9 @@ forward 256 cues and 128 position snapshots; drain snapshots to the latest one.
 `interactiveCueDrops()` and `interactivePositionDrops()` expose host ring pressure;
 position snapshots also acknowledge the last accepted command sequence.
 These APIs are available to later UI/host work; ordinary Play does not opt in.
+The bundled web player binds this runtime directly in its AudioWorklet bridge
+(explicit path, coalesced generation/sequence-tagged batches, feedback read
+between render calls); see [web/README.md](web/README.md#interactive-scores).
 
 Tests are procedural and require no sample files. The standalone mixer suite
 covers runtime behavior, and tracker RT tests cover publication, queues, zero

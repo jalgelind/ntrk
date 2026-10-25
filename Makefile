@@ -113,7 +113,9 @@ WEB_OUT := $(OUT)/web
 # Optional host-owned song. No parent checkout dependency in the standalone build.
 WEB_DEMO ?=
 WEB_DEMO_NAME ?=
-WEB_EXPORTS := web_fx web_cell_text web_instrument_pan web_capacity web_input web_patterns web_orders web_audio web_demo web_load web_save web_info web_edit web_transport web_mute web_render web_instrument_name web_instrument_volume web_used_channels
+WEB_EXPORTS := web_fx web_cell_text web_instrument_pan web_capacity web_input web_patterns web_orders web_audio web_demo web_load web_save web_info web_edit web_transport web_mute web_render web_instrument_name web_instrument_volume web_used_channels \
+  web_load_interactive web_ia_select web_ia_command web_ia_snapshot web_ia_info web_ia_pop web_ia_cue \
+  web_score_count web_score_info web_score_name
 .PHONY: web test-web
 web: $(WEB_OUT)/ntrk.wasm web-demo
 	python3 web/version_assets.py "$(WEB_OUT)"
@@ -127,7 +129,8 @@ web-demo:
 
 $(WEB_OUT)/ntrk.wasm: web/bridge.cc $(HDRS) $(LIB_CC)
 	@mkdir -p $(WEB_OUT)
-	$(EMXX) -std=c++11 -O2 -Wall -Wextra -ffp-contract=off web/bridge.cc -o $@ \
+# NDEBUG: the standalone module imports no stdio; release paths never rely on assert.
+	$(EMXX) -std=c++11 -O2 -Wall -Wextra -ffp-contract=off -DNDEBUG web/bridge.cc -o $@ \
 	  --no-entry -sSTANDALONE_WASM -sFILESYSTEM=0 -sINITIAL_MEMORY=134217728 \
 	  -sSTACK_SIZE=1048576 -sALLOW_MEMORY_GROWTH=0 \
 	  $(foreach fn,$(WEB_EXPORTS),-Wl,--export=$(fn))

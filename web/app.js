@@ -2,16 +2,21 @@ import {TrackerCanvas,fieldLayout} from './canvas.js';
 import {PATTERN_CHUNK_ROWS} from './engine.js';
 const canvas=document.getElementById('tracker'),open=document.getElementById('open');
 const m={snapshot:null,state:null,order:0,row:0,channel:0,field:0,dirty:false,nibble:'',busy:false,ready:false,volume:1,level:0,
-  octave:2,instrument:1,edit:false,follow:true,help:false,confirm:null,name:'Module player',message:'Loading audio engine…',error:false};
+  octave:2,instrument:1,edit:false,follow:true,help:false,confirm:null,name:'Module player',message:'Loading audio engine…',error:false,
+  feedback:null,cues:[],rate:48000};
 let ctx,node,gain,analysers,seq=0,demo,configReady,queue=Promise.resolve(),queued=0;
 const pending=new Map();
+// Score commands: one producer, coalesced by identity (latest value wins), at most
+// one batch in flight, each tagged with the bound generation and a strictly
+// increasing sequence. A batch for a replaced generation is refused as stale.
+const staged=new Map();let scoreSeq=0,scoreInflight=false;
 let loadGeneration=0,patternSerial=0,descriptionSerial=0,editSerial=0;
 const view=new TrackerCanvas(canvas,m,(type,arg)=>{if(type==='open'){open.click();return;}if(type==='transport')ctx?.resume();enqueue(()=>action(type,arg));});
 function status(message,error=false) {m.message=message;m.error=error;view.invalidate();}
 function request(type,args=[]) {
   return new Promise((resolve,reject)=>{
     const id=++seq;
-    const mutation=['load','demo','edit','transport','mute'].includes(type);
+    const mutation=['load','demo','edit','transport','mute','select','score'].includes(type);
     const timer=setTimeout(()=>{
       // A committed load must be acknowledged, never abandoned behind an old UI.
       if(mutation){status('Waiting for audio engine…');return;}
@@ -83,8 +88,40 @@ function updateState(s) {
   }
   view.invalidate();
 }
+function applyFeedback(feedback) {
+  if(!m.snapshot?.score)return;
+  m.feedback=feedback;
+  if(feedback.cues.length)m.cues=[...m.cues,...feedback.cues].slice(-6);
+  view.invalidate();
+}
+function stage(kind,id,value=0,fadeMs=0) {
+  const key=kind==='section'?kind:`${kind}:${id}`;
+  staged.delete(key);staged.set(key,{kind,id,value,fadeMs});flush();
+}
+function stagedValue(kind,id) {return staged.get(`${kind}:${id}`)?.value;}
+async function flush() {
+  if(scoreInflight||!staged.size)return;
+  const generation=m.feedback?.bound?m.feedback.generation:0;
+  if(!generation){staged.clear();status('Choose an initial section first',true);return;}
+  const batch=[...staged.values()].map(c=>({...c,generation,sequence:++scoreSeq}));
+  staged.clear();scoreInflight=true;
+  try {
+    const {results,feedback}=await request('score',[batch]);
+    if(feedback.generation===generation)applyFeedback(feedback);
+    const refused=results.find(r=>r!=='ok');
+    if(refused)status(refused==='stale'?'Score command for a replaced song was ignored':`Score command refused: ${refused}`,refused!=='stale');
+  } catch(error){status(error.message,true);}
+  finally{scoreInflight=false;flush();}
+}
+async function refreshFeedback() {
+  if(!m.snapshot?.score)return;
+  const snapshot=m.snapshot,{state,feedback}=await request('feedback');
+  if(snapshot!==m.snapshot)return;
+  updateState(state);applyFeedback(feedback);
+}
 async function adopt(result,name) {
   ++loadGeneration;++patternSerial;++descriptionSerial;m.description="";
+  staged.clear();m.feedback=null;m.cues=[];
   const decoder=new TextDecoder();
   result.instruments=result.instruments.map(ins=>({name:decoder.decode(ins.nameBytes),pan:ins.pan,volume:ins.volume}));
   // Keep this load's channel list stable through edits, including clearing its
@@ -92,7 +129,9 @@ async function adopt(result,name) {
   m.snapshot=result;m.state=result.state;m.order=m.row=m.field=0;m.channel=result.channels[0];m.nibble='';
   m.instrument=m.state[4]?1:0;m.name=name;m.dirty=false;
   view.sx=view.sy=view.orderScroll=view.insScroll=0;
-  document.title=`ntrk · ${name}`;view.invalidate();await refreshPattern();
+  document.title=`ntrk · ${name}`;view.invalidate();
+  if(result.score)await refreshFeedback();
+  await refreshPattern();
 }
 async function loadDemo() {
   await configReady;
@@ -117,6 +156,7 @@ async function playPause(command) {
   // Resume synchronously in the originating pointer/key gesture.
   const resume=ctx.resume();await resume;
   updateState(await request('transport',[command,0,0]));
+  if(m.snapshot?.score){if(command===1&&!m.feedback?.playing)m.cues=[];await refreshFeedback();}
 }
 function discardThen(fn) {
   if(m.dirty) {m.confirm=()=>enqueue(fn);view.invalidate();}else return fn();
@@ -127,13 +167,32 @@ async function action(type,arg) {
   if(type==='step'){m[arg.id]=Math.max(arg.min,Math.min(arg.max,m[arg.id]+arg.delta));view.invalidate();return;}
   if(type==='entry'){m[arg.id]=arg.toggle?!m[arg.id]:arg.value;view.invalidate();return;}
   if(type==='volume'){m.volume=Math.max(0,Math.min(1,arg));gain.gain.setTargetAtTime(m.volume,ctx.currentTime,.008);view.invalidate();return;}
-  if(type==='seek'){m.follow=false;updateState(await request('transport',[3,m.order,arg]));return;}
+  if(type==='seek'){
+    if(m.snapshot?.score){status('Interactive scores move by section requests',true);return;}
+    m.follow=false;updateState(await request('transport',[3,m.order,arg]));return;
+  }
+  if(type==='section'&&m.snapshot?.score) {
+    const name=m.snapshot.score.sections.find(s=>s.id===arg)?.name||`#${arg}`;
+    if(m.feedback?.started){stage('section',arg);status(`Requested section ${name} at its next boundary`);return;}
+    const {state,feedback}=await request('select',[arg]);updateState(state);applyFeedback(feedback);
+    status(`Initial section ${name} · Play enters it`);return;
+  }
+  if(type==='control'&&m.feedback?.bound) {
+    const held=m.feedback.controls.find(c=>c.id===arg.id)?.held??0;
+    stage('control',arg.id,Math.max(0,Math.min(1,(stagedValue('control',arg.id)??held)+arg.delta)));return;
+  }
+  if(type==='layer'&&m.feedback?.bound) {
+    const layer=m.feedback.layers.find(l=>l.id===arg),authored=m.snapshot.score.layers.find(l=>l.id===arg);
+    const target=stagedValue('layer',arg)??(layer?.held?layer.heldValue:layer?.target??1);
+    stage('layer',arg,target>.5?0:1,authored?.fadeMs||0);return;
+  }
   if(type!=='demo'&&type!=='open'&&!m.snapshot)return;
   if(type==='open') {open.click();return;}
   if(type==='transport')return playPause(arg);
   if(type==='mute') {updateState(await request('mute',[arg]));return;}
   if(type==='order') {
     m.follow=false;m.order=arg;m.row=0;m.nibble='';view.sy=0;view.invalidate();
+    if(m.snapshot.score){await refreshPattern();return;} // browse only: sections own position
     // Observe both promises so neither failure becomes an unhandled rejection.
     const results=await Promise.allSettled([refreshPattern(),request('transport',[3,arg,0])]);
     if(results[1].status==='fulfilled')updateState(results[1].value);
@@ -205,6 +264,7 @@ async function keydown(event) {
     selectedDescription();view.reveal();return;
   }
   if(!m.edit||event.repeat)return;
+  if(m.snapshot.score){status('Interactive scores are read-only in this player');return;}
   if(m.channel<0||m.field>=4){status('Selected command lane · read only');return;}
   let value;
   if(key==='delete'||key==='backspace') {value=0;m.nibble='';}
@@ -246,6 +306,7 @@ run(async()=>{
   const response=await fetch('ntrk.wasm',{cache:'no-store'});if(!response.ok)throw new Error('Cannot load ntrk.wasm');
   const module=await WebAssembly.compile(await response.arrayBuffer());ctx=new AudioContext({sampleRate:48000});
   await ctx.audioWorklet.addModule('worklet.js');
+  m.rate=ctx.sampleRate;
   node=new AudioWorkletNode(ctx,'ntrk',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2],processorOptions:{module}});
   node.onprocessorerror=()=>{
     m.ready=false;m.snapshot=null;m.state=null;++loadGeneration;++patternSerial;++descriptionSerial;
@@ -282,6 +343,6 @@ run(async()=>{
     }
     if(level!==m.level){m.level=level;view.invalidate();}
     if(polling||!m.snapshot||ctx.state!=='running')return;polling=true;
-    run(async()=>{try{updateState(await request('state'));}finally{polling=false;}});
+    run(async()=>{try{if(m.snapshot.score)await refreshFeedback();else updateState(await request('state'));}finally{polling=false;}});
   },40);
 });
