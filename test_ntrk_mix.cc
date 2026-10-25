@@ -5001,7 +5001,6 @@ test_pan_deltas_follow_audible_rows() {
     CHECK(std::fabs(p.pan[0]-pan_from_byte(96))<1e-6f);
     tick(); // row 1 applies B/8xx/E8x
     if(source==3){ // first-ever config read DURING playback must apply this edit
-      CHECK(!mx.strip_synced);
       mix::config_set_channel_pan(m.mix,0,pan_from_byte(176));
       CHECK(mix::mixer_config_read(&mx,&m));
     }

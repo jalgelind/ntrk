@@ -91,7 +91,9 @@ FXPL and macro APIs. Meta `M01` means macro 1; `00` is no invocation, not PAN.
 Empty cells show dots; a valid command's zero parameter remains `00`. Arrows,
 hit testing and scrolling use the same fixed character geometry and true channel
 IDs. Only the displayed pattern is formatted (at most 256 rows ×149 command
-cells, with a 512-entry text cache); selected descriptions are fetched lazily.
+cells, with a 512-entry text cache), fetched in 8-row windows so the audio
+worklet renders between messages instead of formatting a whole pattern in one
+handler call; selected descriptions are fetched lazily.
 Order browsing and playback follow clear old command labels while fetching the
 next pattern, and stale replies cannot replace a newer selection or loaded song.
 Loads stay pending until acknowledged; a ten-second wait never leaves the old

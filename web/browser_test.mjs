@@ -35,7 +35,7 @@ try {
         window.delayedPatterns=[];window.delayedLoads=[];
         Object.defineProperty(this.port,'onmessage',{set(fn){descriptor.set.call(this,event=>{
           const result=event.data.result;
-          if(window.delayPatternReplies&&result?.rows&&Number.isInteger(result.pattern))
+          if(window.delayPatternReplies&&result?.rows&&result.start===0&&Number.isInteger(result.pattern))
             delayedPatterns.push({pattern:result.pattern,release:()=>fn(event)});
           else if(window.delayLoadReplies&&result?.cells&&result?.orders)
             delayedLoads.push(()=>fn(event));

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import {Engine} from './engine.js';
+import {Engine,PATTERN_CHUNK_ROWS} from './engine.js';
 const root=process.argv[2]||'out/web',fixtures=process.argv[3]||'out/web-fixtures';
 const module=await WebAssembly.compile(fs.readFileSync(path.join(root,'ntrk.wasm')));
 const engine=new Engine(module,48000);
@@ -21,8 +21,20 @@ assert.equal(snapshot.state[12],8);assert.equal(snapshot.state[13],5);
 assert(snapshot.fx.byteLength>13000000);
 const NativeMap=globalThis.Map;let peakCache=0;
 globalThis.Map=class extends NativeMap{set(k,v){super.set(k,v);peakCache=Math.max(peakCache,this.size);return this;}};
-let commands;
-try{commands=engine.command('pattern',[197]);}finally{globalThis.Map=NativeMap;}
+// The worklet handles one window per message, so the longest uninterrupted
+// audio-thread hold is the slowest single window, not the whole pattern.
+let commands={pattern:197,rows:[]},worstMs=0,windows=0;
+assert.throws(()=>engine.command('pattern',[197,0,PATTERN_CHUNK_ROWS+1]),/window/);
+try{
+  for(let start=0;start<snapshot.state[1];start+=PATTERN_CHUNK_ROWS){
+    const t=performance.now(),part=engine.command('pattern',[197,start,PATTERN_CHUNK_ROWS]);
+    worstMs=Math.max(worstMs,performance.now()-t);windows++;
+    assert.equal(part.start,start);assert(part.rows.length<=PATTERN_CHUNK_ROWS);
+    commands.rows.push(...part.rows);
+  }
+}finally{globalThis.Map=NativeMap;}
+// One 128-frame quantum at 48 kHz is 2.67 ms; a window must stay near that.
+assert(worstMs<8,`slowest pattern window ${worstMs.toFixed(2)} ms`);
 assert.equal(commands.rows.length,256);
 assert(commands.rows.every(row=>row.length===149&&row.every(s=>typeof s==='string')));
 assert(calls<=256*149);assert(peakCache<=512,'format cache bounded independently of song size');
@@ -38,11 +50,11 @@ calls=0;const reloaded=engine.command('load',[saved]);assert.equal(calls,0);
 assert.equal(reloaded.cells[((197*256+255)*16+15)*4+3],123);
 assert.deepEqual(Buffer.from(engine.command('save')),saved);
 engine.command('load',[fs.readFileSync(path.join(fixtures,'pattern-transition.ntrk'))]);
-assert.equal(engine.command('pattern',[0]).rows[0][0],'SOF');
-assert.equal(engine.command('pattern',[1]).rows[0][0],'PAN');
+assert.equal(engine.command('pattern',[0,0,1]).rows[0][0],'SOF');
+assert.equal(engine.command('pattern',[1,0,1]).rows[0][0],'PAN');
 engine.command('demo');assert.equal(engine.state()[12],0);
-assert.equal(engine.command('pattern',[0]).rows[0].length,16,'no FXPL means no fake FX lane');
-console.log(`WASM large geometry passed: ${original.length} bytes, ${256*149} formatted cells maximum, cache peak ${peakCache}, payload ${payload} bytes, exact load/edit/save`);
+assert.equal(engine.command('pattern',[0,0,1]).rows[0].length,16,'no FXPL means no fake FX lane');
+console.log(`WASM large geometry passed: ${original.length} bytes, ${256*149} formatted cells maximum, cache peak ${peakCache}, ${windows} windows of ${PATTERN_CHUNK_ROWS} rows (slowest ${worstMs.toFixed(2)} ms), payload ${payload} bytes, exact load/edit/save`);
 
 // Native bridge fixtures are independent audio references for every actual channel count.
 for(let channels=1;channels<=16;++channels) {

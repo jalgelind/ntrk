@@ -624,7 +624,6 @@ struct Mixer {
   uint8_t channel_output[kMaxChannels] = {};  // 0 = master, n = send n (a Bus)
   uint8_t send_output[kSends] = {};           // 0 = master, n = a higher send
   SendMode send_mode[kSends] = {};
-  bool     strip_synced = false; // configuration has been read at least once
   uint64_t strip_seen = 0;       // last player pan epoch seeded before sequencing
   uint16_t strip_pan_dirty = 0;               // channels whose stored pan a read changed
 

@@ -1030,7 +1030,6 @@ mixer_config_read(Mixer *mx, const uint8_t *block) {
     mx->send_output[s] = p[kMixrSendOutputAt + s];
     mx->send_mode[s] = (SendMode) p[kMixrSendModeAt + s];
   }
-  mx->strip_synced = true;
   return true;
 }
 

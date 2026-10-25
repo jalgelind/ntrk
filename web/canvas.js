@@ -164,7 +164,7 @@ export class TrackerCanvas {
       }
       if(!narrow) {
         this.label('Inspection only',rect(insX,infoY+71,insW,22),ink.dim,11);
-        this.label('FX lanes shown read-only',rect(insX,infoY+94,insW,20),ink.dim,11);
+        if(m.state[12]+m.state[13]>0)this.label('FX lanes shown read-only',rect(insX,infoY+94,insW,20),ink.dim,11);
         this.label('Instrument inspection',rect(insX,infoY+114,insW,20),ink.dim,11);
       }
       this.pattern();

@@ -1,10 +1,11 @@
 import {TrackerCanvas,fieldLayout} from './canvas.js';
+import {PATTERN_CHUNK_ROWS} from './engine.js';
 const canvas=document.getElementById('tracker'),open=document.getElementById('open');
 const m={snapshot:null,state:null,order:0,row:0,channel:0,field:0,dirty:false,nibble:'',busy:false,ready:false,volume:1,level:0,
   octave:2,instrument:1,edit:false,follow:true,help:false,confirm:null,name:'Module player',message:'Loading audio engine…',error:false};
 let ctx,node,gain,analysers,seq=0,demo,configReady,queue=Promise.resolve(),queued=0;
 const pending=new Map();
-let loadGeneration=0,patternSerial=0,descriptionSerial=0;
+let loadGeneration=0,patternSerial=0,descriptionSerial=0,editSerial=0;
 const view=new TrackerCanvas(canvas,m,(type,arg)=>{if(type==='open'){open.click();return;}if(type==='transport')ctx?.resume();enqueue(()=>action(type,arg));});
 function status(message,error=false) {m.message=message;m.error=error;view.invalidate();}
 function request(type,args=[]) {
@@ -35,8 +36,21 @@ async function refreshPattern() {
   if(!snapshot)return;
   const pattern=snapshot.orders[m.order],gen=loadGeneration,serial=++patternSerial;
   snapshot.commands=null;m.description='';++descriptionSerial;view.invalidate();
-  const commands=await request('pattern',[pattern]);
-  if(gen!==loadGeneration||serial!==patternSerial||snapshot!==m.snapshot||snapshot.orders[m.order]!==pattern)return;
+  // Rows arrive in small windows so the audio worklet interleaves rendering
+  // between them. An edit landing mid-assembly restarts it, so a window fetched
+  // before the edit never survives.
+  const stale=()=>gen!==loadGeneration||serial!==patternSerial||snapshot!==m.snapshot||snapshot.orders[m.order]!==pattern;
+  let commands;
+  for(;;) {
+    const edits=editSerial;
+    commands={pattern,rows:[]};
+    for(let start=0;start<m.state[1];start+=PATTERN_CHUNK_ROWS) {
+      const part=await request('pattern',[pattern,start,PATTERN_CHUNK_ROWS]);
+      if(stale())return;
+      commands.rows.push(...part.rows);
+    }
+    if(edits===editSerial)break;
+  }
   snapshot.commands=commands;selectedDescription();view.invalidate();
 }
 async function replaceSong(type,args,name) {
@@ -120,8 +134,12 @@ async function action(type,arg) {
   if(type==='mute') {updateState(await request('mute',[arg]));return;}
   if(type==='order') {
     m.follow=false;m.order=arg;m.row=0;m.nibble='';view.sy=0;view.invalidate();
-    const formatting=refreshPattern();
-    updateState(await request('transport',[3,arg,0]));await formatting;return;
+    // Observe both promises so neither failure becomes an unhandled rejection.
+    const results=await Promise.allSettled([refreshPattern(),request('transport',[3,arg,0])]);
+    if(results[1].status==='fulfilled')updateState(results[1].value);
+    const failed=results.find(r=>r.status==='rejected');
+    if(failed)throw failed.reason;
+    return;
   }
   if(type==='demo')return discardThen(async()=>{
     try {await loadDemo();status('Example · ready to play');}finally{view.invalidate();}
@@ -147,6 +165,7 @@ open.onchange=()=>{const file=open.files[0];open.value='';enqueue(()=>loadFile(f
 canvas.addEventListener('dragover',e=>{e.preventDefault();});
 canvas.addEventListener('drop',e=>{e.preventDefault();const file=e.dataTransfer.files[0];enqueue(()=>loadFile(file));});
 async function write(value) {
+  ++editSerial;
   await request('edit',[m.snapshot.orders[m.order],m.row,m.channel,m.field,value]);
   m.snapshot.cells[index()]=value;m.dirty=true;
   const pattern=m.snapshot.orders[m.order];

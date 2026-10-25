@@ -1,4 +1,5 @@
 // Shared worklet/test adapter. C++ owns the song and all playback state.
+export const PATTERN_CHUNK_ROWS = 8;
 export class Engine {
   constructor(module, rate) {
     this.api = new WebAssembly.Instance(module, {
@@ -29,11 +30,14 @@ export class Engine {
     }
     return out;
   }
-  // Only the displayed pattern is formatted. The cache is local and capped;
+  // Only a bounded row window of the displayed pattern is formatted per call so
+  // the AudioWorklet message handler never holds the audio thread for a whole
+  // 256x149 pattern; callers page through rows. The cache is local and capped;
   // snapshots never contain formatted song-wide objects or descriptions.
-  pattern(pattern) {
+  pattern(pattern,start=0,count=PATTERN_CHUNK_ROWS) {
     const s=this.state();
     if(!Number.isInteger(pattern)||pattern<0||pattern>=s[2])throw new Error('Pattern out of range');
+    if(!Number.isInteger(start)||!Number.isInteger(count)||start<0||count<1||count>PATTERN_CHUNK_ROWS||start>=s[1])throw new Error('Row window out of range');
     const rows=[],cache=new Map(),notes=new Uint8Array(this.api.memory.buffer,this.api.web_patterns());
     const fxPtr=this.api.web_fx(),fx=new Uint8Array(this.api.memory.buffer,fxPtr);
     const text=(r,c,lane)=>{
@@ -46,13 +50,13 @@ export class Engine {
       if(cache.size===512)cache.delete(cache.keys().next().value);
       cache.set(key,label);return label;
     };
-    for(let r=0;r<s[1];r++){
+    for(let r=start;r<Math.min(s[1],start+count);r++){
       const row=[];
       for(let c=0;c<s[0];c++)for(let lane=-1;lane<s[12];lane++)row.push(text(r,c,lane));
       for(let lane=0;lane<s[13];lane++)row.push(text(r,-1,lane));
       rows.push(row);
     }
-    return {pattern,rows};
+    return {pattern,start,rows};
   }
 
   formatted(p,r,c,lane) {
@@ -83,7 +87,7 @@ export class Engine {
   command(type, args = []) {
     const a = this.api;
     if (type === 'state') return this.state();
-    if (type === 'pattern') return this.pattern(args[0]);
+    if (type === 'pattern') return this.pattern(...args);
     if (type === 'formatted') return this.formatted(...args);
     if (type === 'snapshot') return this.snapshot();
     if (type === 'load') {
