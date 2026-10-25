@@ -140,6 +140,12 @@ console.log(`WASM large geometry passed: ${original.length} bytes, ${256*149} fo
   assert.equal(after.accepted,1);assert.equal(after.pending,0);
   assert.deepEqual(after.controls.map(c=>c.held),before.controls.map(c=>c.held));
   assert.deepEqual(after.layers.map(l=>[l.target,l.remaining]),before.layers.map(l=>[l.target,l.remaining]));
+  // Only the three own kind names map to a command; inherited or coerced names do not.
+  const kinds=['toString','constructor','__proto__','hasOwnProperty','valueOf','',Symbol('control'),'0','1','2',0,1,'Control',' control',['control']];
+  const kindResults=engine.command('score',[kinds.map(kind=>({kind,generation,sequence:2,id:0x7fffffff,value:.5}))]).results;
+  assert(kindResults.every(r=>r==='invalid'),JSON.stringify(kindResults));
+  const afterKinds=engine.command('feedback').feedback;
+  assert.equal(afterKinds.accepted,1);assert.deepEqual(afterKinds.controls.map(c=>c.held),before.controls.map(c=>c.held));
   // The very next valid sequence is still 2: refusals consumed none.
   assert.equal(one({kind:'layer',sequence:2,id:0x80000000,value:0,fadeMs:0}),'ok');
   assert.equal(one({kind:'section',sequence:3,id:0xfffffffe}),'ok');assert.equal(accepted(),3);

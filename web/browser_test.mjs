@@ -392,7 +392,13 @@ try {
     // Unsigned score IDs above 0x7fffffff are drawn, hit and selected intact.
     await loadFixture('interactive-ids');
     await button('section2147483651');await wait(()=>view.m.feedback?.bound&&view.m.feedback.initial===2147483651);
-    await button('play');await wait(()=>view.m.feedback.current===2147483651);await button('stop');
+    await button('play');await wait(()=>view.m.feedback.current===2147483651);
+    // Inherited property names are not command kinds, also through the worklet port.
+    const inherited=await page.evaluate(async()=>{const before=await engineCommand('feedback'),g=before.feedback.generation;
+      const r=await engineCommand('score',[['toString','constructor','__proto__','valueOf'].map(kind=>({kind,generation:g,sequence:1e9,id:0x7fffffff,value:.5}))]);
+      return {results:r.results,same:r.feedback.accepted===before.feedback.accepted&&r.feedback.controls[0].held===before.feedback.controls[0].held};});
+    assert(inherited.results.every(r=>r==='invalid')&&inherited.same,JSON.stringify(inherited));
+    await button('stop');
     // Worklet round trip (handler plus message transit) for the largest-shaped score.
     const largeScore=Array.from(await readFile(path.join(fixtureRoot,'interactive-large.ntrk')));
     const handler=await page.evaluate(async bytes=>{

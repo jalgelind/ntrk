@@ -4,7 +4,8 @@ export const PATTERN_CHUNK_ROWS = 8;
 // request, i.e. the coalesced identities a UI transaction can hold.
 export const MAX_SCORE_COMMANDS = 49;
 export const STATUS = ['ok', 'invalid', 'unsupported', 'stale', 'missing-section', 'invalid-rate', 'invalid-sequence'];
-const KIND = {control: 0, layer: 1, section: 2};
+// Own entries only: inherited names such as 'toString' or '__proto__' are not kinds.
+const KIND = new Map([['control', 0], ['layer', 1], ['section', 2]]);
 const RECORD = {1: 'controls', 2: 'layers', 3: 'sections', 4: 'cues'};
 // Checked before any number reaches WASM, so no conversion can alias a value.
 // IDs are u32 (IMUS); generations/sequences are positive safe integers.
@@ -13,7 +14,7 @@ const isCounter = x => Number.isSafeInteger(x) && x >= 1;
 const isUnit = x => typeof x === 'number' && Number.isFinite(x) && x >= 0 && x <= 1;
 export const MAX_FADE_MS = 60000;
 export function validScoreCommand(c) {
-  if (!c || typeof c !== 'object' || KIND[c.kind] === undefined) return false;
+  if (!c || typeof c !== 'object' || typeof c.kind !== 'string' || !KIND.has(c.kind)) return false;
   if (!isCounter(c.generation) || !isCounter(c.sequence) || !isU32(c.id) || !c.id) return false;
   if (c.kind === 'section') return true;
   const fade = c.fadeMs ?? 0;
@@ -68,7 +69,7 @@ export class Engine {
     if (!Array.isArray(commands) || commands.length > MAX_SCORE_COMMANDS) throw new Error('Score command batch out of bounds');
     // A refused command never reaches the runtime: state and accepted sequence stay.
     return commands.map(c => !validScoreCommand(c) ? 'invalid' :
-      STATUS[this.api.web_ia_command(KIND[c.kind], c.generation, c.sequence, c.id, c.kind === 'section' ? 0 : c.value, c.fadeMs ?? 0)] ?? 'invalid');
+      STATUS[this.api.web_ia_command(KIND.get(c.kind), c.generation, c.sequence, c.id, c.kind === 'section' ? 0 : c.value, c.fadeMs ?? 0)] ?? 'invalid');
   }
   string(ptr) {
     const bytes = new Uint8Array(this.api.memory.buffer, ptr);
