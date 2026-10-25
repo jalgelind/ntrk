@@ -6,6 +6,20 @@ export const MAX_SCORE_COMMANDS = 49;
 export const STATUS = ['ok', 'invalid', 'unsupported', 'stale', 'missing-section', 'invalid-rate', 'invalid-sequence'];
 const KIND = {control: 0, layer: 1, section: 2};
 const RECORD = {1: 'controls', 2: 'layers', 3: 'sections', 4: 'cues'};
+// Checked before any number reaches WASM, so no conversion can alias a value.
+// IDs are u32 (IMUS); generations/sequences are positive safe integers.
+const isU32 = x => Number.isInteger(x) && x >= 0 && x <= 0xffffffff;
+const isCounter = x => Number.isSafeInteger(x) && x >= 1;
+const isUnit = x => typeof x === 'number' && Number.isFinite(x) && x >= 0 && x <= 1;
+export const MAX_FADE_MS = 60000;
+export function validScoreCommand(c) {
+  if (!c || typeof c !== 'object' || KIND[c.kind] === undefined) return false;
+  if (!isCounter(c.generation) || !isCounter(c.sequence) || !isU32(c.id) || !c.id) return false;
+  if (c.kind === 'section') return true;
+  const fade = c.fadeMs ?? 0;
+  return isUnit(c.value) && (c.kind === 'control' ? fade === 0 :
+    Number.isInteger(fade) && fade >= 0 && fade <= MAX_FADE_MS);
+}
 export class Engine {
   constructor(module, rate) {
     this.api = new WebAssembly.Instance(module, {
@@ -52,9 +66,9 @@ export class Engine {
   // render quantum. Each result is the runtime's verdict; nothing is retried.
   scoreCommands(commands) {
     if (!Array.isArray(commands) || commands.length > MAX_SCORE_COMMANDS) throw new Error('Score command batch out of bounds');
-    return commands.map(({kind, generation, sequence, id, value = 0, fadeMs = 0}) =>
-      KIND[kind] === undefined ? 'invalid' :
-        STATUS[this.api.web_ia_command(KIND[kind], generation, sequence, id, value, fadeMs)] ?? 'invalid');
+    // A refused command never reaches the runtime: state and accepted sequence stay.
+    return commands.map(c => !validScoreCommand(c) ? 'invalid' :
+      STATUS[this.api.web_ia_command(KIND[c.kind], c.generation, c.sequence, c.id, c.kind === 'section' ? 0 : c.value, c.fadeMs ?? 0)] ?? 'invalid');
   }
   string(ptr) {
     const bytes = new Uint8Array(this.api.memory.buffer, ptr);
@@ -150,6 +164,7 @@ export class Engine {
       return this.snapshot();
     }
     if (type === 'select') {
+      if (!isU32(args[0])) throw new Error('Section ID must be an integer from 0 to 4294967295');
       const status = a.web_ia_select(args[0]);
       if (status === -1) throw new Error('Stop playback before choosing the initial section');
       if (status) throw new Error(status === 4 ? 'No such section in this score' : `Section refused: ${STATUS[status]}`);

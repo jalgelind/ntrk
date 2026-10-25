@@ -7,6 +7,7 @@
 #include <new>
 #include <string>
 #include <algorithm>
+#include <chrono>
 
 static size_t g_allocations = 0;
 void *operator new(size_t n) {
@@ -343,6 +344,124 @@ static ntrk_test::InteractiveFixture *score_fixture(bool loop) {
   f->encode();
   return f;
 }
+// The fixture score with every record ID moved to the top of the u32 range.
+std::vector<uint8_t> high_id_score() {
+  static ntrk_test::InteractiveFixture f(2, 2, true, false);
+  const uint32_t ids[] = {0x7fffffffu, 0x80000000u, 0x80000003u, 0xfffffffeu,
+                          0x90000009u, 0x90000007u, 0x90000008u, 0x9000000au};
+  for (int i = 0; i < f.count; ++i) {
+    ntrk::ImusCueView q;
+    if (f.records[i].kind == ntrk::kImusCue) {
+      assert(ntrk::imus_cue(f.records[i], &q));
+      q.section_id = q.section_id == 3 ? ids[2] : ids[3];
+      uint8_t body[96]; size_t n = 0;
+      assert(ntrk::imus_body_encode(q, body, sizeof body, &n));
+      std::memcpy(f.bodies[i], body, n); f.records[i].bytes = uint32_t(n);
+    }
+    f.records[i].id = ids[i];
+  }
+  size_t n = 0;
+  assert(ntrk::imus_encode(1, 1, 0xffffffffu, f.records, uint32_t(f.count), f.wire, sizeof f.wire, &n, &f.module));
+  f.module.imus = f.wire; f.module.imus_bytes = uint32_t(n);
+  return saved_module(f.module);
+}
+void test_interactive_ids(const char *directory) {
+  using ia::Status;
+  const std::vector<uint8_t> score = high_id_score();
+  assert(web_demo(48000) && load_bytes(score, true) == 1);
+  assert(web_score_info(0, 1) == 2147483647.0 && web_score_info(1, 1) == 2147483648.0);
+  assert(web_score_info(2, 1) == 2147483651.0 && web_score_info(3, 1) == 4294967294.0);
+  assert(web_score_info(4, 2) == 2147483651.0); // cue -> section reference stays unsigned
+  // Negative control: the wasm-i32 spelling of 0x80000003 is not that section.
+  assert(web_ia_select(-2147483645.0) == int(Status::Invalid) && !web_ia_snapshot());
+  assert(web_ia_select(4294967295.0) == int(Status::MissingSection));
+  assert(web_ia_select(4294967296.0) == int(Status::Invalid) && web_ia_select(3.5) == int(Status::Invalid));
+  assert(web_ia_select(2147483651.0) == 0 && web_ia_snapshot() && web_ia_info(25, 0) == 2147483651.0);
+  const double gen = web_ia_info(0, 0);
+  assert(web_transport(1, 0, 0));
+  assert(web_ia_command(0, gen, 1, 2147483647.0, 0.5, 0) == 0);
+  assert(web_ia_command(1, gen, 2, 2147483648.0, 0.0, 0) == 0);
+  assert(web_ia_command(2, gen, 3, 4294967294.0, 0, 0) == 0);
+  // IDs and durations that i32 conversion would alias are refused, consuming nothing.
+  for (double id : {1.5, 4294967297.0, 4294967296.0 + 2147483647.0, -1.0, std::nan("")})
+    assert(web_ia_command(0, gen, 4, id, 0.5, 0) == int(Status::Invalid));
+  for (double fade : {std::nan(""), HUGE_VAL, 0.9, -1.0, 65536.0})
+    assert(web_ia_command(1, gen, 4, 2147483648.0, 1, fade) == int(Status::Invalid));
+  assert(web_ia_command(0, gen, 4, 4294967295.0, 0.5, 0) == int(Status::Invalid)); // in range, not in score
+  web_ia_snapshot(); assert(web_ia_info(3, 0) == 3);
+  for (int q = 0; q < 60; ++q) web_render(128);
+  web_ia_snapshot();
+  assert(web_ia_info(4, 0) == 4294967294.0 && web_ia_info(15, 0) == 2147483647.0 && web_ia_info(18, 0) == 2147483648.0);
+  assert(web_ia_info(19, 0) == 0.0);
+  ia::CueEvent seen; bool high_cue = false;
+  while (web_ia_pop()) { seen = cue; high_cue = high_cue || cue.section == 0xfffffffeu; }
+  assert(high_cue);
+  if (directory) write_file(directory, "interactive-ids.ntrk", score.data(), score.size());
+  std::puts("web interactive ids: 0x7fffffff/0x80000000/0x80000003/0xfffffffe select, command, feedback and cues; i32-aliased, fractional and out-of-range IDs/fades refused passed");
+}
+// Largest-shaped procedural score for handler timing: 16 channels, 256 rows,
+// 256 orders, 8 FXPL columns, 64 whole-song sections, 16 layers, 256 cues.
+struct LargeScore {
+  ntrk::Module module; uint8_t order[256] = {};
+  ntrk::Note notes[256 * 16] = {}; ntrk::FxCell fx[256 * (16 * 8 + 1)] = {};
+  int8_t pcm[32] = {}; uint8_t wire[65536] = {}, bodies[400][32] = {};
+  ntrk::ImusRecord records[400]; int count = 0;
+  template<class T> void add(uint8_t kind, const T &view) {
+    size_t n = 0; assert(ntrk::imus_body_encode(view, bodies[count], 32, &n));
+    records[count].id = uint32_t(count + 1); records[count].kind = kind;
+    records[count].body = bodies[count]; records[count].bytes = uint32_t(n); ++count;
+  }
+};
+std::vector<uint8_t> large_score() {
+  static LargeScore f;
+  ntrk::Module &m = f.module;
+  m.channels = 16; m.rows = 256; m.order_count = 256; m.pattern_count = 1; m.order = f.order;
+  m.patterns = f.notes; m.fx = f.fx; m.fx_columns = 8; m.meta_columns = 1; m.macro_count = 1;
+  m.speed = 6; m.bpm = 125; m.note_max = 36; m.instrument_count = 1;
+  m.macros[0].target_count = 1; m.macros[0].targets[0].scope = 0; m.macros[0].targets[0].scale = 256;
+  for (int i = 0; i < 32; ++i) f.pcm[i] = i < 16 ? 30 : -30;
+  auto &ins = m.instruments[0]; ins.data = f.pcm; ins.length = 32; ins.loop_len = 32; ins.volume = 32;
+  for (int r = 0; r < 256; r += 4) for (int c = 0; c < 16; ++c) { f.notes[r * 16 + c].note = uint8_t(13 + c); f.notes[r * 16 + c].instrument = 1; }
+  const uint8_t name[] = "x";
+  ntrk::ImusControlView control; control.name = name; control.name_bytes = 1; control.macro_index = 1; control.default_value = 65535;
+  f.add(ntrk::kImusControl, control);
+  for (int c = 0; c < 16; ++c) {
+    ntrk::ImusLayerView layer; layer.name = name; layer.name_bytes = 1; layer.channel_mask = uint16_t(1u << c);
+    f.add(ntrk::kImusLayer, layer);
+  }
+  for (int s = 0; s < 64; ++s) {
+    ntrk::ImusSectionView section; section.name = name; section.name_bytes = 1;
+    section.end_order = 256; section.end_row = 0; section.end_action = 1; section.quantization = uint8_t(s % 3);
+    f.add(ntrk::kImusSection, section);
+  }
+  for (int q = 0; q < 256; ++q) {
+    ntrk::ImusCueView cue_view; cue_view.name = name; cue_view.name_bytes = 1;
+    cue_view.section_id = uint32_t(18 + q % 64); cue_view.row_offset = uint32_t(q * 97 % (256 * 256));
+    f.add(ntrk::kImusCue, cue_view);
+  }
+  size_t n = 0;
+  assert(ntrk::imus_encode(1, 1, uint32_t(f.count + 1), f.records, uint32_t(f.count), f.wire, sizeof f.wire, &n, &m));
+  m.imus = f.wire; m.imus_bytes = uint32_t(n);
+  return saved_module(m);
+}
+double elapsed_ms(std::chrono::steady_clock::time_point since) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count();
+}
+void test_interactive_large(const char *directory) {
+  const std::vector<uint8_t> score = large_score();
+  assert(web_demo(48000));
+  auto t = std::chrono::steady_clock::now();
+  assert(load_bytes(score, true) == 1); const double load = elapsed_ms(t);
+  t = std::chrono::steady_clock::now(); describe(); const double described = elapsed_ms(t);
+  t = std::chrono::steady_clock::now(); assert(web_ia_select(18) == 0); const double select = elapsed_ms(t);
+  assert(web_score_count() == 337 && web_transport(1, 0, 0));
+  double energy = 0;
+  for (int q = 0; q < 50; ++q) { web_render(128); for (double x : audio) energy += x * x; }
+  assert(energy > 0);
+  if (directory) write_file(directory, "interactive-large.ntrk", score.data(), score.size());
+  std::printf("web interactive large handler (native -O2, %zu bytes, 337 records): load %.2f ms, describe %.2f ms, select %.2f ms\n",
+              score.size(), load, described, select);
+}
 void test_interactive(const char *directory) {
   using ia::Status;
   const std::vector<uint8_t> score = saved_module(score_fixture(true)->module);
@@ -542,6 +661,8 @@ int main(int argc, char **argv) {
   test_command_metadata(argc > 1 ? argv[1] : nullptr);
   test_large_geometry(argc > 1 ? argv[1] : nullptr);
   test_interactive(argc > 1 ? argv[1] : nullptr);
+  test_interactive_ids(argc > 1 ? argv[1] : nullptr);
+  test_interactive_large(argc > 1 ? argv[1] : nullptr);
   if (argc > 1) {
     assert(web_demo(48000));
     uint8_t orders[128] = {}; song.order = orders; song.order_count = 128;

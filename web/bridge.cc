@@ -40,7 +40,7 @@ ia::Runtime runtime;
 ia::Position position;
 ia::CueEvent cue;
 // Off-render description of the adopted score; names are copied, never borrowed.
-struct ScoreEntry { uint8_t kind; uint32_t id; int field[7]; char name[64]; };
+struct ScoreEntry { uint8_t kind; uint32_t id; uint32_t field[7]; char name[64]; };
 ScoreEntry score[ntrk::kMaxImusRecords];
 int score_count = 0;
 
@@ -72,10 +72,10 @@ void describe() {
     } else if (r.kind == ntrk::kImusLayer && ntrk::imus_layer(r, &l)) {
       named = &l; e.field[0] = l.channel_mask; e.field[1] = l.default_gain; e.field[2] = l.fade_ms;
     } else if (r.kind == ntrk::kImusSection && ntrk::imus_section(r, &s) && ntrk::imus_span(song, s, &first, &end)) {
-      named = &s; e.field[0] = int(first); e.field[1] = int(end); e.field[2] = s.entry_bpm;
+      named = &s; e.field[0] = first; e.field[1] = end; e.field[2] = s.entry_bpm;
       e.field[3] = s.entry_speed; e.field[4] = s.quantization; e.field[5] = s.end_action; e.field[6] = s.tail_policy;
     } else if (r.kind == ntrk::kImusCue && ntrk::imus_cue(r, &q)) {
-      named = &q; e.field[0] = int(q.section_id); e.field[1] = int(q.row_offset);
+      named = &q; e.field[0] = q.section_id; e.field[1] = q.row_offset;
       e.field[2] = q.type; e.field[3] = q.strength;
     }
     if (!named) continue;
@@ -84,6 +84,9 @@ void describe() {
   }
 }
 bool whole(double x) { return x >= 1 && x <= 9007199254740991.0 && x == std::floor(x); }
+// Score IDs are any u32. They cross the JS boundary as doubles, never as wasm
+// i32, so neither sign wrapping nor ToInt32 truncation/modulo can alias an ID.
+bool u32(double x) { return x >= 0 && x <= 4294967295.0 && x == std::floor(x); }
 
 void reset() {
   ntrk::player_start(&player, &song);
@@ -256,7 +259,7 @@ int web_load(int size) {
   return 1;
 }
 
-int web_ia_select(int section);
+int web_ia_select(double section);
 // Explicit interactive host path; web_load keeps refusing scores. 1 adopted,
 // 0 invalid or not a score, -3 unsupported profile/capability, -5 device rate
 // outside the runtime's rates. Every refusal leaves the current song intact.
@@ -283,8 +286,9 @@ int web_load_interactive(int size) {
 // Chooses the initial section while stopped (0 only for section-less scores).
 // Compiles a fresh generation off render; refusals keep the previous binding.
 // Returns the runtime Status value (0 Ok), or -1 when not interactive/stopped.
-int web_ia_select(int section) {
-  if (!interactive || started || section < 0) return -1;
+int web_ia_select(double section) {
+  if (!interactive || started) return -1;
+  if (!u32(section)) return int(ia::Status::Invalid);
   const ia::Status checked = probe.compile(song, generation + 1, capabilities(), uint32_t(section));
   if (checked != ia::Status::Ok) return int(checked);
   retire();
@@ -298,9 +302,9 @@ int web_ia_select(int section) {
 // Generation-tagged, strictly sequenced score commands applied at the next
 // render boundary: 0 control (value 0..1), 1 layer (value 0..1, fade ms),
 // 2 section request. Returns the runtime Status value; stale ones are counted.
-int web_ia_command(int kind, double gen, double seq, int id, double value, int fade_ms) {
+int web_ia_command(int kind, double gen, double seq, double id, double value, double fade_ms) {
   if (!bound) { if (stale_commands != UINT32_MAX) ++stale_commands; return int(ia::Status::Stale); }
-  if (!whole(gen) || !whole(seq) || id < 0) return int(ia::Status::Invalid);
+  if (!whole(gen) || !whole(seq) || !u32(id)) return int(ia::Status::Invalid);
   const uint64_t g = uint64_t(gen), q = uint64_t(seq);
   uint16_t normalized = 0;
   ia::Status status = ia::Status::Invalid;
@@ -308,7 +312,7 @@ int web_ia_command(int kind, double gen, double seq, int id, double value, int f
     return int(status);
   if (kind == 0) status = runtime.control(g, q, uint32_t(id), normalized);
   else if (kind == 1) {
-    if (fade_ms < 0 || fade_ms > 65535) return int(status);
+    if (!u32(fade_ms) || fade_ms > 65535) return int(status);
     status = runtime.layer(g, q, uint32_t(id), normalized, uint16_t(fade_ms));
   } else if (kind == 2) status = runtime.request_section(g, q, uint32_t(id));
   if (status == ia::Status::Stale && stale_commands != UINT32_MAX) ++stale_commands;
@@ -352,9 +356,9 @@ double web_ia_cue(int field) {
   }
 }
 int web_score_count() { return interactive ? score_count : 0; }
-int web_score_info(int i, int field) {
+double web_score_info(int i, int field) {
   if (!interactive || i < 0 || i >= score_count || field < 0 || field > 8) return -1;
-  return field == 0 ? score[i].kind : field == 1 ? int(score[i].id) : score[i].field[field - 2];
+  return field == 0 ? score[i].kind : field == 1 ? score[i].id : score[i].field[field - 2];
 }
 const char *web_score_name(int i) { return interactive && i >= 0 && i < score_count ? score[i].name : ""; }
 

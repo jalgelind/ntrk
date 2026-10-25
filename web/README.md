@@ -150,6 +150,10 @@ generation and a strictly increasing sequence. Each load or section choice
 compiles a new generation; commands for a replaced generation are refused as
 stale and counted. The worklet applies a batch in its message handler, so it
 takes effect before the next render quantum.
+Score IDs are any u32 and cross the WASM boundary as exact numbers. Before
+anything reaches WASM, IDs must be integers in u32 range, values finite in 0–1,
+fades integer milliseconds up to 60,000 and generations/sequences positive safe
+integers; a refused command changes nothing and consumes no sequence number.
 
 ## Boundary and verification
 
@@ -167,6 +171,31 @@ memory (cross-origin isolation), which this host deliberately does not require.
 The runtime binding and score table are fixed-size; a load retires the old
 binding before its backing buffer is reused.
 
+These handlers are measured audio interruptions, not glitch-free operations
+(2026-10-25, Apple arm64, load averages 2.5–5.2). For the bundled procedural
+score (2 channels, 8 records) WASM load takes about 0.5 ms and section choice
+0.15 ms in node. For the largest-shaped procedural score (`interactive-large`:
+16 channels, 256 orders × 256 rows, 8 FXPL columns, 64 whole-song sections, 16
+layers, 256 cues; 91,756 bytes):
+
+| Handler | native `-O2` | WASM in node (min/max of 3) | Chromium worklet round trip (3 runs) |
+|---|---:|---:|---:|
+| load (parse, compile check, describe) | 861 ms | 1,149 / 1,963 ms | 4,150–4,386 ms |
+| describe alone | 286 ms | — | — |
+| choose initial section | 594 ms | 766 / 774 ms | 2,177–3,118 ms |
+
+The cost is IMUS span validation: every section re-checks every row of its span
+across all channels and FXPL lanes (here 64 × 65,536 rows × 144 lanes), and it
+runs on each full decode: three times per load (`module_load_ex`, the compile
+check, describe) and twice per section choice (the refusal-preserving probe and
+the published binding). Bounding it needs ntrk core changes, not host changes:
+compile and describe from an already validated, generation-tagged view (making
+section choice O(records)); validate each stored pattern row once rather than
+once per overlapping section (bounded by pattern storage); or a resumable
+validation cursor spread across messages, with Play withheld until it finishes.
+The 8-row pattern window is likewise an interruption: 3.6–4.6 ms here, 9.1 ms
+once under load, against a 2.67 ms quantum at 48 kHz.
+
 `make test` includes the native bridge, importer, renderer/mixer and library
 checks. `test-web` generates sampled eight-channel MOD/XM/PCM8/PCM16 fixtures,
 sparse/wide/multi-column FXPL, meta-only empty, long-list, distinct-order and
@@ -179,7 +208,9 @@ section requests, pause, stop/restart); audio and cues must be identical, with
 zero heap allocation across bridge commands/render/feedback. It also covers the
 explicit initial section, sequencing/normalization, stale reload, unsupported
 profile and rate, a section that stops at its end, section-less scores and
-retirement by an ordinary load. `engine_tests.mjs` replays the same script in
+retirement by an ordinary load, plus record IDs at 0x7fffffff, 0x80000000,
+0x80000003 and 0xfffffffe, refused aliasing/out-of-range IDs and durations, and
+handler timing for the largest-shaped score. `engine_tests.mjs` replays the same script in
 WASM against the native standalone-runtime output.
 
 After building WASM, verify bounded pattern formatting, cache/payload limits and

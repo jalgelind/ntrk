@@ -389,6 +389,21 @@ try {
     await button('section3');await page.waitForFunction(old=>view.m.feedback?.bound&&view.m.feedback.generation>old,old);
     assert.deepEqual((await page.evaluate(old=>engineCommand('score',[[{kind:'control',generation:old,sequence:1e9,id:1,value:.5}]]),old)).results,['stale']);
     await button('stop');
+    // Unsigned score IDs above 0x7fffffff are drawn, hit and selected intact.
+    await loadFixture('interactive-ids');
+    await button('section2147483651');await wait(()=>view.m.feedback?.bound&&view.m.feedback.initial===2147483651);
+    await button('play');await wait(()=>view.m.feedback.current===2147483651);await button('stop');
+    // Worklet round trip (handler plus message transit) for the largest-shaped score.
+    const largeScore=Array.from(await readFile(path.join(fixtureRoot,'interactive-large.ntrk')));
+    const handler=await page.evaluate(async bytes=>{
+      const times=[];
+      for(let i=0;i<3;i++){
+        let t=performance.now();await engineCommand('load',[new Uint8Array(bytes).buffer]);const load=performance.now()-t;
+        t=performance.now();await engineCommand('select',[18]);times.push({load,select:performance.now()-t});
+      }
+      return times;
+    },largeScore);
+    console.log('browser worklet large interactive round trips (ms):',handler.map(t=>`load ${t.load.toFixed(0)} select ${t.select.toFixed(0)}`).join('; '));
     await loadBytes('sampled.xm.ntrk',await readFile(path.join(fixtureRoot,'sampled.xm.ntrk')));
     console.log('browser interactive: explicit entry, section request, layer silence/restore, held control, cues, pause clock, seek/edit/profile refusals, stale reload passed');
   }

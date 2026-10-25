@@ -108,6 +108,65 @@ console.log(`WASM large geometry passed: ${original.length} bytes, ${256*149} fo
   console.log(`WASM interactive: standalone-runtime audio (${expected.length/256} quanta) and ${cues.length/8} cues exact; explicit section, read-only/seek refusals, batch bound, sequence/NaN/range, stale reload, future profile, ordinary retirement passed (handler: load ${loadMs.toFixed(2)} ms, select ${selectMs.toFixed(2)} ms)`);
 }
 
+// Unsigned IDs and boundary validation: refused values never reach WASM, keep
+// runtime state and the accepted sequence, and cannot alias another ID.
+{
+  const read=name=>fs.readFileSync(path.join(fixtures,name));
+  const ids=engine.command('load',[read('interactive-ids.ntrk')]).score;
+  assert.deepEqual(ids.sections.map(s=>s.id),[0x80000003,0xfffffffe]);
+  assert.deepEqual([ids.controls[0].id,ids.layers[0].id],[0x7fffffff,0x80000000]);
+  assert(ids.cues.every(c=>c.section===0x80000003||c.section===0xfffffffe));
+  for(const bad of [-2147483645,0x100000000,3.5,NaN,'3',null])assert.throws(()=>engine.command('select',[bad]),/Section ID/);
+  assert.equal(engine.command('feedback').feedback.bound,false,'refused selections bind nothing');
+  assert.throws(()=>engine.command('select',[0xffffffff]),/No such section/);
+  const generation=engine.command('select',[0x80000003]).feedback.generation;
+  engine.command('transport',[1,0,0]);
+  const one=c=>engine.command('score',[[{generation,...c}]]).results[0];
+  const accepted=()=>engine.command('feedback').feedback.accepted;
+  assert.equal(one({kind:'control',sequence:1,id:0x7fffffff,value:.25}),'ok');
+  const refusals=[
+    {kind:'control',sequence:2,id:1.5,value:.5},{kind:'control',sequence:2,id:4294967297,value:.5},
+    {kind:'control',sequence:2,id:0x7fffffff+0x100000000,value:.5},{kind:'control',sequence:2,id:-1,value:.5},
+    {kind:'control',sequence:2,id:0x7fffffff,value:NaN},{kind:'control',sequence:2,id:0x7fffffff,value:1.0000001},
+    {kind:'control',sequence:2,id:0x7fffffff,value:'0.5'},{kind:'control',sequence:2,id:0x7fffffff,value:.5,fadeMs:10},
+    {kind:'layer',sequence:2,id:0x80000000,value:1,fadeMs:NaN},{kind:'layer',sequence:2,id:0x80000000,value:1,fadeMs:Infinity},
+    {kind:'layer',sequence:2,id:0x80000000,value:1,fadeMs:.9},{kind:'layer',sequence:2,id:0x80000000,value:1,fadeMs:60001},
+    {kind:'section',sequence:2,id:0x80000003+0.5},{kind:'section',sequence:2,id:0},{kind:'section',sequence:1.5,id:0xfffffffe},
+    {kind:'section',sequence:2**53,id:0xfffffffe},{kind:'bogus',sequence:2,id:1},null,7];
+  const before=engine.command('feedback').feedback;
+  const results=engine.command('score',[refusals]).results;
+  assert(results.every(r=>r==='invalid'),JSON.stringify(results));
+  const after=engine.command('feedback').feedback;
+  assert.equal(after.accepted,1);assert.equal(after.pending,0);
+  assert.deepEqual(after.controls.map(c=>c.held),before.controls.map(c=>c.held));
+  assert.deepEqual(after.layers.map(l=>[l.target,l.remaining]),before.layers.map(l=>[l.target,l.remaining]));
+  // The very next valid sequence is still 2: refusals consumed none.
+  assert.equal(one({kind:'layer',sequence:2,id:0x80000000,value:0,fadeMs:0}),'ok');
+  assert.equal(one({kind:'section',sequence:3,id:0xfffffffe}),'ok');assert.equal(accepted(),3);
+  assert.equal(engine.command('feedback').feedback.pending,0xfffffffe);
+  assert.throws(()=>engine.command('score',[Array(50).fill(refusals[0])]),/out of bounds/);
+  assert.throws(()=>engine.command('score',[{length:1,0:refusals[0]}]),/out of bounds/);
+  const l=new Float32Array(128),r=new Float32Array(128);
+  for(let q=0;q<60;q++)engine.render(l,r);
+  const fb=engine.command('feedback').feedback;
+  assert.equal(fb.current,0xfffffffe);assert.equal(fb.layers[0].current,0);
+  assert(fb.cues.some(c=>c.section===0xfffffffe));
+  engine.command('transport',[0,0,0]);
+  console.log('WASM interactive ids: u32 IDs 0x7fffffff..0xfffffffe round-trip; i32-aliased/fractional/out-of-range IDs, NaN/Infinity/fractional/over-range values and fades refused before WASM with state and sequence preserved passed');
+}
+// Handler timing for the largest-shaped procedural score. These handlers run in
+// the worklet between quanta: the measured time is an audio interruption.
+{
+  const large=fs.readFileSync(path.join(fixtures,'interactive-large.ntrk'));
+  const time=fn=>{const t=performance.now();fn();return performance.now()-t;};
+  const runs=[];
+  for(let i=0;i<3;i++)runs.push({load:time(()=>engine.command('load',[large])),
+    snapshot:time(()=>engine.command('snapshot')),select:time(()=>engine.command('select',[18]))});
+  const worst=k=>Math.max(...runs.map(r=>r[k])).toFixed(1),best=k=>Math.min(...runs.map(r=>r[k])).toFixed(1);
+  console.log(`WASM interactive large handler (node, ${large.length} bytes, 337 records, 3 runs min/max): load ${best('load')}/${worst('load')} ms, snapshot (score table) ${best('snapshot')}/${worst('snapshot')} ms, select ${best('select')}/${worst('select')} ms`);
+  engine.command('demo');
+}
+
 // Native bridge fixtures are independent audio references for every actual channel count.
 for(let channels=1;channels<=16;++channels) {
   const name=`count-${String(channels).padStart(2,'0')}`;
