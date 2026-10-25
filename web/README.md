@@ -171,29 +171,30 @@ memory (cross-origin isolation), which this host deliberately does not require.
 The runtime binding and score table are fixed-size; a load retires the old
 binding before its backing buffer is reused.
 
-These handlers are measured audio interruptions, not glitch-free operations
-(2026-10-25, Apple arm64, load averages 2.5–5.2). For the bundled procedural
-score (2 channels, 8 records) WASM load takes about 0.5 ms and section choice
-0.15 ms in node. For the largest-shaped procedural score (`interactive-large`:
-16 channels, 256 orders × 256 rows, 8 FXPL columns, 64 whole-song sections, 16
-layers, 256 cues; 91,756 bytes):
+These handlers are measured audio interruptions, not glitch-free operations.
+For the bundled procedural score (2 channels, 8 records) WASM load takes about
+0.5 ms and section choice 0.15 ms in node (2026-10-25). For the largest-shaped
+procedural score (`interactive-large`: 16 channels, 256 orders × 256 rows, 8
+FXPL columns, 64 whole-song sections, 16 layers, 256 cues; 91,756 bytes),
+measured 2026-10-25 on Apple arm64, 3 runs each, load averages 2.6–8.0
+(`make test-web`, `node web/engine_tests.mjs`, `web/browser_test.mjs`):
 
-| Handler | native `-O2` | WASM in node (min/max of 3) | Chromium worklet round trip (3 runs) |
+| Handler | native `-O2` | WASM in node (min/max of 3) | Chromium worklet round trip (3 × 3 runs) |
 |---|---:|---:|---:|
-| load (parse, compile check, describe) | 861 ms | 1,149 / 1,963 ms | 4,150–4,386 ms |
-| describe alone | 286 ms | — | — |
-| choose initial section | 594 ms | 766 / 774 ms | 2,177–3,118 ms |
+| load (parse, compile check, describe) | 0.39–0.42 ms | 0.6–0.7 / 1.5–1.7 ms | 2–5 ms |
+| describe alone | 0.12–0.14 ms | — | — |
+| choose initial section | 0.26–0.27 ms | 0.4 / 0.9 ms | 0–1 ms |
 
-The cost is IMUS span validation: every section re-checks every row of its span
-across all channels and FXPL lanes (here 64 × 65,536 rows × 144 lanes), and it
-runs on each full decode: three times per load (`module_load_ex`, the compile
-check, describe) and twice per section choice (the refusal-preserving probe and
-the published binding). Bounding it needs ntrk core changes, not host changes:
-compile and describe from an already validated, generation-tagged view (making
-section choice O(records)); validate each stored pattern row once rather than
-once per overlapping section (bounded by pattern storage); or a resumable
-validation cursor spread across messages, with Play withheld until it finishes.
-The 8-row pattern window is likewise an interruption: 3.6–4.6 ms here, 9.1 ms
+Before the same day's change these were 847–861 ms load, 279–291 ms describe
+and 557–594 ms section choice natively (Chromium 4.2–4.4 s / 2.2–3.1 s), because
+every section re-checked every row of its span across all channels and FXPL
+lanes (64 × 65,536 rows × 144 lanes) on every full decode. IMUS
+validation now flags each stored pattern's rows once, on the first span that
+reaches the pattern, and answers each section from those flags in O(orders): a
+decode costs at most one pass over pattern storage plus 64 × 256 order checks.
+Worst case, 256 distinct 256-row patterns with 144 lanes and 64 whole-song
+sections, one decode takes 5.2–5.7 ms natively (`test_ntrk`); load runs three
+decodes and section choice two. The 8-row pattern window is likewise an interruption: 3.6–4.6 ms here, 9.1 ms
 once under load, against a 2.67 ms quantum at 48 kHz.
 
 `make test` includes the native bridge, importer, renderer/mixer and library

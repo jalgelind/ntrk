@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -8569,6 +8570,317 @@ static void test_imus_dependency_and_scope() {
   CHECK(!imus_encode(1,1,3,records,2,nullptr,0,&n,&m));
 }
 
+// ---------------------------------------------------------------------------
+// IMUS span validation: differential against the direct per-position scan.
+//
+// `oracle_imus_validate` is imus_validate as it was before span checks were
+// answered from per-pattern row flags: every section re-reads every row and
+// lane it covers. It is kept verbatim apart from `mutant`, which breaks one
+// clause of the span scan so the generator can be shown to reach each clause
+// (a differential that cannot tell a mutant apart proves nothing).
+// ---------------------------------------------------------------------------
+enum ImusOracleMutant {
+  kOracleExact, kOracleNoPlane, kOracleShortEnd, kOracleLateStart, kOracleSkipMissing,
+  kOracleFirstChannel, kOracleNoExtended, kOracleNoContent, kOracleMutants
+};
+static ntrk::ImusStatus oracle_imus_validate(const ntrk::ImusRecords &src, const ntrk::Module *m, int mutant) {
+  using namespace ntrk;
+  const ImusView &v=src.wire;
+  if (!v.version || !v.profile || !v.next_id || v.count>kMaxImusRecords ||
+      v.bytes<12 || v.bytes>kMaxImusBytes) return ImusStatus::Invalid;
+  if (m && (m->channels<1 || m->channels>kMaxChannels || m->rows<1 || m->rows>kMaxRows ||
+      m->order_count<1 || m->order_count>kMaxOrders || m->pattern_count<1 || m->pattern_count>kMaxPatterns ||
+      m->macro_count<0 || m->macro_count>kMaxMacros || m->fx_columns<1 || m->fx_columns>kMaxFxColumns ||
+      m->meta_columns<0 || m->meta_columns>kMaxMetaColumns)) return ImusStatus::Invalid;
+  bool opaque=v.version!=1 || v.profile!=1;
+  uint32_t ids[kMaxImusRecords]; uint8_t kinds[kMaxImusRecords];
+  int counts[5]={}; uint16_t layer_mask=0; uint8_t macros[kMaxImusControls]; int macro_count=0;
+  size_t at=12;
+  for (uint32_t i=0;i<v.count;++i) {
+    ImusRecord r;
+    if (!src.next(&at,i,&r) || !r.id || r.id>=v.next_id || !r.version ||
+        (r.flags&~1u) || (r.bytes && !r.body)) return ImusStatus::Invalid;
+    for (uint32_t j=0;j<i;++j) if (ids[j]==r.id) return ImusStatus::Invalid;
+    ids[i]=r.id; kinds[i]=r.kind;
+    if (r.kind>=1 && r.kind<=4) ++counts[r.kind];
+    if (counts[1]>kMaxImusControls || counts[2]>kMaxImusLayers ||
+        counts[3]>kMaxImusSections || counts[4]>kMaxImusCues) return ImusStatus::Invalid;
+    if (v.version!=1 || v.profile!=1) continue;
+    if (r.version!=1 || r.kind<1 || r.kind>4) { opaque=opaque || (r.flags&1); continue; }
+    ImusNamedView named;
+    if (r.kind==kImusControl) {
+      ImusControlView c;
+      if (!imus_control(r,&c) || !imus_control_valid(c))
+        return ImusStatus::Invalid;
+      named=c;
+      for (int j=0;j<macro_count;++j) if (macros[j]==c.macro_index) return ImusStatus::Invalid;
+      if (m) {
+        if (!m->fx || c.macro_index>m->macro_count) return ImusStatus::Invalid;
+        const Macro &mac=m->macros[c.macro_index-1];
+        if (!mac.target_count || mac.target_count>kMaxMacroTargets || mac.flags) return ImusStatus::Invalid;
+        for (int j=0;j<mac.target_count;++j) {
+          const MacroTarget &t=mac.targets[j];
+          if (!macro_target_valid(t.target) || t.scope==kMacroScopeSelf ||
+              (t.scope!=kMacroScopeAll && t.scope>=m->channels)) return ImusStatus::Invalid;
+          for (int k=0;k<j;++k) if (imus_scopes_overlap(t,mac.targets[k])) return ImusStatus::Invalid;
+          for (int k=0;k<macro_count;++k) {
+            const Macro &other=m->macros[macros[k]-1];
+            for (int z=0;z<other.target_count;++z)
+              if (imus_scopes_overlap(t,other.targets[z])) return ImusStatus::Invalid;
+          }
+        }
+      }
+      macros[macro_count++]=c.macro_index;
+    } else if (r.kind==kImusLayer) {
+      ImusLayerView l;
+      if (!imus_layer(r,&l) || !imus_layer_valid(l) || (l.channel_mask&layer_mask) || (m && (uint32_t(l.channel_mask)>>m->channels))) return ImusStatus::Invalid;
+      layer_mask|=l.channel_mask; named=l;
+    } else if (r.kind==kImusSection) {
+      ImusSectionView s; uint32_t first=0,end=0;
+      if (!imus_section(r,&s) || !imus_section_valid(s))
+        return ImusStatus::Invalid;
+      named=s;
+      if (m) {
+        if (!imus_span(*m,s,&first,&end) || m->swing || !m->order || !m->patterns)
+          return ImusStatus::Invalid;
+        const uint32_t from=first+(mutant==kOracleLateStart ? 1 : 0);
+        const uint32_t to=mutant==kOracleShortEnd ? end-1 : end;
+        for (uint32_t pos=from;pos<to && mutant!=kOracleNoContent;++pos) {
+          const int pat=m->order[pos/uint32_t(m->rows)];
+          if (pat>=m->pattern_count) {
+            if (mutant==kOracleSkipMissing) continue;
+            return ImusStatus::Invalid;
+          }
+          const size_t row=size_t(pat)*size_t(m->rows)+pos%uint32_t(m->rows);
+          for (int c=0;c<(mutant==kOracleFirstChannel ? 1 : m->channels);++c) {
+            const Note &n=m->patterns[row*size_t(m->channels)+size_t(c)];
+            if (mutant==kOracleNoExtended ? (n.effect==0x0b || n.effect==0x0d || n.effect==0x0f)
+                                          : !imus_score_command(n.effect,n.param)) return ImusStatus::Invalid;
+          }
+          if (m->fx && mutant!=kOracleNoPlane) {
+            const int lanes=m->channels*m->fx_columns+m->meta_columns;
+            for (int c=0;c<m->channels*m->fx_columns;++c)
+              if (!imus_plane_command(m->fx[row*size_t(lanes)+size_t(c)].cmd)) return ImusStatus::Invalid;
+          }
+        }
+      }
+    } else {
+      ImusCueView c;
+      if (!imus_cue(r,&c) || !imus_cue_valid(c))
+        return ImusStatus::Invalid;
+      named=c;
+    }
+    const ImusStatus fields=imus_fields(named);
+    if (fields==ImusStatus::Invalid) return fields;
+    opaque=opaque || fields==ImusStatus::Opaque;
+  }
+  if (!src.records && at!=v.bytes) return ImusStatus::Invalid;
+  if (v.version==1 && v.profile==1) {
+    at=12;
+    for (uint32_t i=0;i<v.count;++i) {
+      ImusRecord r; src.next(&at,i,&r);
+      if (r.kind!=kImusCue || r.version!=1) continue;
+      ImusCueView c; if (!imus_cue(r,&c)) return ImusStatus::Invalid;
+      uint32_t j=0;
+      while (j<v.count && ids[j]!=c.section_id) ++j;
+      if (j==v.count || kinds[j]!=kImusSection) return ImusStatus::Invalid;
+      size_t cursor=12; ImusRecord s;
+      for (uint32_t k=0;k<=j;++k) src.next(&cursor,k,&s);
+      if (s.version!=1) opaque=true;
+      if (s.version==1 && m) {
+        ImusSectionView section; uint32_t first=0,end=0;
+        if (!imus_section(s,&section) || !imus_span(*m,section,&first,&end) || c.row_offset>=end-first)
+          return ImusStatus::Invalid;
+      }
+    }
+  }
+  return opaque ? ImusStatus::Opaque : ImusStatus::Supported;
+}
+static ntrk::ImusStatus oracle_imus_decode(const uint8_t *p, size_t n, const ntrk::Module *m, int mutant) {
+  using namespace ntrk;
+  if (!p || n<12 || n>kMaxImusBytes) return ImusStatus::Invalid;
+  ImusRecords src;
+  src.wire.data=p; src.wire.bytes=n; src.wire.version=imus_u16(p); src.wire.profile=imus_u16(p+2);
+  src.wire.count=imus_u32(p+4); src.wire.next_id=imus_u32(p+8);
+  return oracle_imus_validate(src,m,mutant);
+}
+
+// Procedural score: raw wire (sections may be malformed on purpose), module
+// geometry and pattern content chosen to land forbidden cells on span edges.
+struct ImusDiffCase {
+  ntrk::Module m;
+  uint8_t order[ntrk::kMaxOrders];
+  uint8_t wire[ntrk::kMaxImusBytes];
+  size_t bytes=0; uint32_t count=0;
+  uint32_t starts[ntrk::kMaxImusSections], ends[ntrk::kMaxImusSections];
+  int sections=0;
+};
+static ntrk::Note g_diff_notes[ntrk::kMaxPatterns*ntrk::kMaxRows*ntrk::kMaxChannels];
+static ntrk::FxCell g_diff_fx[ntrk::kMaxPatterns*ntrk::kMaxRows*
+                             (ntrk::kMaxChannels*ntrk::kMaxFxColumns+ntrk::kMaxMetaColumns)];
+static void diff_record(ImusDiffCase *c, uint8_t kind, uint8_t flags, uint16_t version,
+                        uint32_t id, const uint8_t *body, uint32_t n) {
+  uint8_t *p=c->wire+c->bytes;
+  p[0]=kind; p[1]=flags; ntrk::imus_w16(p+2,version); ntrk::imus_w32(p+4,n); ntrk::imus_w32(p+8,id);
+  memcpy(p+12,body,n); c->bytes+=12+n; ++c->count;
+}
+static void diff_section(ImusDiffCase *c, uint32_t id, uint16_t so, uint16_t sr, uint16_t eo, uint16_t er) {
+  uint8_t b[17]={1,'S'};
+  ntrk::imus_w16(b+2,so); ntrk::imus_w16(b+4,sr); ntrk::imus_w16(b+6,eo); ntrk::imus_w16(b+8,er);
+  ntrk::imus_w16(b+10,125); ntrk::imus_w16(b+12,6); b[14]=uint8_t(id%3); b[15]=1; b[16]=0;
+  diff_record(c,ntrk::kImusSection,0,1,id,b,sizeof b);
+}
+static void diff_cue(ImusDiffCase *c, uint32_t id, uint32_t section, uint32_t row) {
+  uint8_t b[14]={1,'Q'};
+  ntrk::imus_w32(b+2,section); ntrk::imus_w32(b+6,row); ntrk::imus_w16(b+10,1); ntrk::imus_w16(b+12,0);
+  diff_record(c,ntrk::kImusCue,0,1,id,b,sizeof b);
+}
+static void diff_forbid(ImusDiffCase *c, uint32_t *seed, uint32_t pos, bool plane) {
+  using namespace ntrk;
+  const Module &m=c->m;
+  const uint32_t total=uint32_t(m.order_count)*uint32_t(m.rows);
+  if (pos>=total) return;
+  const int pat=c->order[pos/uint32_t(m.rows)];
+  if (pat>=m.pattern_count) return;
+  const size_t row=size_t(pat)*size_t(m.rows)+pos%uint32_t(m.rows);
+  const int ch=int(fuzz_random(seed)%uint32_t(m.channels));
+  if (plane && m.fx) {
+    const int lanes=m.channels*m.fx_columns+m.meta_columns;
+    g_diff_fx[row*size_t(lanes)+size_t(ch*m.fx_columns)+fuzz_random(seed)%uint32_t(m.fx_columns)].cmd=
+        uint8_t(0x32+fuzz_random(seed)%14);
+    return;
+  }
+  Note &n=g_diff_notes[row*size_t(m.channels)+size_t(ch)];
+  static const uint8_t effects[]={0x0b,0x0d,0x0f,0x0e,0x0e};
+  const int k=int(fuzz_random(seed)%5);
+  n.effect=effects[k];
+  n.param=k==3 ? uint8_t(0x60|(fuzz_random(seed)&15)) : k==4 ? uint8_t(0xe0|(fuzz_random(seed)&15)) : uint8_t(fuzz_random(seed));
+}
+static void diff_build(ImusDiffCase *c, uint32_t *seed, bool max_geometry) {
+  using namespace ntrk;
+  Module &m=c->m; m=Module();
+  static const int row_choices[]={1,2,3,63,64,65,127,128,129,255,256};
+  m.channels=max_geometry ? 16 : (fuzz_random(seed)%3==0 ? 1 : fuzz_random(seed)%3==0 ? 16 : 1+int(fuzz_random(seed)%16));
+  m.rows=max_geometry ? 256 : (fuzz_random(seed)%2 ? row_choices[fuzz_random(seed)%11] : 1+int(fuzz_random(seed)%256));
+  m.pattern_count=max_geometry ? 256 : 1+int(fuzz_random(seed)%(fuzz_random(seed)%16==0 ? 32 : 4));
+  m.order_count=max_geometry ? 256 : 1+int(fuzz_random(seed)%(fuzz_random(seed)%16==0 ? 64 : 6));
+  // Small geometry with full rows keeps oracle cost bounded.
+  if (!max_geometry && m.rows>64 && m.order_count>8) m.order_count=8;
+  m.fx_columns=max_geometry ? 8 : 1+int(fuzz_random(seed)%8);
+  m.meta_columns=max_geometry ? 5 : int(fuzz_random(seed)%6);
+  const bool plane=max_geometry || fuzz_random(seed)%4!=0;
+  for (int o=0;o<m.order_count;++o)
+    c->order[o]=uint8_t(fuzz_random(seed)%40==0 ? m.pattern_count+int(fuzz_random(seed)%(256-m.pattern_count+1))%256
+                                                : int(fuzz_random(seed)%uint32_t(m.pattern_count)));
+  if (max_geometry) for (int o=0;o<256;++o) c->order[o]=uint8_t(o);
+  const size_t cells=size_t(m.pattern_count)*size_t(m.rows);
+  const int lanes=m.channels*m.fx_columns+m.meta_columns;
+  memset(g_diff_notes,0,cells*size_t(m.channels)*sizeof(Note));
+  memset(g_diff_fx,0,cells*size_t(lanes)*sizeof(FxCell));
+  // Allowed lookalikes everywhere: 0x0e sub-commands other than 6x/Ex, the two
+  // articulation commands, mixer-range FXPL and meta lanes holding player ranges.
+  const uint32_t decoys=max_geometry ? 4096 : 1+fuzz_random(seed)%16;
+  for (uint32_t i=0;i<decoys;++i) {
+    const size_t row=fuzz_random(seed)%cells;
+    Note &n=g_diff_notes[row*size_t(m.channels)+fuzz_random(seed)%uint32_t(m.channels)];
+    static const uint8_t ok_effects[]={0x0a,0x0c,0x0e,0x01};
+    n.effect=ok_effects[fuzz_random(seed)%4]; n.param=uint8_t(n.effect==0x0e ? 0x50 : fuzz_random(seed));
+    FxCell *f=g_diff_fx+row*size_t(lanes);
+    static const uint8_t ok_cmds[]={0x2f,0x30,0x31,0x40,0xff};
+    f[fuzz_random(seed)%uint32_t(m.channels*m.fx_columns)].cmd=ok_cmds[fuzz_random(seed)%5];
+    if (m.meta_columns) f[m.channels*m.fx_columns+int(fuzz_random(seed)%uint32_t(m.meta_columns))].cmd=uint8_t(0x32+fuzz_random(seed)%14);
+  }
+  m.order=c->order; m.patterns=g_diff_notes; m.fx=plane ? g_diff_fx : nullptr;
+  if (!max_geometry && fuzz_random(seed)%64==0) m.swing=1;
+
+  c->bytes=12; c->count=0; c->sections=0;
+  const uint32_t total=uint32_t(m.order_count)*uint32_t(m.rows);
+  const int nsections=max_geometry ? 64 : (fuzz_random(seed)%32==0 ? 64 : 1+int(fuzz_random(seed)%6));
+  uint32_t id=1;
+  for (int s=0;s<nsections;++s) {
+    uint32_t a=0,b=total;
+    const uint32_t shape=max_geometry ? 0 : fuzz_random(seed)%12;
+    if (shape==1) { a=fuzz_random(seed)%total; b=a+1+fuzz_random(seed)%(total-a); }        // ordinary
+    else if (shape==2) { a=fuzz_random(seed)%total; b=a+1; }                               // one row
+    else if (shape==3) { a=fuzz_random(seed)%total; b=a; }                                 // zero length
+    else if (shape==4) { a=(fuzz_random(seed)%uint32_t(m.order_count))*uint32_t(m.rows); b=a+uint32_t(m.rows); } // one order
+    else if (shape==5) { a=fuzz_random(seed)%total; b=total; }                             // to song end
+    else if (shape==6) { a=0; b=1+fuzz_random(seed)%total; }                               // from song start
+    else if (shape>=7 && shape<=10) { a=fuzz_random(seed)%total; b=a+1+fuzz_random(seed)%(total-a); }
+    else if (shape==11) { a=fuzz_random(seed)%(total+2); b=fuzz_random(seed)%(total+2); }   // may be reversed or past the end
+    uint16_t so=uint16_t(a/uint32_t(m.rows)), sr=uint16_t(a%uint32_t(m.rows));
+    uint16_t eo=uint16_t(b/uint32_t(m.rows)), er=uint16_t(b%uint32_t(m.rows));
+    if (!max_geometry && fuzz_random(seed)%24==0) er=uint16_t(m.rows);                    // row past a pattern
+    if (!max_geometry && fuzz_random(seed)%24==0 && eo==m.order_count) er=1;               // past the song end
+    diff_section(c,id,so,sr,eo,er);
+    c->starts[c->sections]=a; c->ends[c->sections]=b; ++c->sections; ++id;
+  }
+  if (!max_geometry && fuzz_random(seed)%8==0) {
+    uint8_t future[17]={1,'F'}; diff_record(c,kImusSection,uint8_t(fuzz_random(seed)&1),2,id++,future,sizeof future);
+  }
+  const int ncues=max_geometry ? 4 : int(fuzz_random(seed)%4);
+  for (int q=0;q<ncues;++q) {
+    const int s=int(fuzz_random(seed)%uint32_t(c->sections));
+    const uint32_t len=c->ends[s]>c->starts[s] ? c->ends[s]-c->starts[s] : 0;
+    const uint32_t row=max_geometry ? len-1-uint32_t(q) : fuzz_random(seed)%8==0 ? len : len ? len-1-(fuzz_random(seed)%2)*(fuzz_random(seed)%len) : 0;
+    diff_cue(c,id++,uint32_t(s+1)+(!max_geometry && fuzz_random(seed)%32==0 ? 1000 : 0),row);
+  }
+  imus_w16(c->wire,1); imus_w16(c->wire+2,1); imus_w32(c->wire+4,c->count); imus_w32(c->wire+8,id);
+  m.imus=c->wire; m.imus_bytes=uint32_t(c->bytes);
+
+  // Forbidden content: on, just inside and just outside random span edges, or nowhere.
+  const uint32_t forbid=max_geometry ? 0 : fuzz_random(seed)%4;
+  for (uint32_t i=0;i<forbid;++i) {
+    const int s=int(fuzz_random(seed)%uint32_t(c->sections));
+    const uint32_t edges[]={c->starts[s]-1,c->starts[s],c->starts[s]+1,c->ends[s]-1,c->ends[s],
+                            c->ends[s]-2,fuzz_random(seed)%total};
+    diff_forbid(c,seed,edges[fuzz_random(seed)%7],fuzz_random(seed)%2==0);
+  }
+}
+static void test_imus_span_differential() {
+  using namespace ntrk;
+  static ImusDiffCase c;
+  uint32_t seed=0x1badb002u;
+  int disagree=0, outcomes[3]={}, caught[kOracleMutants]={};
+  for (int i=0;i<20000;++i) {
+    diff_build(&c,&seed,false);
+    const ImusStatus fresh=imus_decode(c.wire,c.bytes,nullptr,&c.m);
+    const ImusStatus old=oracle_imus_decode(c.wire,c.bytes,&c.m,kOracleExact);
+    if (fresh!=old) { if (!disagree) printf("  imus differential: case %d differs (%d vs %d)\n",i,int(fresh),int(old)); ++disagree; }
+    if (imus_decode(c.wire,c.bytes,nullptr)!=oracle_imus_decode(c.wire,c.bytes,nullptr,kOracleExact)) ++disagree;
+    ++outcomes[int(old)];
+    for (int k=1;k<kOracleMutants;++k)
+      if (oracle_imus_decode(c.wire,c.bytes,&c.m,k)!=old) ++caught[k];
+  }
+  CHECK(disagree==0);
+  // The generator reaches every outcome and every clause of the span scan.
+  CHECK(outcomes[0]>500 && outcomes[1]>500 && outcomes[2]>20);
+  for (int k=1;k<kOracleMutants;++k) CHECK(caught[k]>0);
+  printf("  imus differential: 20000 scores, %d invalid / %d supported / %d opaque; mutants caught:",
+         outcomes[0],outcomes[1],outcomes[2]);
+  for (int k=1;k<kOracleMutants;++k) printf(" %d",caught[k]);
+  printf("\n");
+
+  // Maximum geometry: 16 channels, 256 distinct 256-row patterns, 8 FXPL + 5 meta
+  // lanes, 64 whole-song sections. Clean (meta lanes hold player-range bytes),
+  // then one forbidden cell on the very last row, then one on the very first.
+  diff_build(&c,&seed,true);
+  clock_t t=clock();
+  const ImusStatus clean=imus_decode(c.wire,c.bytes,nullptr,&c.m);
+  const double clean_ms=1000.0*double(clock()-t)/CLOCKS_PER_SEC;
+  CHECK(clean==ImusStatus::Supported && oracle_imus_decode(c.wire,c.bytes,&c.m,kOracleExact)==clean);
+  const size_t last=size_t(255)*256+255;
+  g_diff_notes[last*16+15].effect=0x0b;
+  CHECK(imus_decode(c.wire,c.bytes,nullptr,&c.m)==ImusStatus::Invalid);
+  CHECK(oracle_imus_decode(c.wire,c.bytes,&c.m,kOracleExact)==ImusStatus::Invalid);
+  g_diff_notes[last*16+15].effect=0;
+  g_diff_fx[0].cmd=0x3f;
+  CHECK(imus_decode(c.wire,c.bytes,nullptr,&c.m)==ImusStatus::Invalid);
+  CHECK(oracle_imus_decode(c.wire,c.bytes,&c.m,kOracleNoPlane)==ImusStatus::Supported); // negative control
+  g_diff_fx[0].cmd=0;
+  printf("  imus max geometry: 256 patterns x 256 rows x 144 lanes, 64 whole-song sections, decode %.2f ms\n",clean_ms);
+}
+
 static void test_imus() {
   using namespace ntrk;
   uint8_t control[]={1,'C',1,0xff,0xff,0,0};
@@ -8788,6 +9100,7 @@ main(void) {
   test_imus();
   test_imus_body_bounds();
   test_imus_dependency_and_scope();
+  test_imus_span_differential();
 
   test_slic_block();
   test_itun_block();

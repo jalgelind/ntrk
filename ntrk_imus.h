@@ -212,6 +212,57 @@ inline bool imus_score_command(uint8_t effect, uint8_t param) {
 // Only the current articulation commands inhabit the player's FXPL namespace.
 // Reject future player commands in spans; mixer commands are a different namespace.
 inline bool imus_plane_command(uint8_t cmd) { return cmd<0x30 || cmd==0x30 || cmd==0x31 || cmd>=0x40; }
+// Per-pattern row flags for span checks: bit r of `bad[p]` marks a row of pattern p
+// holding a note command or FXPL lane command a section span may not contain.
+// A pattern is scanned once per validation, on the first span that reaches it, so
+// overlapping sections cost O(orders) each instead of O(rows x lanes).
+struct ImusRowScan {
+  static const int kWords = kMaxRows/64;
+  uint64_t bad[kMaxPatterns][kWords];
+  bool scanned[kMaxPatterns];
+  ImusRowScan() { for (int p=0;p<kMaxPatterns;++p) scanned[p]=false; }
+};
+inline const uint64_t *imus_pattern_rows(const Module &m, int pat, ImusRowScan *scan) {
+  uint64_t *bad=scan->bad[pat];
+  if (scan->scanned[pat]) return bad;
+  for (int w=0;w<ImusRowScan::kWords;++w) bad[w]=0;
+  const int lanes=m.channels*m.fx_columns+m.meta_columns, plane=m.channels*m.fx_columns;
+  for (int r=0;r<m.rows;++r) {
+    const size_t row=size_t(pat)*size_t(m.rows)+size_t(r);
+    const Note *n=m.patterns+row*size_t(m.channels);
+    bool hit=false;
+    for (int c=0;c<m.channels;++c) hit=hit || !imus_score_command(n[c].effect,n[c].param);
+    if (m.fx) {
+      const FxCell *f=m.fx+row*size_t(lanes);
+      for (int c=0;c<plane && !hit;++c) hit=!imus_plane_command(f[c].cmd);
+    }
+    if (hit) bad[r>>6]|=uint64_t(1)<<(r&63);
+  }
+  scan->scanned[pat]=true;
+  return bad;
+}
+// True when no row in [a,b) is flagged; a<b<=kMaxRows.
+inline bool imus_rows_clean(const uint64_t *bad, uint32_t a, uint32_t b) {
+  for (uint32_t w=a>>6; w<=(b-1)>>6; ++w) {
+    uint64_t mask=~uint64_t(0);
+    if (w==a>>6) mask&=~uint64_t(0)<<(a&63);
+    if (w==(b-1)>>6 && (b&63)) mask&=~(~uint64_t(0)<<(b&63));
+    if (bad[w]&mask) return false;
+  }
+  return true;
+}
+// Positions [first,end) from imus_span: every order names a stored pattern and no
+// row in the span carries a forbidden command.
+inline bool imus_span_clean(const Module &m, uint32_t first, uint32_t end, ImusRowScan *scan) {
+  const uint32_t rows=uint32_t(m.rows), last=(end-1)/rows;
+  for (uint32_t o=first/rows; o<=last; ++o) {
+    const int pat=m.order[o];
+    if (pat>=m.pattern_count) return false;
+    const uint32_t a=o==first/rows ? first%rows : 0, b=o==last ? (end-1)%rows+1 : rows;
+    if (!imus_rows_clean(imus_pattern_rows(m,pat,scan),a,b)) return false;
+  }
+  return true;
+}
 inline bool imus_scopes_overlap(const MacroTarget &a, const MacroTarget &b) {
   if (a.target!=b.target) return false;
   if (macro_target_is_global(a.target)) return true;
@@ -228,6 +279,7 @@ inline ImusStatus imus_validate(const ImusRecords &src, const Module *m=nullptr)
   bool opaque=v.version!=1 || v.profile!=1;
   uint32_t ids[kMaxImusRecords]; uint8_t kinds[kMaxImusRecords];
   int counts[5]={}; uint16_t layer_mask=0; uint8_t macros[kMaxImusControls]; int macro_count=0;
+  ImusRowScan scan;
   size_t at=12;
   for (uint32_t i=0;i<v.count;++i) {
     ImusRecord r;
@@ -274,22 +326,9 @@ inline ImusStatus imus_validate(const ImusRecords &src, const Module *m=nullptr)
         return ImusStatus::Invalid;
       named=s;
       if (m) {
-        if (!imus_span(*m,s,&first,&end) || m->swing || !m->order || !m->patterns)
+        if (!imus_span(*m,s,&first,&end) || m->swing || !m->order || !m->patterns ||
+            !imus_span_clean(*m,first,end,&scan))
           return ImusStatus::Invalid;
-        for (uint32_t pos=first;pos<end;++pos) {
-          const int pat=m->order[pos/uint32_t(m->rows)];
-          if (pat>=m->pattern_count) return ImusStatus::Invalid;
-          const size_t row=size_t(pat)*size_t(m->rows)+pos%uint32_t(m->rows);
-          for (int c=0;c<m->channels;++c) {
-            const Note &n=m->patterns[row*size_t(m->channels)+size_t(c)];
-            if (!imus_score_command(n.effect,n.param)) return ImusStatus::Invalid;
-          }
-          if (m->fx) {
-            const int lanes=m->channels*m->fx_columns+m->meta_columns;
-            for (int c=0;c<m->channels*m->fx_columns;++c)
-              if (!imus_plane_command(m->fx[row*size_t(lanes)+size_t(c)].cmd)) return ImusStatus::Invalid;
-          }
-        }
       }
     } else {
       ImusCueView c;

@@ -149,3 +149,13 @@ per copy. `sizeof(Position)` is 960 bytes; 128 host-ring entries use 122,880 byt
 plus indices. At 375 callbacks/second the payload writes are 360,000 bytes/second;
 UI consumers drain to the latest snapshot. Load averages were 5.75/5.33/5.38.
 This is a snapshot-copy microbenchmark, not an end-to-end callback deadline test.
+
+Compile/validation measurement (2026-10-25): Apple arm64, load averages 2.6–8.0.
+`imus_decode` against a module flags each stored pattern's forbidden rows once
+per decode and answers every section span from those flags, so a decode is
+bounded by one pass over pattern storage plus sections × orders. Worst geometry
+(16 channels, 256 distinct 256-row patterns, 8 FXPL + 5 meta lanes, 64
+whole-song sections) decodes in 5.2–5.7 ms (`test_ntrk`, `-O1`/`-O2`, 3 runs);
+the web host's largest procedural score loads in 0.4 ms natively and 2–5 ms as
+a Chromium worklet round trip (see [web/README.md](web/README.md)). `compile`
+decodes once; hosts that probe before publishing pay for two.
