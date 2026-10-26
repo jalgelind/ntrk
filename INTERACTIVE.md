@@ -45,6 +45,34 @@ receipt. Section selection follows FORMAT's idempotent current/pending rules;
 repeated values are not restart commands. No request implicitly starts a stopped
 runtime.
 
+`Runtime::frames_until(Quant)` (`Quant::Row|Beat|Bar`) is a const, allocation-free
+query on the audio owner: output frames from the start of the next `render` call
+to the first frame of the next row, beat or bar of the active section's clock
+(the same grid as section quantization: `rows_per_beat`/`rows_per_bar` from TUNE,
+`row_offset % grid`, anchored at the section start). 0 means a boundary starts at
+the next frame. It replicates the player's tick arithmetic fire by fire (speed,
+`EEx` extra ticks, fractional `until_tick` residual, current rate), so it equals
+the frame where the cue `sample_offset` of that row would land; it is bit-exact at
+every render-call boundary, not an estimate. Boundary rules: a loop wrap and a
+pending section transition each start a new section row 0, which is a row, beat
+and bar boundary of the music you will hear; the walk ends there (nothing past a
+transition is predicted). A pending request fires only when that boundary lies
+strictly after the clock it was received at, as `request_section` does. A section
+that ends with a stop action has no next boundary. The answer assumes no command
+is issued between the query and the boundary: a later request, pause or
+`change_rate` changes the truth. Returns `UINT32_MAX` when unbound, inactive,
+paused, draining, or not exact: Beat/Bar without an active section (an ordinary
+arrangement may change tempo mid-song), or no further boundary exists. Row is
+exact whenever the current row's tick state is known. Sections cannot contain
+tempo or speed commands (FORMAT), so one section's clock is regular.
+
+Scheduling a sound or command at a boundary: at the start of the audio callback
+call `frames_until`, render that many frames, then apply the command (commands
+take effect before the next render call's first frame) and render the rest.
+`render` accepts any frame count, so splitting at the boundary is bit-identical to
+one call. A section request made now cannot use a boundary at the current clock,
+so query after issuing the request when scheduling around a transition.
+
 The wrapper observes `until_tick <= 0` and pre-tick `tick == 0`, never apparent
 raw order/row changes during final-tick audio. It renders one frame at a new tick
 so the mixer owns the pre-tick snapshot and authored FXPL evaluation; subsequent

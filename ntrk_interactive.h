@@ -9,6 +9,8 @@
 #include <cassert>
 #include <limits>
 namespace ntrk { namespace interactive {
+// Boundary grids for Runtime::frames_until: next row, beat or bar of the active section.
+enum class Quant { Row, Beat, Bar };
 enum class Status { Ok, Invalid, Unsupported, Stale, MissingSection, InvalidRate, InvalidSequence };
 struct Capabilities {
   bool held_controls=false, layer_ramps=false, safe_entry=false, cut=false, carry=false;
@@ -295,6 +297,42 @@ public:
       }
     }
     p.row_offset=row_offset_; p.cue_drops=drops_; p.playing=active_ && !draining_; p.paused=paused_; p.draining=draining_; return p;
+  }
+  // Output frames from the start of the next render call to the first frame of
+  // the next row / beat / bar of the active section's clock, or UINT32_MAX when
+  // not exact (see INTERACTIVE.md). Const, allocation-free; replicates the
+  // player's tick arithmetic fire by fire (a closed form drifts by a frame).
+  uint32_t frames_until(Quant q) const {
+    const uint32_t none=UINT32_MAX;
+    if (!binding_ || !active_ || paused_ || draining_ || !player_->sequencing || !player_->playing) return none;
+    if (q!=Quant::Row && section_<0) return none;
+    const Section *s=section_>=0 ? &binding_->section_[section_] : nullptr;
+    const uint32_t len=s ? s->end-s->first : 0;
+    const uint32_t grid=q==Quant::Row ? 1u : uint32_t(q==Quant::Beat ? player_->module->rows_per_beat : player_->module->rows_per_bar);
+    const uint32_t qgrid=s ? (s->quantization==0 ? 1u : uint32_t(s->quantization==1 ? player_->module->rows_per_beat : player_->module->rows_per_bar)) : 1u;
+    if (!grid) return none;
+    const double fpt=frames_per_tick(player_,rate_);
+    const int spd=player_->speed<1 ? 1 : player_->speed;
+    int t=player_->tick, extra=player_->extra_ticks;
+    double u=player_->until_tick; uint64_t f=0;
+    uint32_t k=first_ ? row_offset_ : row_offset_+1; // row that starts at the next tick==0 fire
+    for (;;) {
+      const uint64_t w=u<=0.0 ? 0u : uint64_t(frames_until_tick(u));
+      f+=w; u-=double(w);
+      if (t==0) {
+        bool hit=!s;
+        if (s) {
+          const bool end=k>=len;
+          if (clock_+f>request_clock_ && pending_>=0 && (end || k%qgrid==0)) hit=true; // new section row 0
+          else if (end) { if (!s->action) return none; hit=true; }                  // loop wrap row 0
+          else hit=k%grid==0;
+        }
+        if (hit) return f>=none ? none-1 : uint32_t(f);
+        ++k;
+      }
+      u+=fpt;
+      if (++t>=spd) { if (extra>0) { --extra; t=spd-1; } else t=0; }
+    }
   }
 private:
   static bool allowed_(const Player *p,const void *cookie) {

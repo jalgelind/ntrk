@@ -136,6 +136,105 @@ static void test_interactive_partition() {
     }
   }
 }
+// frames_until oracle: a second, identical runtime stepped one frame at a time
+// records where rows really start (change of traversal/row_offset/section).
+namespace {
+struct SyncAct { uint64_t clock; int kind; double rate; }; // 0 request section 4, 1 pause+unpause, 2 rate
+struct SyncRun { uint64_t checks=0, bad=0, hash=1469598103934665603ull; };
+static void sync_setup(ntrk_test::InteractiveFixture &f,int speed,int bpm,int rpb) {
+  f.module.bpm=uint16_t(bpm); f.module.speed=speed; f.module.rows_per_beat=rpb; f.module.rows_per_bar=rpb*2;
+  for (int i=2;i<4;++i) {
+    ImusSectionView v; imus_section(f.records[i],&v);
+    v.entry_bpm=uint16_t(bpm); v.entry_speed=uint16_t(speed); v.end_action=1; v.quantization=i==2 ? 2 : 1;
+    if (i==2) { v.end_order=1; v.end_row=0; } // section 3: 4 rows, bar quantized; 4: 4 rows, beat
+    size_t bytes=0; imus_body_encode(v,f.bodies[i],96,&bytes); f.records[i].bytes=uint32_t(bytes);
+  }
+  f.encode();
+}
+// bias != 0 is the negative control: a deliberately wrong answer must be caught.
+static SyncRun sync_run(double rate,int speed,int bpm,int rpb,int chunk,uint64_t horizon,const std::vector<SyncAct> &acts,uint32_t bias) {
+  SyncRun res;
+  ntrk_test::InteractiveFixture fa(1,speed),fb(1,speed); sync_setup(fa,speed,bpm,rpb); sync_setup(fb,speed,bpm,rpb);
+  RuntimeBinding ba,bb; ba.compile(fa.module,1,fa.caps,3); bb.compile(fb.module,1,fb.caps,3);
+  Player pa,pb; mix::Mixer ma,mb; Runtime a,b; a.bind(ba,pa,ma,1,rate); b.bind(bb,pb,mb,1,rate);
+  // Oracle: starts[i] = {clock, row_offset} of every row start; paused spans add no clock.
+  struct Start { uint64_t clock; uint32_t ro; };
+  std::vector<Start> starts; std::vector<double> sink(2*512,0.0);
+  uint64_t seq=0;
+  auto act_at=[&](Runtime &r,double &cur,uint64_t clock,bool oracle) {
+    for (size_t i=0;i<acts.size();++i) if (acts[i].clock==clock) {
+      if (acts[i].kind==0) r.request_section(1,++seq,4);
+      else if (acts[i].kind==2) { r.change_rate(acts[i].rate); cur=acts[i].rate; }
+      (void)oracle;
+    }
+  };
+  { double cur=rate; seq=0; uint64_t last=~0ull; uint64_t key=~0ull;
+    for (uint64_t c=0;c<horizon+4*uint64_t(rate);++c) {
+      if (c<horizon) { act_at(b,cur,c,true); } else if (c==horizon) {}
+      sink.assign(2,0.0); b.render(sink.data(),1,2,cur);
+      const Position p=b.position();
+      const uint64_t k=(p.traversal<<40)^(uint64_t(p.row_offset)<<8)^p.current;
+      if (k!=key) { key=k; starts.push_back(Start{c,p.row_offset}); } (void)last;
+      if (!p.playing) break;
+    }
+  }
+  seq=0; double cur=rate; std::vector<double> out(2*600,0.0); int call=0; const int irregular[]={1,7,97,512,3,128,64};
+  uint64_t done=0;
+  auto query=[&](uint64_t clock) {
+    const Quant qs[3]={Quant::Row,Quant::Beat,Quant::Bar};
+    const uint32_t grids[3]={1,uint32_t(rpb),uint32_t(rpb*2)};
+    for (int q=0;q<3;++q) {
+      uint64_t want=~0ull;
+      for (size_t i=0;i<starts.size();++i) if (starts[i].clock>=clock && starts[i].ro%grids[q]==0) { want=starts[i].clock-clock; break; }
+      const uint32_t got=a.frames_until(qs[q])+bias;
+      res.hash^=got; res.hash*=1099511628211ull; ++res.checks;
+      // A later request or rate change legitimately moves the boundary: only compare absent those.
+      bool later=false; for (size_t i=0;i<acts.size();++i) if (acts[i].kind!=1 && acts[i].clock>clock && acts[i].clock<=clock+want) later=true;
+      if (want!=~0ull && !later && uint64_t(got)!=want) { if (!res.bad && !bias) printf("sync mismatch rate %.0f speed %d bpm %d clock %llu q %d got %u want %llu\n",cur,speed,bpm,(unsigned long long)clock,q,got,(unsigned long long)want); ++res.bad; }
+    }
+  };
+  while (done<horizon) {
+    act_at(a,cur,done,false);
+    for (size_t i=0;i<acts.size();++i) if (acts[i].clock==done && acts[i].kind==1) {
+      a.pause(true); CHECK(a.frames_until(Quant::Row)==UINT32_MAX && a.frames_until(Quant::Bar)==UINT32_MAX);
+      a.render(out.data(),64,2,cur); CHECK(a.position().clock==done); a.pause(false);
+    }
+    query(done);
+    uint64_t n=uint64_t(chunk==97 ? irregular[call++%7] : chunk);
+    for (size_t i=0;i<acts.size();++i) if (acts[i].clock>done && acts[i].clock-done<n) n=acts[i].clock-done;
+    if (n>horizon-done) n=horizon-done;
+    out.assign(size_t(n)*2,0.0); a.render(out.data(),int(n),2,cur); done+=n;
+  }
+  return res;
+}
+}
+static void test_interactive_frames_until() {
+  struct Case { int speed,bpm,rpb; };
+  const Case cases[]={{6,125,4},{1,255,4},{3,170,2},{31,255,4},{6,32,2},{3,125,3},{1,32,4},{31,125,2}};
+  uint64_t hash=1469598103934665603ull,total=0;
+  for (double rate : {44100.,48000.,96000.}) for (const Case &c : cases) {
+    const double fpt=rate*2.5/c.bpm; const uint64_t row=uint64_t(fpt*c.speed);
+    if (row>60000 && rate!=48000.) continue; // keep the slow tempos at one rate
+    const uint64_t horizon=row*20+3;
+    // Request lands mid-row of section 3 (bar-quantized), later a pause and a rate change.
+    const std::vector<SyncAct> acts={{row*3+row/3,0,0},{row*9+5,1,0},{row*13+7,2,rate==44100. ? 48000. : 44100.}};
+    for (int chunk : {1,64,128,512,97}) {
+      if (chunk==1 && row>3000) continue;
+      SyncRun r=sync_run(rate,c.speed,c.bpm,c.rpb,chunk,horizon,acts,0);
+      CHECK(r.bad==0 && r.checks>0);
+      if (chunk==97) { hash^=r.hash; hash*=1099511628211ull; total+=r.checks; }
+      // Negative control: the same comparison with a one-frame error must fail.
+      if (chunk==128) CHECK(sync_run(rate,c.speed,c.bpm,c.rpb,chunk,horizon,acts,1).bad>0);
+    }
+  }
+  printf("interactive sync %016llx %llu\n",(unsigned long long)hash,(unsigned long long)total);
+  // Unavailable answers: unbound, paused, no section for Beat/Bar, stopped.
+  Runtime idle; CHECK(idle.frames_until(Quant::Row)==UINT32_MAX);
+  ntrk_test::InteractiveFixture f; RuntimeBinding b; CHECK(b.compile(f.module,1,f.caps,3)==Status::Ok);
+  Player p; mix::Mixer mx; Runtime r; CHECK(r.bind(b,p,mx,1,48000)==Status::Ok);
+  CHECK(r.frames_until(Quant::Row)==0 && r.frames_until(Quant::Bar)==0);
+  r.stop(false); CHECK(r.frames_until(Quant::Row)==UINT32_MAX);
+}
 static void test_interactive_saturation_tail() {
   ntrk_test::InteractiveFixture f(1,1,true,true); RuntimeBinding b; CHECK(b.compile(f.module,1,f.caps,3)==Status::Ok);
   Player p; mix::Mixer mx; Runtime r; CHECK(r.bind(b,p,mx,1,48000)==Status::Ok);
@@ -409,4 +508,5 @@ static void test_interactive() {
   test_interactive_macro_gain_tail();
   test_interactive_binding(); test_interactive_ramps(); test_interactive_timing();
   test_interactive_requests_pause(); test_interactive_partition(); test_interactive_saturation_tail();
+  test_interactive_frames_until();
 }
