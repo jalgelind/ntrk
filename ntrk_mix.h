@@ -525,16 +525,16 @@ struct Mixer {
   // slot needs. Untouched -- not even `svf_set` -- for an instrument with no
   // filter flag, which is what keeps a module that asks for nothing bit for bit
   // the unfiltered path.
-  fx::Svf voice_filter[kMaxChannels];
+  fx::Svf voice_filter[kMaxChannels*kMaxNoteColumns];
   // The right side's filter, for a channel playing a stereo sample; untouched otherwise.
-  fx::Svf voice_filter_r[kMaxChannels];
+  fx::Svf voice_filter_r[kMaxChannels*kMaxNoteColumns];
 
   // Where each channel's sample position and synth age were left at the end of
   // the last run, which is how a note trigger is spotted from out here. Two,
   // because one of them holds still for a voice that has no sample to walk.
   // See the use site.
-  double voice_pos[kMaxChannels] = {};
-  uint32_t voice_age[kMaxChannels] = {};
+  double voice_pos[kMaxChannels*kMaxNoteColumns] = {};
+  uint32_t voice_age[kMaxChannels*kMaxNoteColumns] = {};
 
   // -- The effect plane's state. **Not one field of it is touched for a module
   // whose `fx` is null**, which is the whole of the bit-identity guarantee; see

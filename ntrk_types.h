@@ -30,10 +30,12 @@
 #include "ntrk_fx_shape.h"
 
 #include <stdint.h>
+#include <stddef.h>
 
 namespace ntrk {
 
 const int kMaxChannels = 16;
+const int kMaxNoteColumns = 4;
 
 // The format's own ceilings on geometry. The header's fields are u16 and would
 // carry more; these are where the format stops, and the loader and the writer
@@ -404,6 +406,34 @@ instrument_blob_bytes(const Instrument &ins) {
 
 // One cell. Four bytes, because that is what a pattern is mostly made of and a
 // tune is thousands of them: 64 rows by 4 channels by 4 bytes is a 1K pattern.
+// `SLC` — start the note at a slice from the instrument's `SLIC` table.
+//
+// **Past the nibble on purpose.** ProTracker's effect column is a nibble and
+// every one of its sixteen values is spent; this format's `Note::effect` is a
+// whole byte, so a new command starts at 0x10 rather than stealing `Exx`'s
+// sub-nibble space. The consequence is that **three display functions which
+// mask `effect & 15` have to know about it** -- `note_fx_index`,
+// `note_fx_describe` and `note_fx_repr` -- or `SLC 05` prints as `ARP`,
+// describes as *Arpeggio*, and renders as `005`, colliding with arpeggio.
+const uint8_t kFxSlice = 0x10;
+
+// `S` -- Renoise's sample offset. On an instrument with a SLIC table, `S00` is
+// the whole sample from its top and `Sxx` is slice `xx - 1` -- Renoise's
+// numbering, where the root plays the sample and the slices count from one; on
+// one without, it starts `xx/256` of the way in, so
+// every sixteenth is a round hex value (`S80` half, `S40` a quarter). **No
+// memory**, as `SLC`: a fraction means something on its own, and `S00` is the
+// top. Named `SOF`: `OFS` "Sample offset" is `9xx`'s, and the completion list
+// keeps a row per mnemonic and name. Unlike `9xx`, whose `xx * 256` frames reach 1.48 s at 44.1 kHz, this
+// reaches every sample whatever its length. Written with EFXS (see there).
+const uint8_t kFxOffset = 0x11;
+// `H` -- slice `xx` and PLAY ON: `SLC`'s start, never its instrument's slice stop. The
+// per-note answer to "from this slice to the end", where slice stop is per instrument. Also
+// past the nibble, so also covered by EFXS.
+const uint8_t kFxSliceOn = 0x12;
+// The highest note effect this reader plays. EFXS names one above it -> refused.
+const uint8_t kFxLast = kFxSliceOn;
+
 struct Note {
   uint8_t note = 0;         // 0 none, else 1..note_max
   uint8_t instrument = 0;   // 0 none, else 1..instrument_count
@@ -666,7 +696,7 @@ struct Module {
   // it is the format's own shape. `Module{}` (the only brace-init this codebase
   // does) still zero-inits every other field the way it always has; this
   // constructor only reaches into `mix`.
-  Module() { mix_default(mix); }
+  Module() { mix_default(mix); for (int c=0;c<kMaxChannels;++c) note_columns[c]=1; }
 
   int extension_count = 0;
   ExtensionBlock extensions[kMaxBlocks]; // borrowed optional payloads; never audio input
@@ -717,6 +747,8 @@ struct Module {
   int meta_columns = 0;      // whole-row lanes, after every channel lane
 
   const uint8_t *order = nullptr;
+  uint8_t note_columns[kMaxChannels];
+  const Note *extra_notes = nullptr; // three slots per primary cell, inactive slots zero
   const Note *patterns = nullptr;   // pattern_count * rows * channels
   const FxCell *fx = nullptr;       // FXPL, null unless the file carried one
   Instrument instruments[kMaxInstruments];
@@ -760,6 +792,47 @@ struct Module {
   // carried through load/save; **the player and mixer never read it** (see kBlockEdit).
   uint16_t hidden_channels = 0;
 };
+
+// Checked shared geometry; the primary cell retains its historical stride.
+inline bool module_polyphonic(const Module *m) {
+  if (!m || m->channels<1 || m->channels>kMaxChannels) return false;
+  for (int c=0;c<m->channels;++c) if (m->note_columns[c]>1) return true;
+  return false;
+}
+inline const Note *module_note(const Module *m,int pattern,int row,int track,int column=0) {
+  if (!m || pattern<0 || pattern>=m->pattern_count || row<0 || row>=m->rows ||
+      track<0 || track>=m->channels || track>=kMaxChannels || column<0 || column>=kMaxNoteColumns ||
+      m->note_columns[track]<1 || m->note_columns[track]>kMaxNoteColumns || column>=m->note_columns[track]) return nullptr;
+  const size_t at=(size_t(pattern)*m->rows+row)*m->channels+track;
+  return column ? (m->extra_notes ? m->extra_notes+at*3+column-1 : nullptr) : (m->patterns ? m->patterns+at : nullptr);
+}
+inline bool extra_note_valid(const Module *m,const Note &n) {
+  if (!m || n.effect>kFxLast || (n.note>m->note_max && n.note!=kNoteOff) || n.instrument>m->instrument_count) return false;
+  if (n.effect==8 || n.effect==0xB || n.effect==0xD || n.effect==0xF) return false;
+  if (n.effect==0xE && ((n.param>>4)==6 || (n.param>>4)==8 || (n.param>>4)==0xE)) return false;
+  return true;
+}
+// Bounded by the fixed track count; safe at audio initialization without reading cells.
+inline bool module_column_layout_valid(const Module *m) {
+  if (!m || m->channels<1 || m->channels>kMaxChannels) return false;
+  for (int c=0;c<kMaxChannels;++c)
+    if (m->note_columns[c]<1 || m->note_columns[c]>kMaxNoteColumns ||
+        (c>=m->channels && m->note_columns[c]!=1) || (m->note_columns[c]>1 && !m->extra_notes)) return false;
+  return true;
+}
+inline bool module_columns_valid(const Module *m) {
+  if (!module_column_layout_valid(m) || m->rows<1 || m->rows>kMaxRows ||
+      m->pattern_count<1 || m->pattern_count>kMaxPatterns) return false;
+  if (!m->extra_notes) return true;
+  const size_t cells=size_t(m->pattern_count)*m->rows*m->channels;
+  for (size_t i=0;i<cells;++i) for (int j=0;j<3;++j) {
+    const Note &n=m->extra_notes[i*3+j];
+    if (j+1>=m->note_columns[i%m->channels]) {
+      if (n.note || n.instrument || n.effect || n.param) return false;
+    } else if (!extra_note_valid(m,n)) return false;
+  }
+  return true;
+}
 
 // Whether channel `c` is silenced at order position `o`. **The one reader**, so
 // the bit arithmetic is spelled once rather than at the player, the writer and
@@ -973,6 +1046,7 @@ struct Player {
   int bpm = 125;
   double until_tick = 0.0;   // output frames left in this tick
   Channel channels[kMaxChannels];
+  Channel extra_channels[kMaxChannels][kMaxNoteColumns-1];
   bool playing = false;
   bool loop = true;          // start the tune again rather than stopping
 
@@ -1060,6 +1134,11 @@ channel_silent(const Module *m, const Player *p, int c) {
   if (p != nullptr && c >= 0 && c < kMaxChannels && p->muted[c])
     return true;
   return slot_muted(m, p != nullptr ? p->order : -1, c);
+}
+
+inline Channel *player_voice(Player *p,int track,int column=0) {
+  if (!p || track<0 || track>=kMaxChannels || column<0 || column>=kMaxNoteColumns) return nullptr;
+  return column ? &p->extra_channels[track][column-1] : &p->channels[track];
 }
 
 }  // namespace ntrk

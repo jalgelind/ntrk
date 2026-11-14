@@ -1,5 +1,6 @@
 import {TrackerCanvas,fieldLayout} from './canvas.js';
 import {PATTERN_CHUNK_ROWS,ScoreCommands} from './engine.js';
+import {MetadataClient,sameVersion} from './metadata.js';
 const canvas=document.getElementById('tracker'),open=document.getElementById('open');
 const m={snapshot:null,state:null,order:0,row:0,channel:0,field:0,dirty:false,nibble:'',busy:false,ready:false,volume:1,level:0,
   octave:2,instrument:1,edit:false,follow:true,help:false,confirm:null,name:'Module player',message:'Loading audio engine…',error:false,
@@ -9,11 +10,28 @@ const pending=new Map();
 // Score commands: one producer (see ScoreCommands). A batch for a replaced
 // generation is refused as stale by the engine.
 const commands=new ScoreCommands();
-let loadGeneration=0,patternSerial=0,descriptionSerial=0,editSerial=0;
+let loadGeneration=0,patternSerial=0,descriptionSerial=0;
+let audioFailed=false;
+const audioFailureMessage='Audio engine failed; reload the page to restart';
+function requireAudio() {if(audioFailed)throw new Error(audioFailureMessage);}
+let metadata,metadataError='',committed={epoch:0,revision:0};
+function unavailable(error) {
+  if(audioFailed)return;
+  metadataError=`Command labels unavailable: ${error.message}. Playback remains available; reload the page to retry.`;
+  ++patternSerial;++descriptionSerial;
+  if(m.snapshot)m.snapshot.commands=null;
+  m.description='';status(metadataError,true);
+}
+function invalidateMetadata() {
+  ++patternSerial;++descriptionSerial;metadata?.cancelQueries();
+  if(m.snapshot)m.snapshot.commands=null;
+  m.description='';view.invalidate();
+}
 const view=new TrackerCanvas(canvas,m,(type,arg)=>{if(type==='open'){open.click();return;}if(type==='transport')ctx?.resume();enqueue(()=>action(type,arg));});
-function status(message,error=false) {m.message=message;m.error=error;view.invalidate();}
-function request(type,args=[]) {
-  return new Promise((resolve,reject)=>{
+function status(message,error=false) {m.message=audioFailed?audioFailureMessage:metadataError||message;m.error=audioFailed||!!metadataError||error;view.invalidate();}
+async function request(type,args=[]) {
+  requireAudio();
+  const reply=await new Promise((resolve,reject)=>{
     const id=++seq;
     const mutation=['load','demo','edit','transport','mute','select','score'].includes(type);
     const timer=setTimeout(()=>{
@@ -21,45 +39,51 @@ function request(type,args=[]) {
       if(mutation){status('Waiting for audio engine…');return;}
       pending.delete(id);reject(new Error('Audio engine did not respond'));
     },10000);
-    pending.set(id,{resolve,reject,timer});node.port.postMessage({id,type,args});
+    pending.set(id,{resolve,reject,timer});
+    try{node.port.postMessage({id,type,args,...committed});}
+    catch(error){clearTimeout(timer);pending.delete(id);reject(error);}
   });
+  requireAudio();
+  if(['load','demo','edit'].includes(type)) {
+    committed={epoch:reply.epoch,revision:reply.revision};invalidateMetadata();
+    if(!metadataError) {
+      try{await metadata.request(type,args,committed);}
+      catch(error){metadata.fail(error);}
+    }
+    requireAudio();
+    if(type==='edit')refreshPattern().catch(error=>status(error.message,true));
+  }
+  return reply.result;
 }
 function selectedDescription() {
   const snapshot=m.snapshot,gen=loadGeneration,serial=++descriptionSerial;
   m.description='';
-  if(!snapshot?.commands)return;
+  if(!snapshot?.commands||metadataError)return;
+  const version={...committed};
   const pattern=snapshot.orders[m.order],row=m.row,c=m.channel,f=m.field;
   const lane=c<0?f:f<4?-1:f-4;
-  request('formatted',[pattern,row,c,lane]).then(cell=>{
-    if(gen!==loadGeneration||serial!==descriptionSerial||snapshot!==m.snapshot)return;
+  metadata.request('formatted',[pattern,row,c,lane],version).then(cell=>{
+    if(!cell||!sameVersion(version,committed)||gen!==loadGeneration||serial!==descriptionSerial||snapshot!==m.snapshot)return;
     m.description=cell.description==='None'?'':cell.description;view.invalidate();
   }).catch(error=>{if(gen===loadGeneration&&serial===descriptionSerial)status(error.message,true);});
 }
 async function refreshPattern() {
+  invalidateMetadata();
   const snapshot=m.snapshot;
-  if(!snapshot)return;
-  const pattern=snapshot.orders[m.order],gen=loadGeneration,serial=++patternSerial;
-  snapshot.commands=null;m.description='';++descriptionSerial;view.invalidate();
-  // Rows arrive in small windows so the audio worklet interleaves rendering
-  // between them. An edit landing mid-assembly restarts it, so a window fetched
-  // before the edit never survives.
-  const stale=()=>gen!==loadGeneration||serial!==patternSerial||snapshot!==m.snapshot||snapshot.orders[m.order]!==pattern;
-  let commands;
-  for(;;) {
-    const edits=editSerial;
-    commands={pattern,rows:[]};
-    for(let start=0;start<m.state[1];start+=PATTERN_CHUNK_ROWS) {
-      const part=await request('pattern',[pattern,start,PATTERN_CHUNK_ROWS]);
-      if(stale())return;
-      commands.rows.push(...part.rows);
-    }
-    if(edits===editSerial)break;
+  if(!snapshot||metadataError)return;
+  const pattern=snapshot.orders[m.order],gen=loadGeneration,serial=patternSerial,version={...committed};
+  const stale=()=>!sameVersion(version,committed)||gen!==loadGeneration||serial!==patternSerial||snapshot!==m.snapshot||snapshot.orders[m.order]!==pattern;
+  const labels={pattern,rows:[]};
+  for(let start=0;start<snapshot.state[1];start+=PATTERN_CHUNK_ROWS) {
+    const part=await metadata.request('pattern',[pattern,start,PATTERN_CHUNK_ROWS],version);
+    if(!part||stale())return;
+    labels.rows.push(...part.rows);
   }
-  snapshot.commands=commands;selectedDescription();view.invalidate();
+  snapshot.commands=labels;selectedDescription();view.invalidate();
 }
 async function replaceSong(type,args,name) {
   const previous={snapshot:m.snapshot,state:m.state};
-  ++loadGeneration;++patternSerial;++descriptionSerial;m.snapshot=null;m.state=null;m.description='';view.invalidate();
+  invalidateMetadata();++loadGeneration;m.snapshot=null;m.state=null;m.description='';view.invalidate();
   let committed=false;
   try {
     const result=await request(type,args);committed=true;
@@ -71,6 +95,7 @@ async function replaceSong(type,args,name) {
 }
 function index(r=m.row,c=m.channel,f=m.field) {return ((m.snapshot.orders[m.order]*m.state[1]+r)*m.state[0]+c)*4+f;}
 function updateState(s) {
+  if(audioFailed)return;
   if(m.state&&s.every((value,i)=>value===m.state[i])&&!(m.snapshot&&!m.busy&&m.follow&&s[8]&&m.order!==s[6]))return;
   m.state=s;
   if(m.snapshot&&!m.busy&&m.follow&&s[8]) {
@@ -114,6 +139,7 @@ async function refreshFeedback() {
   updateState(state);applyFeedback(feedback);
 }
 async function adopt(result,name) {
+  requireAudio();
   ++loadGeneration;++patternSerial;++descriptionSerial;m.description="";
   commands.bind(0);m.feedback=null;m.cues=[];
   const decoder=new TextDecoder();
@@ -218,13 +244,9 @@ open.onchange=()=>{const file=open.files[0];open.value='';enqueue(()=>loadFile(f
 canvas.addEventListener('dragover',e=>{e.preventDefault();});
 canvas.addEventListener('drop',e=>{e.preventDefault();const file=e.dataTransfer.files[0];enqueue(()=>loadFile(file));});
 async function write(value) {
-  ++editSerial;
   await request('edit',[m.snapshot.orders[m.order],m.row,m.channel,m.field,value]);
+  requireAudio();
   m.snapshot.cells[index()]=value;m.dirty=true;
-  const pattern=m.snapshot.orders[m.order];
-  const formatted=await request('formatted',[pattern,m.row,m.channel,-1]);
-  if(m.snapshot.commands?.pattern===pattern)
-    m.snapshot.commands.rows[m.row][m.channel*(1+m.state[12])]=formatted.text;
   m.row=(m.row+1)%m.state[1];
   selectedDescription();view.reveal();status('Cell updated');
 }
@@ -281,6 +303,7 @@ async function keydown(event) {
     if(m.field===0&&value!==0&&value!==97) {
       const instrument=m.instrument;
       await request('edit',[m.snapshot.orders[m.order],m.row,m.channel,1,instrument]);
+      requireAudio();
       m.snapshot.cells[index(m.row,m.channel,1)]=instrument;
     }
     await write(value);
@@ -302,16 +325,26 @@ run(async()=>{
   await ctx.audioWorklet.addModule('worklet.js');
   m.rate=ctx.sampleRate;
   node=new AudioWorkletNode(ctx,'ntrk',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2],processorOptions:{module}});
-  node.onprocessorerror=()=>{
+  const audioFailure=()=>{
+    if(audioFailed)return;
+    audioFailed=true;commands.bind(0);commands.clear();m.feedback=null;m.cues=[];m.description='';
     m.ready=false;m.snapshot=null;m.state=null;++loadGeneration;++patternSerial;++descriptionSerial;
     for(const p of pending.values()){clearTimeout(p.timer);p.reject(new Error('Audio engine failed'));}pending.clear();
-    status('Audio engine failed; reload the page to restart',true);
+    metadata?.close();metadataError='';status(audioFailureMessage,true);
   };
+  node.onprocessorerror=audioFailure;node.port.onmessageerror=audioFailure;
   node.port.onmessage=({data})=>{
+    if(audioFailed)return;
     if(data.state){updateState(data.state);return;}
     const p=pending.get(data.id);if(!p)return;clearTimeout(p.timer);pending.delete(data.id);
-    if(data.error)p.reject(new Error(data.error));else p.resolve(data.result);
+    if(data.error)p.reject(new Error(data.error));else p.resolve(data);
   };
+  try {
+    metadata=new MetadataClient(new Worker('metadata-worker.js',{type:'module'}),unavailable);
+    await metadata.request('init',[module,ctx.sampleRate],committed);
+  } catch(error){if(metadata)metadata.fail(error);else unavailable(error);}
+  requireAudio();
+  window.addEventListener('pagehide',event=>{if(!event.persisted)metadata?.close();});
   gain=ctx.createGain();
   const splitter=ctx.createChannelSplitter(2);
   analysers=[ctx.createAnalyser(),ctx.createAnalyser()];
@@ -337,6 +370,6 @@ run(async()=>{
     }
     if(level!==m.level){m.level=level;view.invalidate();}
     if(polling||!m.snapshot||ctx.state!=='running')return;polling=true;
-    run(async()=>{try{if(m.snapshot.score)await refreshFeedback();else updateState(await request('state'));}finally{polling=false;}});
+    run(async()=>{try{if(m.snapshot.score)await refreshFeedback();else {const snapshot=m.snapshot,state=await request('state');if(snapshot===m.snapshot)updateState(state);}}finally{polling=false;}});
   },40);
 });

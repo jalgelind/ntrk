@@ -550,7 +550,26 @@ void test_interactive(const char *directory) {
   std::puts("web interactive: explicit path/initial section, standalone-runtime audio+cue parity, zero render allocation, sequencing, stale reload, unsupported profile/rate, end/restart, section-less, ordinary retirement passed");
 }
 
+// An editor without a column axis must refuse before replacing its current song.
+static void test_note_column_refusal() {
+  assert(web_demo(48000));const int original_size=web_save();assert(original_size>0);
+  const std::vector<uint8_t> original(web_input(),web_input()+original_size);
+  ntrk::Module poly=song;
+  std::vector<ntrk::Note> extra(size_t(poly.pattern_count)*poly.rows*poly.channels*3);
+  poly.note_columns[0]=2;poly.extra_notes=extra.data();extra[0].note=25;extra[0].instrument=1;
+  size_t size=0;assert(ntrk::module_save(&poly,web_input(),web_capacity(),&size));
+  assert(web_load(int(size))==-6);
+  assert(web_save()==original_size);assert(!std::memcmp(original.data(),web_input(),original.size()));
+  ntrk_test::InteractiveFixture fixture; ntrk::Note plane[12]={};
+  fixture.module.note_columns[0]=2;fixture.module.extra_notes=plane;plane[0].note=25;plane[0].instrument=1;
+  assert(ntrk::module_save(&fixture.module,web_input(),web_capacity(),&size));
+  assert(web_load_interactive(int(size))==-6);
+  assert(web_save()==original_size);assert(!std::memcmp(original.data(),web_input(),original.size()));
+  std::puts("web note columns: ordinary/interactive refusal preserves current song");
+}
+
 int main(int argc, char **argv) {
+  test_note_column_refusal();
   assert(!web_demo(0));
   assert(web_demo(48000));
   assert(web_info(0) == ntrk::kMaxChannels && web_info(1) == 32 && web_info(3) == 2);

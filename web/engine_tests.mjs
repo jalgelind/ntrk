@@ -21,8 +21,8 @@ assert.equal(snapshot.state[12],8);assert.equal(snapshot.state[13],5);
 assert(snapshot.fx.byteLength>13000000);
 const NativeMap=globalThis.Map;let peakCache=0;
 globalThis.Map=class extends NativeMap{set(k,v){super.set(k,v);peakCache=Math.max(peakCache,this.size);return this;}};
-// The worklet handles one window per message, so the longest uninterrupted
-// audio-thread hold is the slowest single window, not the whole pattern.
+// The metadata Worker handles one window per message; window size bounds
+// cancellation latency and payloads, with no cell formatting on the audio owner.
 let commands={pattern:197,rows:[]},worstMs=0,windows=0;
 assert.throws(()=>engine.command('pattern',[197,0,PATTERN_CHUNK_ROWS+1]),/window/);
 try{

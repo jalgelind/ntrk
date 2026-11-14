@@ -569,10 +569,13 @@ mixer_reset(Mixer *mx) {
   for (int c = 0; c < kMaxChannels; ++c) {
     slot_revert(&mx->insert[c]);
     slot_set_kind(&mx->insert[c], mx->insert[c].kind);
-    fx::svf_reset(&mx->voice_filter[c]);
-    fx::svf_reset(&mx->voice_filter_r[c]);
-    mx->voice_pos[c] = 0.0;
-    mx->voice_age[c] = 0u;
+    for(int nc=0;nc<kMaxNoteColumns;++nc) {
+      const int vi=nc ? kMaxChannels+c*3+nc-1 : c;
+    fx::svf_reset(&mx->voice_filter[vi]);
+    fx::svf_reset(&mx->voice_filter_r[vi]);
+    mx->voice_pos[vi] = 0.0;
+    mx->voice_age[vi] = 0u;
+    }
   }
   for (int s = 0; s < kSends; ++s) {
     slot_revert(&mx->send[s]);
@@ -1697,11 +1700,14 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
     }
 
     for (int c = 0; c < m->channels; ++c) {
-      Channel *ch = &player->channels[c];
-      if (ch->instrument <= 0)
-        continue;
-
-      float *v = mx->voice[c];
+      float *sum=mx->voice[c];
+      float sum_r[kMaxBlock], scratch[kMaxBlock], scratch_r[kMaxBlock];
+      bool st=false, have=false;
+      for (int nc=0;nc<m->note_columns[c];++nc) {
+        Channel *ch=player_voice(player,c,nc);
+        if (ch->instrument<=0) continue;
+        const int vi=nc ? kMaxChannels+(c*3+nc-1) : c;
+        float *v=scratch;
       const Instrument &ins = m->instruments[ch->instrument - 1];
 
       // **A new note gets a clean filter**, or a resonant one rings the
@@ -1724,26 +1730,26 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       // trigger — and a voice triggered inside `player_run_begin` above is
       // playing by construction and renders the whole of the run that triggered
       // it, so the stored value is at least one.
-      if (ch->pos != mx->voice_pos[c] || ch->synth_age != mx->voice_age[c]) {
-        fx::svf_reset(&mx->voice_filter[c]);
-        fx::svf_reset(&mx->voice_filter_r[c]);
+      if (ch->pos != mx->voice_pos[vi] || ch->synth_age != mx->voice_age[vi]) {
+        fx::svf_reset(&mx->voice_filter[vi]);
+        fx::svf_reset(&mx->voice_filter_r[vi]);
       }
 
       // **A stereo sample runs the strip in stereo, decided per run**: a channel's instrument
       // changes only on a trigger, and a run never crosses a tick. `vr` IS `v` for a mono voice,
       // so everything below reads the right side through it and a mono voice does exactly the
       // arithmetic it always did.
-      const bool st = (ins.flags & kInstrumentStereo) != 0u;
-      float *vr = st ? mx->voice_r : v;
-      if (st) {
+      const bool voice_st = (ins.flags & kInstrumentStereo) != 0u;
+      float *vr = voice_st ? scratch_r : v;
+      if (voice_st) {
         for (int i = 0; i < run; ++i)
           channel_sample2(ch, ins, &v[i], &vr[i]);
       } else {
         for (int i = 0; i < run; ++i)
           v[i] = channel_sample(ch, ins);
       }
-      mx->voice_pos[c] = ch->pos;
-      mx->voice_age[c] = ch->synth_age;
+      mx->voice_pos[vi] = ch->pos;
+      mx->voice_age[vi] = ch->synth_age;
 
       // **Before the insert, and before the mute.** The instrument's filter is
       // part of the voice -- the insert is the user's effect on top of the
@@ -1762,7 +1768,7 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
       // Two in series would be a filter the format never described.
       const bool plane_filter = plane && mx->fxpl_filter[c];
       if (plane_filter || (ins.flags & kInstrumentFilter) != 0u) {
-        fx::Svf *f = &mx->voice_filter[c];
+        fx::Svf *f = &mx->voice_filter[vi];
         int type;
         if (plane_filter) {
           fx::svf_set(f, fxpl_to_cutoff(mx->fxpl_val[c][kFxplCutoff]),
@@ -1775,8 +1781,8 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
         }
         for (int i = 0; i < run; ++i)
           v[i] = voice_filter_sample(f, type, v[i]);
-        if (st) {
-          fx::Svf *fr = &mx->voice_filter_r[c];
+        if (voice_st) {
+          fx::Svf *fr = &mx->voice_filter_r[vi];
           fr->a1 = f->a1;                // the same coefficients, the right side's own state
           fr->a2 = f->a2;
           fr->a3 = f->a3;
@@ -1785,6 +1791,13 @@ mixer_render_add(Mixer *mx, Player *player, double *buffer, int frames,
             vr[i] = voice_filter_sample(fr, type, vr[i]);
         }
       }
+
+        if (!have) for (int i=0;i<run;++i) { sum[i]=v[i]; sum_r[i]=vr[i]; }
+        else for (int i=0;i<run;++i) { sum[i]+=v[i]; sum_r[i]+=vr[i]; }
+        have=true; st=st || voice_st;
+      }
+      if (!have) continue;
+      float *v=sum, *vr=st ? sum_r : sum;
 
       // Sampled even when muted, because channel_sample is what advances the
       // position and a channel that stopped being read would freeze and then

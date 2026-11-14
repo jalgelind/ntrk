@@ -6,7 +6,7 @@ import sys
 
 out = Path(sys.argv[1])
 source = Path(__file__).parent
-names = ['index.html', 'style.css', 'app.js', 'canvas.js', 'engine.js', 'worklet.js']
+names = ['index.html', 'style.css', 'app.js', 'canvas.js', 'engine.js', 'worklet.js', 'metadata.js', 'metadata-worker.js']
 contents = {name: (source / name).read_bytes() for name in names}
 contents.update({name: (out / name).read_bytes() for name in ['ntrk.wasm', 'demo.json']})
 if (out / 'demo.ntrk').exists():

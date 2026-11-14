@@ -867,6 +867,7 @@ const int kDirectoryEntryBytes = 12;
 // preserved when the file says it is optional and refused when it says it is
 // critical, which is how this reader stays honest against a file written by a
 // later one.
+const uint16_t kBlockNcol = 0x0013; // critical note columns, version 1
 const uint16_t kBlockMeta = 0x0011;
 const uint16_t kBlockFxpl = 0x0001;
 const uint16_t kBlockName = 0x0002;
@@ -1003,7 +1004,7 @@ inline bool meta_field_encode(const MetaField &f, uint8_t *out, size_t cap, size
   return true;
 }
 inline bool block_known(uint16_t id) {
-  return (id >= 1 && id <= 6) || (id >= 0xA && id <= 0xF) || id == kBlockMeta || id == kBlockImus;
+  return (id >= 1 && id <= 6) || (id >= 0xA && id <= 0xF) || id == kBlockMeta || id == kBlockImus || id == kBlockNcol;
 }
 
 // SMUT: `u16 order_count`, `u16 channels`, then one `u16 LE` per order position
@@ -1035,34 +1036,6 @@ const int kSmutHeaderBytes = 4;
 const int kSlicHeaderBytes = 4;
 const int kSlicRecordBytes = 4;
 const int kSlicOffsetBytes = 4;
-
-// `SLC` — start the note at a slice from the instrument's `SLIC` table.
-//
-// **Past the nibble on purpose.** ProTracker's effect column is a nibble and
-// every one of its sixteen values is spent; this format's `Note::effect` is a
-// whole byte, so a new command starts at 0x10 rather than stealing `Exx`'s
-// sub-nibble space. The consequence is that **three display functions which
-// mask `effect & 15` have to know about it** -- `note_fx_index`,
-// `note_fx_describe` and `note_fx_repr` -- or `SLC 05` prints as `ARP`,
-// describes as *Arpeggio*, and renders as `005`, colliding with arpeggio.
-const uint8_t kFxSlice = 0x10;
-
-// `S` -- Renoise's sample offset. On an instrument with a SLIC table, `S00` is
-// the whole sample from its top and `Sxx` is slice `xx - 1` -- Renoise's
-// numbering, where the root plays the sample and the slices count from one; on
-// one without, it starts `xx/256` of the way in, so
-// every sixteenth is a round hex value (`S80` half, `S40` a quarter). **No
-// memory**, as `SLC`: a fraction means something on its own, and `S00` is the
-// top. Named `SOF`: `OFS` "Sample offset" is `9xx`'s, and the completion list
-// keeps a row per mnemonic and name. Unlike `9xx`, whose `xx * 256` frames reach 1.48 s at 44.1 kHz, this
-// reaches every sample whatever its length. Written with EFXS (see there).
-const uint8_t kFxOffset = 0x11;
-// `H` -- slice `xx` and PLAY ON: `SLC`'s start, never its instrument's slice stop. The
-// per-note answer to "from this slice to the end", where slice stop is per instrument. Also
-// past the nibble, so also covered by EFXS.
-const uint8_t kFxSliceOn = 0x12;
-// The highest note effect this reader plays. EFXS names one above it -> refused.
-const uint8_t kFxLast = kFxSliceOn;
 
 // The FXPL payload's geometry prefix: `u16 fx_columns`, `u16 meta_columns`,
 // then the cells. In the payload rather than in the header because the header
@@ -1260,6 +1233,11 @@ module_load_impl(Module *module, const uint8_t *data, size_t size, ModuleLoadMod
       // `FxCell` has no alignment of its own -- two uint8_t -- so the cells
       // start at an arbitrary offset plus four and the cast stays sound.
       module->fx = (const FxCell *) (const void *) (p + kFxplPrefixBytes);
+    } else if (id == kBlockNcol) {
+      const size_t want=20u+size_t(module->pattern_count)*module->rows*module->channels*12u;
+      if (flags!=kBlockCritical || bytes!=want || read_u16(data+offset)!=1 || read_u16(data+offset+2)!=0) return false;
+      for (int c=0;c<kMaxChannels;++c) module->note_columns[c]=data[offset+4+c];
+      module->extra_notes=reinterpret_cast<const Note *>(data+offset+20);
     } else if (id == kBlockImus) {
       if (flags != kBlockCritical || !bytes || bytes > kMaxImusBytes) return false;
       if (mode == ModuleLoadMode::Ordinary) {
@@ -1715,6 +1693,7 @@ module_load_impl(Module *module, const uint8_t *data, size_t size, ModuleLoadMod
     }
   }
 
+  if (!module_columns_valid(module)) return false;
   if (module->imus_bytes) {
     const ImusStatus status = imus_decode(module->imus, module->imus_bytes, nullptr, module);
     if (status == ImusStatus::Invalid) return false;
@@ -1817,6 +1796,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
   // which no per-field bound can see.
   if (module->rows_per_bar % module->rows_per_beat != 0)
     return false;
+  if (!module_columns_valid(module)) return false;
   if (module->order == nullptr || module->patterns == nullptr)
     return false;
   if (module->note_max != 36 && module->note_max != kMaxNote)
@@ -1995,6 +1975,13 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     if (e > kFxSlice && e <= kFxLast && e > efxs_high)
       efxs_high = e;
   }
+  if (module->extra_notes) for (size_t i=0;i<cells*3;++i) {
+    const uint8_t e=module->extra_notes[i].effect;
+    if (e>kFxLast) return false;
+    if (e>kFxSlice && e>efxs_high) efxs_high=e;
+  }
+  const bool want_ncol=module_polyphonic(module);
+  const size_t ncol_bytes=want_ncol ? 20u+cells*12u : 0u;
   const bool want_efxs = efxs_high != 0u;
   const bool want_edit = module->hidden_channels != 0u;   // see kBlockEdit
 
@@ -2010,7 +1997,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     if (b.bytes > UINT32_MAX - extra_bytes) return false;
     extra_bytes += b.bytes;
   }
-  const int block_count = module->extension_count + (module->metadata_bytes ? 1 : 0) + (module->imus_bytes ? 1 : 0) + 1 + (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
+  const int block_count = (want_ncol ? 1 : 0) + module->extension_count + (module->metadata_bytes ? 1 : 0) + (module->imus_bytes ? 1 : 0) + 1 + (want_fx ? 1 : 0) + (want_tune ? 1 : 0) +
                           (want_name ? 1 : 0) + (want_synp ? 1 : 0) +
                           (want_macr ? 1 : 0) + (want_mixr ? 1 : 0) +
                           (want_slic ? 1 : 0) + (want_smut ? 1 : 0) +
@@ -2051,7 +2038,7 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
                        pattern_bytes + blob_bytes + directory_bytes + fx_bytes +
                        tune_bytes + name_bytes + synp_bytes + macr_bytes +
                        mixr_bytes + slic_bytes + smut_bytes + itun_bytes +
-                       efxs_bytes + edit_bytes + (size_t) module->instrument_count;
+                       efxs_bytes + edit_bytes + ncol_bytes + (size_t) module->instrument_count;
 
   if (total > UINT32_MAX || extra_bytes > UINT32_MAX - total) return false;
   const size_t final_total = total + extra_bytes;
@@ -2193,6 +2180,18 @@ module_save(const Module *module, uint8_t *out, size_t cap, size_t *written) {
     at += (size_t) kTuneBytes;
   }
 
+  if (want_ncol) {
+    write_u16(out+entry,kBlockNcol); write_u16(out+entry+2,kBlockCritical);
+    write_u32(out+entry+4,uint32_t(at)); write_u32(out+entry+8,uint32_t(ncol_bytes));
+    entry+=kDirectoryEntryBytes;
+    write_u16(out+at,1); write_u16(out+at+2,0);
+    for (int c=0;c<kMaxChannels;++c) out[at+4+c]=module->note_columns[c];
+    for (size_t i=0;i<cells*3;++i) {
+      const Note &n=module->extra_notes[i]; const size_t x=at+20+i*4;
+      out[x]=n.note; out[x+1]=n.instrument; out[x+2]=n.effect; out[x+3]=n.param;
+    }
+    at+=ncol_bytes;
+  }
   if (want_efxs) {
     // **Critical, always**: its only job is to make an older reader refuse.
     write_u16(out + entry + 0, kBlockEfxs);
@@ -2518,10 +2517,10 @@ player_start_ex(Player *player, const Module *module, PlaybackMode mode) {
   // the struct before it validates anything, so a caller that ignores its
   // result hands us a `Module` with null pattern and order pointers — and the
   // first render would dereference them on the audio thread. The load path is
-  // careful never to read past a bad file; this is the other half of that, and
-  // the half that costs one line.
+  // careful never to read past a bad file; this is the other half of that.
+  // Column layout checks visit only the fixed track counts, never song cells.
   if (module == nullptr || module->order == nullptr ||
-      module->patterns == nullptr || module->channels < 1 ||
+      module->patterns == nullptr || !module_column_layout_valid(module) ||
       module->rows < 1 || module->order_count < 1 ||
       ((module->imus || module->imus_bytes) && mode != PlaybackMode::LinearPreview))
     return;
@@ -2579,8 +2578,8 @@ player_loop_range(Player *player, int first, int last) {
 inline void
 player_stop(Player *player) {
   player->playing = false;
-  for (int i = 0; i < kMaxChannels; ++i)
-    player->channels[i].playing = false;
+  for (int i = 0; i < kMaxChannels; ++i) for(int nc=0;nc<kMaxNoteColumns;++nc)
+    player_voice(player,i,nc)->playing = false;
 }
 
 // Jump to a position without playing up to it. An editor needs this for every
@@ -2625,8 +2624,8 @@ player_seek(Player *player, int order, int row) {
 
   // Every channel back to nothing sounding: what they were playing belongs to
   // the row we just left, not the one we are landing on.
-  for (int i = 0; i < kMaxChannels; ++i)
-    player->channels[i] = Channel();
+  for (int i = 0; i < kMaxChannels; ++i) for(int nc=0;nc<kMaxNoteColumns;++nc)
+    *player_voice(player,i,nc) = Channel();
 
   return true;
 }
@@ -3078,15 +3077,19 @@ channel_trigger(const Module *m, Channel *ch, int note, double start_frame,
 // playing, and the next row on that channel takes it back.
 inline bool
 player_preview(Player *player, int channel, int note, int instrument,
-               double sample_rate) {
+               double sample_rate, int note_column=0) {
   if (!player_playback_allowed(player))
     return false;
   const Module *m = player->module;
-  if (channel < 0 || channel >= m->channels)
+  if (!module_column_layout_valid(m) || channel < 0 || channel >= m->channels || channel >= kMaxChannels ||
+      note_column<0 || note_column>=kMaxNoteColumns || note_column>=m->note_columns[channel])
     return false;
   if (note < 1 || note > m->note_max)
     return false;
   if (instrument < 1 || instrument > m->instrument_count)
+    return false;
+  Channel *ch = player_voice(player,channel,note_column);
+  if (!ch)
     return false;
 
   if (!player->playing) {
@@ -3095,8 +3098,7 @@ player_preview(Player *player, int channel, int note, int instrument,
   }
 
   const Instrument &ins = m->instruments[instrument - 1];
-  Channel *ch = &player->channels[channel];
-  player_instrument_pan(player, channel, instrument);
+  if (note_column==0) player_instrument_pan(player, channel, instrument);
   ch->instrument = instrument;
   ch->tune_ratio = instrument_tune_ratio(ins);
   ch->finetune = ins.finetune;
@@ -3159,9 +3161,9 @@ player_row(Player *player, double sample_rate) {
       (size_t) module_lanes(m);
   const FxCell *plane = m->fx != nullptr ? m->fx + plane_row : nullptr;
 
-  for (int c = 0; c < m->channels; ++c) {
-    Channel *ch = &player->channels[c];
-    const Note &n = row[c];
+  for (int c = 0; c < m->channels; ++c) for (int nc=0;nc<m->note_columns[c];++nc) {
+    Channel *ch = player_voice(player,c,nc);
+    const Note &n = nc ? *module_note(m,player_pattern(m,player->order),player->row,c,nc) : row[c];
     const int effect = n.effect;
     const uint8_t param = n.param;
 
@@ -3239,7 +3241,7 @@ player_row(Player *player, double sample_rate) {
       ch->finetune = m->instruments[n.instrument - 1].finetune;
     }
 
-    if ((n.instrument > 0 || (n.note > 0 && n.note <= m->note_max)) && ch->instrument > 0)
+    if (nc==0 && (n.instrument > 0 || (n.note > 0 && n.note <= m->note_max)) && ch->instrument > 0)
       player_instrument_pan(player, c, ch->instrument);
 
     // E5x overrides the instrument's finetune, and has to be read before the
@@ -3533,8 +3535,8 @@ player_row(Player *player, double sample_rate) {
   // channel of this row sets it; and on every row a glide runs through, so a
   // tempo change halfway through a long slide is followed rather than missed.
   const float frames = (float) frames_per_tick(player, sample_rate);
-  for (int c = 0; c < m->channels; ++c) {
-    Channel *ch = &player->channels[c];
+  for (int c = 0; c < m->channels; ++c) for (int nc=0;nc<m->note_columns[c];++nc) {
+    Channel *ch = player_voice(player,c,nc);
     if (ch->slide_ticks > 0)
       ch->synth_glide = frames > 1.f
                             ? (double) -fx::ntrk303_expm1(-ch->slide_rate / frames)
@@ -3553,9 +3555,9 @@ player_effects(Player *player, double sample_rate) {
                                        (size_t) m->rows +
                                    (size_t) player->row) *
                                       (size_t) m->channels;
-  for (int c = 0; c < m->channels; ++c) {
-    Channel *ch = &player->channels[c];
-    const Note &n = row[c];
+  for (int c = 0; c < m->channels; ++c) for (int nc=0;nc<m->note_columns[c];++nc) {
+    Channel *ch = player_voice(player,c,nc);
+    const Note &n = nc ? *module_note(m,player_pattern(m,player->order),player->row,c,nc) : row[c];
 
     // The three "on tick n" effects, which are not a slide and do not belong in
     // the switch: they are the same shape as each other and none of them cares
@@ -4105,8 +4107,8 @@ inline void
 player_walk_run(Player *player, int run) {
   const Module *m = player->module;
   for (int i = 0; i < run; ++i) {
-    for (int c = 0; c < m->channels; ++c) {
-      Channel *ch = &player->channels[c];
+    for (int c = 0; c < m->channels; ++c) for (int nc=0;nc<m->note_columns[c];++nc) {
+      Channel *ch = player_voice(player,c,nc);
       if (ch->instrument <= 0)
         continue;
       // Muted channels are walked too, exactly as in `render_add` -- a channel
@@ -4239,8 +4241,8 @@ render_add(Player *player, double *buffer, int frames, int channels,
     const int at = frame + i;
     float left = 0.f;
     float right = 0.f;
-    for (int c = 0; c < m->channels; ++c) {
-      Channel *ch = &player->channels[c];
+    for (int c = 0; c < m->channels; ++c) for (int nc=0;nc<m->note_columns[c];++nc) {
+      Channel *ch = player_voice(player,c,nc);
       if (ch->instrument <= 0)
         continue;
       const Instrument &ins = m->instruments[ch->instrument - 1];

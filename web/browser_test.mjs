@@ -23,21 +23,39 @@ try {
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   browser=await chromium.launch({headless:true});
   const page=await browser.newPage({acceptDownloads:true,viewport:{width:1280,height:720},deviceScaleFactor:2});
-  const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  const errors=[],assetRequests=[];page.on('pageerror',error=>errors.push(error.message));
+  page.on('request',request=>{if(new URL(request.url()).pathname.endsWith('.js'))assetRequests.push(request.url());});
   await page.addInitScript(()=>{
     const createGain=AudioContext.prototype.createGain;
     AudioContext.prototype.createGain=function(){const gain=createGain.call(this);window.testGain??=gain;return gain;};
-    const Original=window.AudioWorkletNode;
+    window.delayedPatterns=[];window.metadataMutations=[];
+    const OriginalWorker=window.Worker;
+    window.Worker=class extends OriginalWorker {
+      constructor(...args){
+        super(...args);window.testMetadata=this;
+        const post=this.postMessage.bind(this);this.postMessage=message=>{
+          if(['load','demo','edit'].includes(message.type))metadataMutations.push({type:message.type,epoch:message.epoch,revision:message.revision});
+          post(message);
+        };
+        const descriptor=Object.getOwnPropertyDescriptor(OriginalWorker.prototype,'onmessage');
+        Object.defineProperty(this,'onmessage',{set(fn){descriptor.set.call(this,event=>{
+          const result=event.data.result;
+          if(window.delayPatternReplies&&result?.rows&&result.start===(window.delayPatternStart||0))
+            delayedPatterns.push({pattern:result.pattern,release:()=>fn(event)});
+          else fn(event);
+        });}});
+      }
+    };
+    const Original=window.AudioWorkletNode;window.BaseAudioWorkletNode=Original;
     window.AudioWorkletNode=class extends Original {
       constructor(...args){
-        super(...args);window.testNode=this;window.testContext=args[0];
+        super(...args);window.testNode=this;window.testContext=args[0];window.audioVersion={epoch:0,revision:0};
+        this.port.addEventListener('message',({data})=>{if(data.epoch>=audioVersion.epoch)audioVersion={epoch:data.epoch,revision:data.revision};});
         const descriptor=Object.getOwnPropertyDescriptor(MessagePort.prototype,'onmessage');
         window.delayedPatterns=[];window.delayedLoads=[];window.delayedScores=[];
         Object.defineProperty(this.port,'onmessage',{set(fn){descriptor.set.call(this,event=>{
           const result=event.data.result;
-          if(window.delayPatternReplies&&result?.rows&&result.start===0&&Number.isInteger(result.pattern))
-            delayedPatterns.push({pattern:result.pattern,release:()=>fn(event)});
-          else if(window.delayLoadReplies&&result?.cells&&result?.orders)
+          if(window.delayLoadReplies&&result?.cells&&result?.orders)
             delayedLoads.push(()=>fn(event));
           // A slow worklet: from a held score reply on, every later reply waits
           // behind it in port order, including feedback polls.
@@ -63,7 +81,7 @@ try {
     window.engineCommand=(type,args=[])=>new Promise((resolve,reject)=>{
       const id=1000000+Math.random();
       const listener=({data})=>{if(data.id!==id)return;testNode.port.removeEventListener('message',listener);data.error?reject(new Error(data.error)):resolve(data.result);};
-      testNode.port.addEventListener('message',listener);testNode.port.postMessage({id,type,args});
+      testNode.port.addEventListener('message',listener);testNode.port.postMessage({id,type,args,...audioVersion});
     });
   });
   await page.waitForFunction(()=>window.view?.m.ready&&view.hits.some(h=>h.id==='open'));
@@ -87,7 +105,7 @@ try {
     await click(p.x,p.y);
     assert.deepEqual(await page.evaluate(()=>[view.m.row,view.m.channel,view.m.field]),[r,c,f],'pointer maps to intended field');
   };
-  const download=async()=>{const pending=page.waitForEvent('download');await button('save');const file=await pending;assert(file.suggestedFilename().endsWith('.ntrk'));return readFile(await file.path());};
+  const download=async()=>{await wait(()=>!view.m.busy&&view.hits.some(h=>h.id==='save'));const [file]=await Promise.all([page.waitForEvent('download'),button('save')]);assert(file.suggestedFilename().endsWith('.ntrk'));return readFile(await file.path());};
   const snapshot=()=>page.evaluate(()=>engineCommand('snapshot'));
   const value=async(r,c,f)=>page.evaluate(async([r,c,f])=>{const s=await engineCommand('snapshot');return s.cells[((s.orders[view.m.order]*s.state[1]+r)*s.state[0]+c)*4+f];},[r,c,f]);
   const pixels=(region)=>page.evaluate(async region=>{
@@ -177,7 +195,10 @@ try {
   await cell(1,0,3);await page.keyboard.type('7f');await wait(()=>!view.m.busy&&view.m.row===2);assert.equal(await value(1,0,3),127);
   await cell(2,0,0);await page.keyboard.press('Enter');await wait(()=>!view.m.busy&&view.m.row===3);assert.equal(await value(2,0,0),97);
   await cell(3,0,3);await page.keyboard.press('Delete');await wait(()=>!view.m.busy&&view.m.row===4);assert.equal(await value(3,0,3),0);
-  await cell(4,0,1);await page.keyboard.type('ff');await wait(()=>!view.m.busy);assert.match((await model()).message,/out of range/);
+  await cell(4,0,1);
+  const beforeRefusedEdit=await page.evaluate(()=>metadataMutations.length);
+  await page.keyboard.type('ff');await wait(()=>!view.m.busy);assert.match((await model()).message,/out of range/);
+  assert.equal(await page.evaluate(()=>metadataMutations.length),beforeRefusedEdit,'refused audio edit is not mirrored');
   // Drawn Help is modal, scrollable, and leaves cells intact.
   const headerBefore=await pixels('header');await button('help');await wait(()=>view.m.help);
   assert.notEqual((await pixels('header')).hash,headerBefore.hash);
@@ -226,6 +247,17 @@ try {
   assert.equal(await value(255,15,3),123);
   const largeSaved=await download();await loadBytes('large-reloaded.ntrk',largeSaved);
   assert.equal(await value(255,15,3),123);assert.deepEqual(await download(),largeSaved);
+  // A successful edit can arrive after several windows of the background
+  // assembly started by an earlier edit. No old-revision rows may survive.
+  await cell(20,0,2);
+  await page.evaluate(()=>{delayPatternStart=24;delayPatternReplies=true;});
+  await page.keyboard.type('08');await wait(()=>delayedPatterns.length>0&&!view.m.busy);
+  await page.keyboard.type('08');await wait(()=>!view.m.busy&&view.m.row===22);
+  assert.equal(await value(21,0,2),8,'audio acknowledged second edit while assembly reply held');
+  await page.evaluate(()=>{delayPatternReplies=false;for(const p of delayedPatterns)p.release();delayedPatterns=[];delayPatternStart=0;});
+  await wait(()=>view.m.snapshot.commands?.rows[21][0]==='PAN');
+  assert.equal(await page.evaluate(()=>view.m.snapshot.commands.rows[20][0]),'PAN');
+  await download();
   await loadFixture('pattern-transition');
   await page.evaluate(()=>{if(!view.m.follow)view.action('entry',{id:'follow',value:true});});
   await button('play');
@@ -240,7 +272,11 @@ try {
   assert(await page.evaluate(()=>view.m.snapshot.commands===null));
   assert.equal(await page.evaluate(async()=>{const {commandCell}=await import('/player/canvas.js'+new URL(document.querySelector('script').src).search);return commandCell(view.m.snapshot,view.m.snapshot.orders[view.m.order],0,0,2).text;}),'');
   await button('pause');await wait(()=>!view.m.busy);
-  await page.evaluate(()=>view.action('order',0));await wait(()=>delayedPatterns.some(p=>p.pattern===0));
+  await page.evaluate(()=>view.action('order',0));
+  await page.waitForTimeout(100);
+  assert.equal(await page.evaluate(()=>delayedPatterns.length),1,'one worker pattern request in flight');
+  await page.evaluate(()=>delayedPatterns[0].release());
+  await wait(()=>delayedPatterns.some(p=>p.pattern===0));
   await page.evaluate(()=>{const newest=delayedPatterns.findLast(p=>p.pattern===0);newest.release();});
   await wait(()=>!view.m.busy&&view.m.snapshot.commands?.pattern===0);
   await page.evaluate(()=>{delayPatternReplies=false;for(const reply of delayedPatterns)reply.release();delayedPatterns=[];});
@@ -250,19 +286,22 @@ try {
   await page.evaluate(()=>{delayPatternReplies=true;view.action('entry',{id:'follow',value:true});});
   await button('play');await wait(()=>delayedPatterns.some(p=>p.pattern===1));
   await page.evaluate(()=>{delayPatternReplies=false;});
-  await loadFixture('commands');
+  const replacement=loadFixture('commands');
+  await wait(()=>view.m.snapshot?.state[1]===32);
   await page.evaluate(()=>{for(const reply of delayedPatterns)reply.release();delayedPatterns=[];});
+  await replacement;
   assert.equal(await page.evaluate(()=>view.m.snapshot.commands.rows[0][0]),'PAN');
   assert(await page.evaluate(()=>view.m.snapshot.commands.pattern===0&&view.m.snapshot.commands.rows.length===32));
   // Simulate an acknowledged engine load whose response takes over ten seconds.
   // The old UI is hidden and the mutation remains pending instead of timing out.
-  await page.evaluate(()=>{delayLoadReplies=true;});
+  await page.evaluate(()=>{window.mirroredBeforeDelay=metadataMutations.length;delayLoadReplies=true;});
   await page.locator('#open').setInputFiles({name:'delayed-load.ntrk',mimeType:'application/octet-stream',buffer:await readFile(path.join(fixtureRoot,'pattern-transition.ntrk'))});
   await wait(()=>delayedLoads.length>0);
   assert.equal(await page.evaluate(()=>view.m.snapshot),null);
   assert.equal((await page.evaluate(()=>engineCommand('state')))[1],2);
   await page.waitForTimeout(10500);
   assert(await page.evaluate(()=>view.m.busy&&view.m.snapshot===null&&view.m.ready));
+  assert(await page.evaluate(()=>metadataMutations.length===mirroredBeforeDelay),'unacknowledged load never reaches mirror');
   await page.evaluate(()=>{delayLoadReplies=false;for(const release of delayedLoads)release();delayedLoads=[];});
   await wait(()=>!view.m.busy&&view.m.name==='delayed-load.ntrk'&&view.m.snapshot.commands?.pattern===0);
   console.log('browser bounded commands: large load/edit/save, order/follow, blank transition, reversed replies, load generation and >10s acknowledged load passed');
@@ -420,12 +459,21 @@ try {
     // Worklet round trip (handler plus message transit) for the largest-shaped score.
     const largeScore=Array.from(await readFile(path.join(fixtureRoot,'interactive-large.ntrk')));
     const handler=await page.evaluate(async bytes=>{
-      const times=[];
-      for(let i=0;i<3;i++){
-        let t=performance.now();await engineCommand('load',[new Uint8Array(bytes).buffer]);const load=performance.now()-t;
-        t=performance.now();await engineCommand('select',[18]);times.push({load,select:performance.now()-t});
-      }
-      return times;
+      const module=await WebAssembly.compile(await(await fetch('/player/ntrk.wasm')).arrayBuffer());
+      const probe=new BaseAudioWorkletNode(testContext,'ntrk',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2],processorOptions:{module}});
+      let version={epoch:0,revision:0},id=0;
+      const command=(type,args)=>new Promise((resolve,reject)=>{
+        probe.port.onmessage=({data})=>{if(data.error)reject(new Error(data.error));else{version={epoch:data.epoch,revision:data.revision};resolve(data.result);}};
+        probe.port.postMessage({id:++id,type,args,...version});
+      });
+      try {
+        const times=[];
+        for(let i=0;i<3;i++){
+          let t=performance.now();await command('load',[new Uint8Array(bytes).buffer]);const load=performance.now()-t;
+          t=performance.now();await command('select',[18]);times.push({load,select:performance.now()-t});
+        }
+        return times;
+      } finally {probe.disconnect();probe.port.close();}
     },largeScore);
     console.log('browser worklet large interactive round trips (ms):',handler.map(t=>`load ${t.load.toFixed(0)} select ${t.select.toFixed(0)}`).join('; '));
     await loadBytes('sampled.xm.ntrk',await readFile(path.join(fixtureRoot,'sampled.xm.ntrk')));
@@ -543,6 +591,138 @@ try {
   });
   const right=await stereoPeaks();assert(right[1]>.001 && right[0]===0,`explicit hard-right worklet ${right}`);
   console.log('browser worklet stereo:',{center,right});
+  // Either/both order promises fail: allSettled must observe both. Inject
+  // Worker errors and transport replies without production hooks; fresh pages.
+  for(const failure of ['pattern','transport','both','mirror-load']) {
+    console.log('order failure case',failure);
+    const isolated=await browser.newPage(),failures=[];
+    isolated.on('pageerror',e=>failures.push(e.message));
+    if(failure!=='transport')await isolated.route('**/metadata-worker.js*',async route=>{
+      const response=await route.fetch();let source=await response.text();
+      source=source.replace('result=mirror.command(data);',
+        `if(${failure==='mirror-load'?"type==='load'":"type==='pattern'&&args[0]===1"})throw new Error('Injected metadata failure');result=mirror.command(data);`);
+      await route.fulfill({response,body:source});
+    });
+    if(failure==='transport'||failure==='both')await isolated.addInitScript(()=>{
+      const Original=AudioWorkletNode;
+      window.AudioWorkletNode=class extends Original {
+        constructor(...args){
+          super(...args);const fail=new Set(),post=this.port.postMessage.bind(this.port);
+          this.port.postMessage=message=>{if(message.type==='transport'&&message.args[0]===3&&message.args[1]===1)fail.add(message.id);post(message);};
+          const descriptor=Object.getOwnPropertyDescriptor(MessagePort.prototype,'onmessage');
+          Object.defineProperty(this.port,'onmessage',{set(fn){descriptor.set.call(this,event=>{
+            if(fail.delete(event.data.id))fn({data:{...event.data,error:'Injected transport failure'}});else fn(event);
+          });}});
+        }
+      };
+    });
+    await isolated.goto(`http://127.0.0.1:${server.address().port}/player/`);
+    await isolated.evaluate(async()=>{const {TrackerCanvas}=await import('/player/canvas.js'+new URL(document.querySelector('script').src).search);const draw=TrackerCanvas.prototype.draw;TrackerCanvas.prototype.draw=function(){window.v=this;return draw.call(this);};dispatchEvent(new Event('resize'));});
+    await isolated.waitForFunction(()=>window.v?.m.ready);
+    await isolated.evaluate(()=>v.action('demo'));await isolated.waitForFunction(()=>v.m.snapshot&&!v.m.busy);
+    if(failure==='mirror-load') {
+      await isolated.locator('#open').setInputFiles({name:'new-audio.ntrk',mimeType:'application/octet-stream',buffer:await readFile(path.join(fixtureRoot,'commands.ntrk'))});
+      await isolated.waitForFunction(()=>v.m.name==='new-audio.ntrk'&&!v.m.busy&&v.m.error);
+      assert(await isolated.evaluate(()=>v.m.snapshot.commands===null&&v.m.state[12]>0&&v.m.message.includes('Playback remains available')));
+    } else {
+      await isolated.evaluate(()=>v.action('order',1));
+      try{await isolated.waitForFunction(()=>!v.m.busy&&v.m.error);}catch(error){console.error(failure,await isolated.evaluate(()=>({message:v.m.message,error:v.m.error,busy:v.m.busy,pattern:v.m.snapshot.commands?.pattern})));throw error;}
+      assert(await isolated.evaluate(()=>v.m.message.includes('failure')));
+      if(failure!=='transport')assert(await isolated.evaluate(()=>v.m.snapshot.commands===null));
+    }
+    assert.deepEqual(failures,[],failure+' observes every rejection');await isolated.close();
+  }
+  // Hold real Worker acknowledgements after the audio owner has replied, then
+  // invoke the installed processor/message failure handlers in the browser.
+  for(const stage of ['init','load','edit','persisted'])for(const failure of stage==='persisted'?['pagehide']:['processorerror','messageerror']) {
+    const isolated=await browser.newPage(),failures=[];
+    isolated.on('pageerror',e=>failures.push(e.message));
+    try {
+      await isolated.addInitScript(({stage})=>{
+        window.heldMetadata=[];window.audioDispatches=[];window.audioAcks=[];window.mirrorDispatches=[];
+        window.holdMetadata=stage==='init'?'init':null;
+        const OriginalWorker=Worker,descriptor=Object.getOwnPropertyDescriptor(Worker.prototype,'onmessage');
+        window.Worker=class extends OriginalWorker {
+          constructor(...args){
+            super(...args);const types=new Map(),post=this.postMessage.bind(this);
+            this.postMessage=message=>{types.set(message.id,message.type);mirrorDispatches.push(message.type);post(message);};
+            Object.defineProperty(this,'onmessage',{set(fn){descriptor.set.call(this,event=>{
+              const type=types.get(event.data.id);
+              if(type&&type===holdMetadata)heldMetadata.push({type,release:()=>fn(event)});else fn(event);
+            });}});
+          }
+        };
+        const OriginalAudio=AudioWorkletNode;
+        window.AudioWorkletNode=class extends OriginalAudio {
+          constructor(...args){
+            super(...args);window.lifecycleNode=this;window.lifecycleContext=args[0];
+            const types=new Map(),post=this.port.postMessage.bind(this.port);
+            this.port.postMessage=message=>{types.set(message.id,message.type);audioDispatches.push(message.type);post(message);};
+            this.port.addEventListener('message',({data})=>{if(types.has(data.id)&&!data.error)audioAcks.push(types.get(data.id));});
+          }
+        };
+      },{stage});
+      await isolated.goto(`http://127.0.0.1:${server.address().port}/player/`);
+      await isolated.evaluate(async()=>{
+        const {TrackerCanvas}=await import('/player/canvas.js'+new URL(document.querySelector('script').src).search),draw=TrackerCanvas.prototype.draw;
+        TrackerCanvas.prototype.draw=function(){window.v=this;return draw.call(this);};dispatchEvent(new Event('resize'));
+      });
+      if(stage==='init')await isolated.waitForFunction(()=>window.v&&heldMetadata.some(p=>p.type==='init'));
+      else {
+        await isolated.waitForFunction(()=>window.v?.m.ready);
+        await isolated.evaluate(()=>v.action('demo'));await isolated.waitForFunction(()=>v.m.snapshot?.commands&&!v.m.busy);
+        if(stage==='load') {
+          await isolated.evaluate(()=>{holdMetadata='load';});
+          await isolated.locator('#open').setInputFiles({name:'held-mirror.ntrk',mimeType:'application/octet-stream',buffer:await readFile(path.join(fixtureRoot,'commands.ntrk'))});
+        } else {
+          await isolated.evaluate(()=>{holdMetadata='edit';v.action('entry',{id:'edit',value:true});v.action('select',{row:0,channel:0,field:3});document.querySelector('canvas').focus();});
+          await isolated.keyboard.press('Delete');
+        }
+        await isolated.waitForFunction(stage=>heldMetadata.some(p=>p.type===(stage==='persisted'?'edit':stage)),stage);
+        assert(await isolated.evaluate(stage=>audioAcks.includes(stage==='persisted'?'edit':stage),stage),'audio mutation acknowledged before held mirror');
+      }
+      if(stage==='persisted') {
+        // Preserve both the unsaved edit and its in-flight acknowledgement.
+        await isolated.evaluate(()=>{dispatchEvent(new PageTransitionEvent('pagehide',{persisted:true}));dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true}));holdMetadata=null;for(const p of heldMetadata.splice(0))p.release();});
+        await isolated.waitForFunction(()=>!v.m.busy&&v.m.dirty&&v.m.snapshot?.commands);
+        const before=await isolated.evaluate(()=>Array.from(v.m.snapshot.cells));
+        await isolated.evaluate(()=>{holdMetadata='formatted';v.action('select',{row:0,channel:0,field:2});});
+        await isolated.waitForFunction(()=>heldMetadata.some(p=>p.type==='formatted'));
+        await isolated.evaluate(()=>{holdMetadata=null;for(const p of heldMetadata.splice(0))p.release();});
+        await isolated.waitForFunction(()=>!v.m.error&&v.m.ready);
+        assert.deepEqual(await isolated.evaluate(()=>Array.from(v.m.snapshot.cells)),before,'BFCache lifecycle preserves unsaved cells');
+        assert(await isolated.evaluate(()=>v.m.dirty&&v.m.snapshot.commands!==null));
+        await isolated.evaluate(()=>v.action('order',1));
+        await isolated.waitForFunction(()=>!v.m.busy&&v.m.order===1&&v.m.snapshot.commands?.pattern===v.m.snapshot.orders[1]);
+        assert.deepEqual(await isolated.evaluate(()=>Array.from(v.m.snapshot.cells)),before,'post-restore pattern query preserves unsaved cells');
+        // Ordinary page close still settles a pending description and retires it.
+        await isolated.evaluate(()=>{holdMetadata='formatted';v.action('select',{row:1,channel:0,field:2});});
+        await isolated.waitForFunction(()=>heldMetadata.some(p=>p.type==='formatted'));
+        await isolated.evaluate(()=>dispatchEvent(new PageTransitionEvent('pagehide',{persisted:false})));
+        await isolated.waitForFunction(()=>v.m.error&&v.m.snapshot.commands===null);
+      } else {
+        await isolated.evaluate(failure=>{
+          if(failure==='processorerror')lifecycleNode.onprocessorerror(new Event('processorerror'));
+          else lifecycleNode.port.onmessageerror(new MessageEvent('messageerror'));
+          window.dispatchesAtFailure=audioDispatches.length;
+          holdMetadata=null;for(const p of heldMetadata.splice(0))p.release();
+          // An old state notification must not repopulate the failed view.
+          lifecycleNode.port.dispatchEvent(new MessageEvent('message',{data:{state:Array(15).fill(1)}}));
+          v.action('demo');
+        },failure);
+        await isolated.waitForFunction(()=>!v.m.ready&&!v.m.busy&&v.m.snapshot===null&&v.m.state===null);
+        await isolated.locator('#open').setInputFiles({name:'after-failure.ntrk',mimeType:'application/octet-stream',buffer:await readFile(path.join(fixtureRoot,'commands.ntrk'))});
+        await isolated.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+        assert(await isolated.evaluate(()=>!v.m.ready&&v.m.snapshot===null&&v.m.state===null&&audioDispatches.length===dispatchesAtFailure&&v.m.message.includes('Audio engine failed')),'late replies cannot revive or dispatch after audio failure');
+        if(stage==='init')assert.equal(await isolated.evaluate(()=>audioDispatches.length),0);
+      }
+      assert.deepEqual(failures,[],`${stage}/${failure}: every rejection observed`);
+      console.log(`browser lifecycle: ${stage}/${failure} passed`);
+    } finally {
+      await isolated.evaluate(()=>window.lifecycleContext?.close()).catch(()=>{});
+      await isolated.close();
+    }
+  }
   const unavailable=await browser.newPage();
   await unavailable.route('**/ntrk.wasm*',route=>route.fulfill({status:404,body:'missing'}));
   await unavailable.goto(`http://127.0.0.1:${server.address().port}/player/`);
@@ -551,7 +731,11 @@ try {
   assert(await unavailable.evaluate(()=>!v.hits.some(h=>h.id==='open'||h.id==='play')));
   await unavailable.close();
   await page.evaluate(()=>testContext.close());assert.deepEqual(errors,[]);
+  const build=new URL(await page.locator('script[type="module"]').getAttribute('src'),page.url()).search;
+  assert(build.startsWith('?v='));
+  for(const url of assetRequests){const asset=new URL(url);assert(asset.pathname.startsWith('/player/'),url);assert.equal(asset.search,build,url);}
+  for(const name of ['metadata.js','metadata-worker.js'])assert(assetRequests.some(url=>new URL(url).pathname==='/player/'+name),'versioned '+name+' requested');
   console.log(`browser: ${demoName}; authored demo migration; all command lanes/read-only paint/hit geometry; centered/explicit stereo; real worklet peak ${peak.toFixed(3)}; canvas pixels/DPR; pointer fields/mutes/orders/instruments/steppers; keyboard edits/bounds; save/reopen; failed loads; modal help/discard; sparse IDs/FXPL-only/meta-only/empty/stable visibility; wide fixture wheel/scrollbars/pan; desktop/mobile resize/focus; subpath generic startup/bad example recovery; sampled MOD/XM/PCM; burst edits/save/load ordering; actual gain/meter; seek; real touch drag/tap threshold passed`);
-} finally {
+} catch(error) {console.error('Harness failure:',error);throw error;} finally {
   if(browser)await browser.close();await new Promise(resolve=>server.close(resolve));
 }

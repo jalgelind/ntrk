@@ -199,8 +199,8 @@ public:
       for (int i=0;i<binding_->layers_;++i) ramp_[i].change_rate(rate_,rate);
       player_->until_tick=player_->until_tick/rate_*rate;
       if (draining_) tail_left_=Ramp::remaining_frames(tail_left_,rate_,rate);
-      for (int i=0;i<player_->module->channels;++i) {
-        Channel &ch=player_->channels[i];
+      for (int i=0;i<player_->module->channels;++i) for(int nc=0;nc<player_->module->note_columns[i];++nc) {
+        Channel &ch=*player_voice(player_,i,nc);
         channel_set_step(&ch,rate);
         ch.env_step=float(double(ch.env_step)*rate_/rate); ch.env_fpms=float(rate/1000.0);
         if (ch.synth_rate>0.f && ch.instrument>0) {
@@ -344,8 +344,10 @@ private:
     return seq && seq>sequence_ ? Status::Ok : Status::InvalidSequence;
   }
   void clear_voices_() {
-    for (int c=0;c<kMaxChannels;++c) {
-      player_->channels[c]=Channel();
+    for (int c=0;c<kMaxChannels*kMaxNoteColumns;++c) {
+      const int track=c<kMaxChannels ? c : (c-kMaxChannels)/3;
+      const int column=c<kMaxChannels ? 0 : (c-kMaxChannels)%3+1;
+      *player_voice(player_,track,column)=Channel();
       fx::svf_reset(&mixer_->voice_filter[c]); fx::svf_reset(&mixer_->voice_filter_r[c]);
       mixer_->voice_pos[c]=0; mixer_->voice_age[c]=0;
     }

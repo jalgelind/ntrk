@@ -24,6 +24,7 @@ layouts remain in README.md and the codecs in ntrk.h are authoritative.
 | 0x0010 | Spent AUTO ID; never reuse |
 | 0x0011 | META descriptive and private editor metadata; always optional |
 | 0x0012 | IMUS required interactive score; explicit capability-bound runtime |
+| 0x0013 | NCOL required bounded note columns |
 
 Directory capacity is now **64 entries**, shared by known and unknown blocks.
 The historical maximum was 32. Raising the bound permits any historical
@@ -358,3 +359,43 @@ chosen Module and IMUS view. Parsing permission never authorizes playback.
 Callers must choose and label linear preview explicitly; ordinary APIs never
 silently downgrade. Runtime binding is a separate capability and module-generation contract with
 renderer backstops; see [INTERACTIVE.md](INTERACTIVE.md).
+
+## NCOL — bounded note columns (`0x0013`)
+
+Critical flag exactly `1`. Payload: `u16 version=1`, `u16 reserved=0`, sixteen
+`u8` column counts, then three four-byte Notes per primary cell, in primary-cell
+order. Count is 1..4 for active tracks and 1 for inactive tracks. Exact payload
+size is `20 + patterns * rows * tracks * 12`; the existing core plane and stride
+are unchanged. Extra slot `j` is column `j+1`. Slots outside the track's count
+must be zero. Counts of one everywhere omit NCOL. Unknown critical blocks are
+refused, never played with tones missing. Duplicate IDs, flags, sizes, versions,
+counts, instrument references, notes and effect vocabulary are checked before
+publishing a loaded view. Optional unknown records retain their existing handling.
+
+Each column owns its instrument, sample position, envelope, effect memories,
+delay/cut/retrigger, glide and 303 state. A blank cell sustains that column under
+the existing rules; note-off releases only that column. An FXPL slide ties only
+an already sounding, non-releasing voice of the same instrument; otherwise it
+strikes. Existing tone-portamento precedence applies independently. Track FXPL
+accent/slide applies to each authored note; it does not create notes on blank cells.
+
+Primary-note effects belong to that column. Transport B/D/F/E6/EE and track-pan
+8/E8 are legal only in column zero. Primary cross-track ordering is unchanged.
+Track FXPL accent and slide apply separately to each authored note, with the
+existing last-column-wins rule for repeated articulation commands. A blank note
+keeps its sounding voice and strike accent. Slide ties only an active, non-release
+voice of the same instrument; silence, release, instrument changes, delayed
+strikes and tone portamento retain their existing strike/portamento precedence.
+Only column zero supplies instrument-pan fallback; extra instruments' pan bytes
+are retained but do not change the shared strip. MIXR/held-pan/FXPL precedence
+is unchanged. Each voice has independent left/right filter history; track filter
+settings apply to each voice. Voices sum without normalization before the one
+track insert, fader, pan and send chain. Mute and interactive layer gains remain
+track-scoped; muted voices and filters continue advancing.
+
+The desktop editor owns the extra plane and shares retained undo buffers per
+pattern. Live generations remain contiguous owned copies. Its module save is
+NTRK and audio export is WAV; MOD/XM are import formats, not export targets.
+The current browser editor refuses NCOL files explicitly before adoption because
+its editable snapshot has no column axis. The shared player/mixer implementation
+is the same in native and WASM builds.

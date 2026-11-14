@@ -90,14 +90,31 @@ FXPL column and every meta lane. Formatting/descriptions come from ntrk's note,
 FXPL and macro APIs. Meta `M01` means macro 1; `00` is no invocation, not PAN.
 Empty cells show dots; a valid command's zero parameter remains `00`. Arrows,
 hit testing and scrolling use the same fixed character geometry and true channel
-IDs. Only the displayed pattern is formatted (at most 256 rows ×149 command
-cells, with a 512-entry text cache), fetched in 8-row windows so the audio
-worklet renders between messages instead of formatting a whole pattern in one
-handler call; selected descriptions are fetched lazily.
+IDs. One dedicated metadata Worker formats the displayed pattern (at most
+256 rows ×149 command cells, with a 512-entry text cache). It reuses the compiled
+WebAssembly module and the same C++ formatter, in a separate Engine instance at
+the audio device's actual sample rate. Eight-row windows yield for cancellation;
+only one pattern assembly and one selected description are in flight. Each query
+kind has at most one active message and one latest waiting request. Superseded
+callers settle immediately, but the active slot remains occupied until its reply.
+The worklet refuses pattern/description requests before invoking the formatter.
 Order browsing and playback follow clear old command labels while fetching the
 next pattern, and stale replies cannot replace a newer selection or loaded song.
 Loads stay pending until acknowledged; a ten-second wait never leaves the old
-song UI controlling a newly loaded engine.
+song UI controlling a newly loaded engine. The audio engine is authoritative:
+only successfully acknowledged loads, generated examples and note edits enter
+the mirror. Committed-song epochs and edit revisions travel on metadata requests
+and replies, separately from request serials; edits invalidate an unfinished
+assembly. Runtime score controls, play, seek and render never enter the mirror.
+A failed audio load preserves the previous mirror. A metadata failure after audio
+success keeps the new song, clears labels and reports “Command labels unavailable”.
+Worker errors, undecodable messages, closure and a ten-second response timeout
+settle pending requests and retire the Worker; reload the page to retry. There is
+no audio-thread formatting fallback or audio rollback. An audio processor or
+message failure instead clears the song view and disables requests until reload;
+late initialization or mirror acknowledgements cannot revive that failed audio
+session. A persisted `pagehide` keeps the metadata Worker and unsaved song for
+BFCache restoration; an ordinary page close retires the Worker.
 Extra columns/meta lanes are labeled read-only when selected; typing there
 cannot write primary bytes. The selected instrument shows its persisted pan.
 
@@ -163,14 +180,25 @@ integers; a refused command changes nothing and consumes no sequence number.
 `bridge.cc` builds natively and as standalone WASM, with fixed 128 MiB memory:
 two file backing buffers, bounded conversion/scratch buffers, mutable primary
 cells and a bounded 40 MiB effect arena. File/mixer validation precedes adopting
-a candidate. The bridge owns all live state in the worklet; rendering allocates
-nothing. Parsing, conversion and serialization run in message handlers and can
+a candidate. The worklet owns authoritative audio state; rendering allocates
+nothing. The metadata Worker adds another **128 MiB linear-memory reservation**
+(256 MiB for both instances), including unused fixed audio/effect buffers. Sharing
+the compiled module shares code, not this memory. This deliberately exceeds the
+native engine-memory budget: it removes formatting from the audio thread while
+keeping one C++ formatter and avoiding a separate metadata bridge or JS registry;
+it does not redefine that budget. On 2026-11-14, a fresh Node process measured
+134,217,728 bytes per WASM memory. RSS was 47.77 MiB with the generated audio
+instance, 48.16 MiB with both generated instances, then 120.17 / 139.27 MiB with
+the maximal fixture in audio / both (GC after loads). These touched-memory figures
+are process-specific, include JS copies, and are not a browser or mobile memory
+guarantee; reservation remains 128 MiB per instance. Parsing, conversion and serialization run in message handlers and can
 interrupt audio for large modules: pause before file operations.
 Interactive decode, validation, score description and binding compilation also
 run in message handlers, never inside `process()`; the render call only renders
 and the handler reads feedback afterwards. An AudioWorklet's handlers share the
-audio rendering thread, and moving that work to another thread would need shared
-memory (cross-origin isolation), which this host deliberately does not require.
+audio rendering thread. This host moves only authored cell formatting to a
+Worker; parsing and runtime binding still interrupt audio and do not gain a
+shared-memory handoff. Cross-origin isolation is not required.
 The runtime binding and score table are fixed-size; a load retires the old
 binding before its backing buffer is reused.
 
@@ -197,10 +225,25 @@ reaches the pattern, and answers each section from those flags in O(orders): a
 decode costs at most one pass over pattern storage plus 64 × 256 order checks.
 Worst case, 256 distinct 256-row patterns with 144 lanes and 64 whole-song
 sections, one decode takes 5.2–5.7 ms natively (`test_ntrk`); load runs three
-decodes and section choice two. The 8-row pattern window is likewise an interruption: 3.1–4.6 ms here, 9.1 ms
-once under load, against a 2.67 ms quantum at 48 kHz. `engine_tests.mjs` prints
-the slowest window but asserts only deterministic bounds (window count/size,
-cache, payload), since wall time varies with machine load.
+decodes and section choice two. Before the dedicated metadata Worker, an 8-row
+pattern window also interrupted audio: 3.1–4.6 ms, 9.1 ms once under load, against
+a 2.67 ms quantum at 48 kHz. `engine_tests.mjs` still prints window timing but
+asserts deterministic bounds (window count/size, cache, payload).
+
+A 2026-11-14 headless Chromium comparison kept playback running while browsing
+96 times through the maximal 256×149 fixture and editing after each assembly
+(authored notes added for audible output; commands/geometry unchanged). Private
+harness instrumentation counted 3,552 formatter calls on the baseline audio owner
+and **zero** after this change; 6,528 calls ran in the Worker (edit-triggered
+reassembly included). Worker format p99/max was 0.70/1.20 ms. Audio process-start
+wall gaps had p99 6 ms in both, max 7 / 6 ms baseline / Worker; no gap exceeded
+8 ms across 3,200 / 3,712 observed quanta, all with nonzero output. Runs lasted
+8.6 / 10.2 seconds. The worklet wall clock had only millisecond resolution and
+headless audio schedules quanta in batches: these are scheduling observations,
+not proof of uninterrupted physical output. Host load was 31.90/39.19/47.19
+(`uptime` before runs); browser/device underruns, sub-millisecond deadlines and
+Firefox/Safari still need device testing. Finite/nonzero samples alone are not
+used as continuity evidence.
 
 `make test` includes the native bridge, importer, renderer/mixer and library
 checks. `test-web` generates sampled eight-channel MOD/XM/PCM8/PCM16 fixtures,
@@ -224,6 +267,7 @@ exact large-file load/edit/save without an audio device:
 
 ```sh
 node web/engine_tests.mjs out/web out/web-fixtures
+node web/metadata_tests.mjs out/web out/web-fixtures
 ```
 
 With an existing Playwright/Chromium installation (no install step):
@@ -240,9 +284,18 @@ sparse IDs, modal help/discard, desktop/narrow rendering and CDP touch events on
 long lists. With the interactive fixture it chooses the initial section, requests
 another, fades a layer to measured silence and back, steps a control, and checks
 cues, frozen pause clock, seek/edit/profile refusals and stale reload commands,
-and holds worklet replies to check that steps/toggles compound on unacknowledged intent. It also delays and reverses pattern replies, replaces the song with
-old replies pending, and holds a successful load acknowledgement beyond ten
-seconds. Set `NTRK_WEB_ROOT` to an extracted bundle to test the actual ZIP.
+and holds worklet replies to check that steps/toggles compound on unacknowledged
+intent. It intercepts Worker replies to check bounded supersession, edits after
+several assembled windows, old replies across song replacement, and each/both
+order-query failures. Mirror failure after an audio load keeps the new song and
+reports unavailable labels. A successful audio load acknowledgement is held
+beyond ten seconds to verify that no unacknowledged load reaches the mirror.
+Delayed metadata initialization/load/edit acknowledgements are paired with
+processor and message failures: the view stays disabled and no later request or
+reply can restore it. Persisted pagehide/pageshow retains in-flight edits, unsaved
+cells and subsequent label queries; ordinary close still settles pending queries.
+The Node metadata suite checks exact shared-C++ labels, epochs/revisions, queue
+bounds, Worker failure lifecycles and a worklet formatter-denial negative control. Set `NTRK_WEB_ROOT` to an extracted bundle to test the actual ZIP.
 Logs/screenshots belong outside Git. js-seq's `tools/tracker/check_web_audio.sh`
 rebuilds WASM before comparing desktop/native bridge/WASM audio at 44.1/48/96 kHz
 and removes temporary float audio files afterwards.

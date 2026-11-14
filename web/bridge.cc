@@ -248,6 +248,7 @@ int web_load(int size) {
   ntrk::ModuleLoadError load_error;
   if (!ntrk::module_load_ex(&candidate, bytes, length, ntrk::ModuleLoadMode::Ordinary, &load_error))
     return load_error == ntrk::ModuleLoadError::InteractiveRequired ? -2 : 0;
+  if (ntrk::module_polyphonic(&candidate)) return -6; // editor has no note-column axis
   ntrk::mix::Mixer checked;
   if (!ntrk::mix::mixer_config_read(&checked, &candidate) || !effects_fit(checked)) return 0;
   // Failed loads leave the playing module and all its backing storage intact.
@@ -273,6 +274,7 @@ int web_load_interactive(int size) {
                             ntrk::ModuleLoadMode::InteractiveV1, &load_error))
     return load_error == ntrk::ModuleLoadError::UnsupportedProfile ? -3 : 0;
   if (!candidate.imus_bytes) return 0;
+  if (ntrk::module_polyphonic(&candidate)) return -6; // editor has no note-column axis
   ntrk::mix::Mixer checked;
   if (!ntrk::mix::mixer_config_read(&checked, &candidate) || !effects_fit(checked)) return 0;
   const ia::Status status = probe.compile(candidate, 1, capabilities(), 0);

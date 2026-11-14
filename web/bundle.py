@@ -6,7 +6,7 @@ import zipfile
 
 root, target = map(Path, sys.argv[1:])
 files = ['index.html', 'style.css', 'app.js', 'canvas.js', 'engine.js',
-         'worklet.js', 'ntrk.wasm', 'demo.json']
+         'worklet.js', 'metadata.js', 'metadata-worker.js', 'ntrk.wasm', 'demo.json']
 if (root / 'demo.ntrk').exists():
     files.append('demo.ntrk')
 with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:

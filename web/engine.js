@@ -127,10 +127,8 @@ export class Engine {
     }
     return out;
   }
-  // Only a bounded row window of the displayed pattern is formatted per call so
-  // the AudioWorklet message handler never holds the audio thread for a whole
-  // 256x149 pattern; callers page through rows. The cache is local and capped;
-  // snapshots never contain formatted song-wide objects or descriptions.
+  // Metadata workers page the displayed pattern, yielding between windows for
+  // cancellation and edits. The formatter/cache remain shared with native C++.
   pattern(pattern,start=0,count=PATTERN_CHUNK_ROWS) {
     const s=this.state();
     if(!Number.isInteger(pattern)||pattern<0||pattern>=s[2])throw new Error('Pattern out of range');
@@ -199,6 +197,7 @@ export class Engine {
         if (loaded === -3) throw new Error('This interactive score needs a newer profile or capability than this player supports.');
         if (loaded === -5) throw new Error('Interactive scores need a 44.1, 48 or 96 kHz audio device.');
       }
+      if (loaded === -6) throw new Error('This song uses multiple note columns. This web editor cannot load them without hiding musical data; open it in the desktop Tracker.');
       if (loaded !== 1) throw new Error('Invalid, unsupported or over-budget ntrk/MOD/XM file');
       return this.snapshot();
     }

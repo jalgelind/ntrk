@@ -276,6 +276,7 @@ inline ImusStatus imus_validate(const ImusRecords &src, const Module *m=nullptr)
       m->order_count<1 || m->order_count>kMaxOrders || m->pattern_count<1 || m->pattern_count>kMaxPatterns ||
       m->macro_count<0 || m->macro_count>kMaxMacros || m->fx_columns<1 || m->fx_columns>kMaxFxColumns ||
       m->meta_columns<0 || m->meta_columns>kMaxMetaColumns)) return ImusStatus::Invalid;
+  if(m && !module_columns_valid(m)) return ImusStatus::Invalid;
   bool opaque=v.version!=1 || v.profile!=1;
   uint32_t ids[kMaxImusRecords]; uint8_t kinds[kMaxImusRecords];
   int counts[5]={}; uint16_t layer_mask=0; uint8_t macros[kMaxImusControls]; int macro_count=0;

@@ -5033,6 +5033,8 @@ static void test_imus_renderer_gate() {
 
 #include "test_support/interactive_tests.inc"
 
+#include "test_support/note_columns_tests.inc"
+
 int
 main(void) {
   test_bypass_is_render_add();
@@ -5119,6 +5121,7 @@ main(void) {
   test_choice_params_name_themselves();
   test_imus_renderer_gate();
   test_interactive();
+  test_note_columns();
 
   printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
