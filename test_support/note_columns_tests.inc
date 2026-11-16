@@ -15,7 +15,8 @@ static void test_note_column_layout() {
       Module bad=m;bad.note_columns[0]=uint8_t(count);bad.extra_notes=count==2 ? nullptr : extra;
       CHECK(!module_column_layout_valid(&bad));CHECK(!module_columns_valid(&bad));
       player_start(&p,&m);CHECK(p.playing);
-      player_start_ex(&p,&bad,mode);CHECK(!p.playing);
+      CHECK(player_start_check(&bad,mode)==PlayerStartResult::InvalidColumnLayout);
+      CHECK(player_start_result(&p,&bad,mode)==PlayerStartResult::InvalidColumnLayout);CHECK(!p.playing);
       memset(output,0,sizeof output);render_add(&p,output,64,2,44100);
       for(double value:output) CHECK(value==0);
       CHECK(!player_preview(&p,0,13,1,44100));
@@ -29,14 +30,24 @@ static void test_note_column_layout() {
   CHECK(!module_column_layout_valid(nullptr));CHECK(!module_note(nullptr,0,0,0));
   CHECK(!module_note(&m,0,0,kMaxChannels));CHECK(!module_note(&m,0,0,0,-1));
   CHECK(!player_voice(nullptr,0));CHECK(!player_voice(&p,kMaxChannels));CHECK(!player_voice(&p,0,kMaxNoteColumns));
-  for(int count : {0,5}) {Module bad=m;bad.note_columns[kMaxChannels-1]=uint8_t(count);CHECK(!module_column_layout_valid(&bad));}
+  for(int count : {0,5,2}) {
+    Module bad=m;bad.note_columns[kMaxChannels-1]=uint8_t(count);bad.extra_notes=extra;
+    CHECK(!module_column_layout_valid(&bad));
+    CHECK(player_start_result(&p,&bad)==PlayerStartResult::InvalidColumnLayout);
+  }
   m.note_columns[0]=4;m.extra_notes=extra;
   for(int nc=0;nc<3;++nc) extra[nc]=poly_note(uint8_t(20+nc*4),1,0,0);
   CHECK(module_column_layout_valid(&m));CHECK(module_columns_valid(&m));
-  player_start(&p,&m);CHECK(p.playing);memset(output,0,sizeof output);render_add(&p,output,64,2,44100);
+  CHECK(player_start_result(&p,&m)==PlayerStartResult::Ok);CHECK(p.playing);
+  memset(output,0,sizeof output);render_add(&p,output,64,2,44100);
+  CHECK(output[2]!=0);
   for(int nc=0;nc<4;++nc) CHECK(player_voice(&p,0,nc)->playing);
   player_stop(&p);CHECK(!player_preview(&p,0,13,1,44100,4));CHECK(!p.playing);
   CHECK(player_preview(&p,0,13,1,44100,3));CHECK(player_voice(&p,0,3)->playing);
+  // Startup checks geometry only; the save/load validator still owns cell content.
+  extra[0].effect=0xF;
+  CHECK(!module_columns_valid(&m));
+  CHECK(player_start_result(&p,&m)==PlayerStartResult::Ok);
 }
 // Shared native/WASM mixer suite: independently owned columns and wire format.
 static void test_note_columns() {

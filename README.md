@@ -19,7 +19,9 @@ if (!ntrk::module_load(&module, bytes, size))
   return;                          // a bad file is refused, never read past
 
 ntrk::Player player;
-ntrk::player_start(&player, &module);
+const auto started = ntrk::player_start_result(&player, &module);
+if (started != ntrk::PlayerStartResult::Ok)
+  return;                          // started names the refusal category
 ntrk::render_add(&player, buffer, frames, 2, 48000.f);
 ```
 
@@ -194,7 +196,7 @@ player.muted[2] = true;                             // mute a channel
 **A `Module` can point at memory you are editing.** `patterns` is a
 `const Note *`, a pointer to const data through this view; an editor may own
 mutable backing arrays. Follow the ordinary playback ownership and mutation
-contract above `player_start_ex` in [ntrk.h](ntrk.h): the host serializes access,
+contract above `player_start_result` in [ntrk.h](ntrk.h): the host serializes access,
 and address stability is not concurrent access safety. That contract covers
 borrowed lifetimes, geometry changes (including note columns), and retirement.
 For Interactive playback, follow the stronger immutable-publication contract

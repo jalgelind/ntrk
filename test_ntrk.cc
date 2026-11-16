@@ -903,6 +903,73 @@ test_slot_mute_refusals() {
 }
 
 static void
+test_player_start_result() {
+  using namespace ntrk;
+  typedef PlayerStartResult R;
+  printf("start results preserve reset, permission and legacy rendering\n");
+  Spec s; build(s);
+  Module m; CHECK(module_load(&m,g_bytes,g_size));
+  CHECK(player_start_result(nullptr,&m)==R::InvalidPlayer);
+  CHECK(player_start_result(nullptr,nullptr)==R::InvalidPlayer);
+  Module empty, no_order=m, no_patterns=m, no_rows=m, no_orders=m;
+  no_order.order=nullptr; no_patterns.patterns=nullptr;
+  no_rows.rows=0; no_orders.order_count=0;
+  const Module *bad[]={nullptr,&empty,&no_order,&no_patterns,&no_rows,&no_orders};
+  Player p;
+  for (const Module *module : bad) {
+    CHECK(player_start_result(&p,&m)==R::Ok);
+    CHECK(player_seek(&p,0,1)); CHECK(player_loop_range(&p,0,0));
+    p.muted[2]=true; p.pan_epoch=41; p.gain=0.2f; p.ticks_elapsed=9;
+    p.channels[0].playing=true; p.extra_channels[0][0].playing=true;
+    p.linear_preview_module=&m; p.linear_preview_imus=g_bytes; p.linear_preview_bytes=1;
+    p.runtime_allowed=[](const Player*,const void*) { return true; };
+    p.runtime_cookie=&m;
+    CHECK(player_start_check(module)==R::InvalidModule);
+    CHECK(player_start_result(&p,module)==R::InvalidModule);
+    CHECK(p.module==module && !p.playing && p.muted[2] && p.pan_epoch==41);
+    CHECK(p.order==0 && p.row==0 && p.tick==0 && p.until_tick==0 && p.ticks_elapsed==0);
+    CHECK(p.speed==6 && p.bpm==125 && p.gain==0.7f && p.sequencing);
+    CHECK(p.loop_first==-1 && p.loop_last==-1 && !p.runtime_allowed && !p.runtime_cookie);
+    CHECK(!p.linear_preview_module && !p.linear_preview_imus && !p.linear_preview_bytes);
+    for (int c=0;c<kMaxChannels;++c) for (int nc=0;nc<kMaxNoteColumns;++nc)
+      CHECK(!player_voice(&p,c,nc)->playing);
+    double audio[128]; for (double &value : audio) value=0.125;
+    render_add(&p,audio,64,2,44100);
+    for (double value : audio) CHECK(value==0.125);
+  }
+  for (int bits=1;bits<4;++bits) {
+    Module score=m; score.imus=(bits&1) ? g_bytes : nullptr; score.imus_bytes=(bits&2) ? 1 : 0;
+    CHECK(player_start_check(&score)==R::RuntimeRequired);
+    CHECK(player_start_result(&p,&score)==R::RuntimeRequired);
+    CHECK(!p.playing && !player_playback_allowed(&p));
+    CHECK(!player_preview(&p,0,13,1,44100));
+    CHECK(player_start_result(&p,&score,PlaybackMode::LinearPreview)==R::Ok);
+    CHECK(p.playing && player_playback_allowed(&p));
+    p.playing=false; // The returned Ok is independent of the host's transport choice.
+    CHECK(player_start_check(&score,PlaybackMode::LinearPreview)==R::Ok);
+    Module copied=score; p.module=&copied;
+    CHECK(!player_playback_allowed(&p));
+  }
+  p.muted[2]=false;
+  Player legacy, extended;
+  void (*start)(Player*,const Module*)=player_start;
+  void (*start_ex)(Player*,const Module*,PlaybackMode)=player_start_ex;
+  start(nullptr,nullptr); start_ex(nullptr,nullptr,PlaybackMode::Ordinary);
+  const uint64_t epoch=p.pan_epoch;
+  const R accepted=player_start_result(&p,&m);
+  CHECK(accepted==R::Ok && p.playing && p.pan_epoch==epoch+1);
+  p.playing=false; CHECK(accepted==R::Ok); // Accepted, adopted stopped, then play.
+  CHECK(player_start_result(&p,&m)==R::Ok);
+  start(&legacy,&m); start_ex(&extended,&m,PlaybackMode::Ordinary);
+  double a[128]={},b[128]={},c[128]={};
+  render_add(&p,a,64,2,44100); render_add(&legacy,b,64,2,44100); render_add(&extended,c,64,2,44100);
+  CHECK(a[0]!=0);
+  CHECK(memcmp(a,b,sizeof a)==0 && memcmp(a,c,sizeof a)==0);
+  CHECK(p.ticks_elapsed==legacy.ticks_elapsed && p.until_tick==legacy.until_tick);
+  CHECK(p.order==legacy.order && p.row==legacy.row && p.tick==legacy.tick);
+}
+
+static void
 test_seek() {
   printf("seek lands on a row without playing up to it\n");
 
@@ -9038,6 +9105,7 @@ static void test_note_column_reasons() {
 
 int
 main(void) {
+  test_player_start_result();
   test_note_column_reasons();
   test_extensions_metadata_counts();
   test_loads();

@@ -2478,7 +2478,34 @@ player_pan_gains(const Player *p, bool stereo, float *left, float *right) {
   }
 }
 
-// Point a player at a module and play it from the top.
+enum class PlayerStartResult {
+  Ok, InvalidPlayer, InvalidModule, InvalidColumnLayout, RuntimeRequired
+};
+
+// Cheap startup admission, not full content validation: reads metadata and the
+// fixed kMaxChannels column counts, never order entries, notes or sample data.
+// Multiple faults report the first in this order. RuntimeRequired means an
+// ordinary start cannot grant permission for an IMUS score; an Interactive
+// Runtime may bootstrap its capability, or a host may choose LinearPreview.
+inline PlayerStartResult
+player_start_check(const Module *module, PlaybackMode mode = PlaybackMode::Ordinary) {
+  if (!module || !module->order || !module->patterns)
+    return PlayerStartResult::InvalidModule;
+  if (!module_column_layout_valid(module))
+    return PlayerStartResult::InvalidColumnLayout;
+  if (module->rows < 1 || module->order_count < 1)
+    return PlayerStartResult::InvalidModule;
+  if ((module->imus || module->imus_bytes) && mode != PlaybackMode::LinearPreview)
+    return PlayerStartResult::RuntimeRequired;
+  return PlayerStartResult::Ok;
+}
+
+// Point a player at a module and play it from the top. A null player returns
+// InvalidPlayer untouched. Otherwise even refusal resets the player and keeps
+// the supplied module pointer, listener mutes and pan epoch. Refusal leaves all
+// voices and transport stopped, without a preview/runtime capability. Ok means
+// accepted initialization, even if the host subsequently holds playing false.
+// The legacy void start wrappers below discard this result.
 //
 // Ordinary playback ownership and mutation contract:
 // - Player and Module provide no synchronization. The host must serialize
@@ -2504,9 +2531,10 @@ player_pan_gains(const Player *p, bool stereo, float *left, float *right) {
 //   against dangling pointers, invalid storage or concurrent mutation.
 // Interactive Runtime has the stronger immutable-publication and generation
 // contract in INTERACTIVE.md; ordinary serialized edits do not relax it.
-inline void
-player_start_ex(Player *player, const Module *module, PlaybackMode mode) {
-  if (!player) return;
+inline PlayerStartResult
+player_start_result(Player *player, const Module *module,
+                    PlaybackMode mode = PlaybackMode::Ordinary) {
+  if (!player) return PlayerStartResult::InvalidPlayer;
   // **Mutes are the editor's state, not the tune's**, so pressing play must not
   // silently unmute what somebody muted. Everything else is reset; this is the
   // one field that survives, and it survives player_seek for the same reason.
@@ -2528,12 +2556,9 @@ player_start_ex(Player *player, const Module *module, PlaybackMode mode) {
   // result hands us a `Module` with null pattern and order pointers — and the
   // first render would dereference them on the audio thread. The load path is
   // careful never to read past a bad file; this is the other half of that.
-  // Column layout checks visit only the fixed track counts, never song cells.
-  if (module == nullptr || module->order == nullptr ||
-      module->patterns == nullptr || !module_column_layout_valid(module) ||
-      module->rows < 1 || module->order_count < 1 ||
-      ((module->imus || module->imus_bytes) && mode != PlaybackMode::LinearPreview))
-    return;
+  const PlayerStartResult result = player_start_check(module, mode);
+  if (result != PlayerStartResult::Ok)
+    return result;
 
   if (mode == PlaybackMode::LinearPreview) {
     player->linear_preview_module = module;
@@ -2549,6 +2574,11 @@ player_start_ex(Player *player, const Module *module, PlaybackMode mode) {
   // Zero, so the first tick is processed by the first frame rendered rather
   // than a tick's worth of silence later.
   player->until_tick = 0.0;
+  return PlayerStartResult::Ok;
+}
+
+inline void player_start_ex(Player *player, const Module *module, PlaybackMode mode) {
+  (void) player_start_result(player, module, mode);
 }
 
 // Required scores need an active runtime capability or deliberate view-bound

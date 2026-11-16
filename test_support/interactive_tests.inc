@@ -16,6 +16,8 @@ static void test_interactive_binding() {
   CHECK(future_binding.compile(future.module,1,future.caps,0)==Status::MissingSection);
   CHECK(future_binding.compile(future.module,1,future.caps,3)==Status::MissingSection);
   Player p; mix::Mixer mx; Runtime r;
+  CHECK(player_start_result(&p,&f.module)==PlayerStartResult::RuntimeRequired);
+  CHECK(!p.playing && !p.runtime_allowed && !player_playback_allowed(&p));
   CHECK(r.bind(b,p,mx,2,48000)==Status::Stale);
   CHECK(r.bind(b,p,mx,1,22050)==Status::InvalidRate);
   CHECK(r.bind(b,p,mx,1,48000)==Status::Ok);
