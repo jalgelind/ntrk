@@ -50,6 +50,7 @@
 #include "ntrk_unity.h"
 
 #include <chrono>
+#include <cmath>
 #include <stdio.h>
 #include <string.h>
 
@@ -69,7 +70,7 @@ static const int kOut = 2;            // interleaved stereo, as a host wants it
 static const int kCallback = 1024;
 
 // Five seconds of audio per run. Long enough that a reverb tank is full and the
-// tune has looped, short enough that seventeen cases times nine runs is a tool
+// tune has looped, short enough that the cases times nine runs are a tool
 // somebody actually runs.
 static const int kSeconds = 5;
 static const long kFrames = (long) kRate * kSeconds;
@@ -114,9 +115,11 @@ static const size_t kInstBytes = 32u;     // one instrument entry
 
 static uint8_t g_bytes[4096];
 static size_t g_size = 0;
+static Note g_extra[kRows * kMaxChannels * (kMaxNoteColumns - 1)];
 
 struct Spec {
   int  channels  = 4;
+  int  columns   = 1;
   int  voice     = -1;      // -1: no SYNTH instrument at all; else a SynthVoice
   bool voice_all = false;   // every channel plays it, rather than the last one
   bool plane     = false;   // an FXPL plane and the MACR table behind it
@@ -191,7 +194,7 @@ build(const Spec &s) {
           pat_at + ((size_t) r * (size_t) s.channels + (size_t) c) * 4u;
       // Spread across the channels so the voices are not in phase, and inside
       // 1..36 so a v1-range note table would play the same thing.
-      g_bytes[cell + 0] = (uint8_t) (25 + c * 3);
+      g_bytes[cell + 0] = (uint8_t) (25 + ((c * s.columns) % 4) * 3);
       const bool synth_here =
           s.voice >= 0 && (s.voice_all || c == s.channels - 1);
       g_bytes[cell + 1] = synth_here ? 2u : 1u;
@@ -288,7 +291,25 @@ prepare(const Spec &s, Module *m, Player *p) {
     g_failed = true;
     return false;
   }
-  player_start(p, m);
+  // Attach borrowed extra storage, rather than introducing another NCOL wire
+  // encoder into the benchmark. Inactive slots stay zero for validation.
+  memset(g_extra, 0, sizeof g_extra);
+  if (s.columns > 1) {
+    m->extra_notes = g_extra;
+    for (int c = 0; c < s.channels; ++c) {
+      m->note_columns[c] = uint8_t(s.columns);
+      for (int r = 0; r < kRows; ++r) for (int nc = 1; nc < s.columns; ++nc) {
+        Note &n = g_extra[(r * s.channels + c) * 3 + nc - 1];
+        // Logical voice order is identical across equal-voice layouts.
+        n.note = uint8_t(25 + ((c * s.columns + nc) % 4) * 3);
+        n.instrument = s.voice >= 0 && (s.voice_all || c == s.channels - 1) ? 2 : 1;
+      }
+    }
+  }
+  if (!module_columns_valid(m) || player_start_result(p, m) != PlayerStartResult::Ok) {
+    g_failed = true;
+    return false;
+  }
   return true;
 }
 
@@ -413,7 +434,7 @@ now_ms() {
 // Setup is outside the timed region, so what is reported is rendering and not
 // the cost of building a mixer.
 static double
-run_once(const Cfg &cfg) {
+run_once(const Cfg &cfg, bool validate = false) {
   Module m;
   Player p;
   if (!prepare(cfg.spec, &m, &p))
@@ -433,6 +454,10 @@ run_once(const Cfg &cfg) {
       mix::mixer_render_add(&g_mixer, &p, g_out, want, kOut, (float) kRate);
     else
       render_add(&p, g_out, want, kOut, (float) kRate);
+    // The warm-up is not a reported timing sample. Scan its entire stream so
+    // a non-finite intermediate block cannot hide behind a healthy final one.
+    if (validate) for (int i = 0; i < want * kOut; ++i)
+      if (!std::isfinite(g_out[i])) g_failed = true;
     done += want;
   }
   const double ms = now_ms() - t0;
@@ -454,7 +479,7 @@ run_once(const Cfg &cfg) {
 
 static double
 median_ms(const Cfg &cfg, bool *silent) {
-  run_once(cfg);                      // warm up: caches, the first tank fill
+  run_once(cfg, true);                // warm up: caches, the first tank fill
   *silent = g_last_peak < 1.0e-4;
 
   double ms[kRuns];
@@ -525,6 +550,17 @@ one_voice(int voice) {
   return c;
 }
 
+static Cfg
+chord(int tracks, int columns, int voice, bool insert = false) {
+  Cfg c;
+  c.spec.channels = tracks;
+  c.spec.columns = columns;
+  c.spec.voice = voice;
+  c.spec.voice_all = voice >= 0;
+  if (insert) c.insert = mix::FxKind::kFilter;
+  return c;
+}
+
 // Four channels, a 303 on the last of them, every send live, an insert filter on
 // every channel, a master shaper, a stereo width that is not 1 and the plane
 // driving pan. This is the configuration the budget is actually about.
@@ -572,6 +608,18 @@ main(void) {
     {"voice: 303 bass", one_voice((int) SynthVoice::kBass)},
 
     {"everything on", everything()},
+
+    {"PCM: 3 tracks x 1 column", chord(3,1,-1)},
+    {"PCM: 1 track x 3 columns", chord(1,3,-1)},
+    {"PCM: 4 tracks x 1 column", chord(4,1,-1)},
+    {"PCM: 2 tracks x 2 columns", chord(2,2,-1)},
+    {"PCM: 1 track x 4 columns", chord(1,4,-1)},
+    {"303: 4 tracks x 1 column", chord(4,1,(int) SynthVoice::kBass)},
+    {"303: 1 track x 4 columns", chord(1,4,(int) SynthVoice::kBass)},
+    {"filter: 4 tracks x 1 column", chord(4,1,-1,true)},
+    {"filter: 1 track x 4 columns", chord(1,4,-1,true)},
+    {"303: 16 tracks x 2 (32 voices)", chord(16,2,(int) SynthVoice::kBass)},
+    {"303: 8 tracks x 4 (32 voices)", chord(8,4,(int) SynthVoice::kBass)},
   };
   const int count = (int) (sizeof cases / sizeof cases[0]);
 
@@ -583,6 +631,24 @@ main(void) {
 
   bool silent_any = false;
   for (int i = 0; i < count; ++i) {
+    // Prove the named workload before timing: observing master audio alone
+    // cannot distinguish one working voice from thirty-one missing voices.
+    Module m; Player p;
+    const Spec &s = cases[i].cfg.spec;
+    if (!prepare(s, &m, &p)) continue;
+    g_out[0] = g_out[1] = 0.0;
+    render_add(&p, g_out, 1, kOut, (float) kRate);
+    int live = 0, synths = 0;
+    for (int c = 0; c < s.channels; ++c) for (int nc = 0; nc < s.columns; ++nc) {
+      const Channel *v = player_voice(&p,c,nc);
+      const bool synth = s.voice >= 0 && (s.voice_all || c == s.channels - 1);
+      if (!v->playing || v->instrument != (synth ? 2 : 1) || (synth && !v->synth_age))
+        g_failed = true;
+      live += v->playing ? 1 : 0;
+      synths += synth && v->synth_age ? 1 : 0;
+    }
+    printf("  workload: %d tracks x %d columns, %d live, %d synth\n",
+           s.channels, s.columns, live, synths);
     bool silent = false;
     const double ms = median_ms(cases[i].cfg, &silent);
     silent_any = silent_any || silent;
@@ -590,7 +656,7 @@ main(void) {
   }
 
   if (g_failed) {
-    printf("\nsomething refused to initialise; the numbers above are not the "
+    printf("\nworkload validation or initialisation failed; the numbers above are not the "
            "workload they name\n");
     return 1;
   }

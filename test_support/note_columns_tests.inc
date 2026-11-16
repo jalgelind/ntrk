@@ -49,9 +49,105 @@ static void test_note_column_layout() {
   CHECK(!module_columns_valid(&m));
   CHECK(player_start_result(&p,&m)==PlayerStartResult::Ok);
 }
+// The same authored rows at every supported width. The primary-only control
+// sounds identical at width one, so legacy fixtures cannot detect lost voices.
+static void test_note_column_widths() {
+  printf("one-to-four columns: inheritance, codec, countdown and primary-only control\n");
+  int missed=0;
+  for(int columns=1;columns<=kMaxNoteColumns;++columns) {
+    Module m;uint8_t order[1]={0};Note notes[4]={},extra[12]={};int8_t wave[16];
+    for(int i=0;i<16;++i) wave[i]=i<8 ? 40 : -40;
+    m.channels=1;m.rows=4;m.speed=1;m.pattern_count=1;m.order_count=1;m.instrument_count=2;
+    m.order=order;m.patterns=notes;m.note_columns[0]=uint8_t(columns);
+    m.extra_notes=columns>1 ? extra : nullptr;
+    m.instruments[0].data=wave;m.instruments[0].length=m.instruments[0].loop_len=16;
+    m.instruments[1].type=uint8_t(InstrumentType::kSynth);
+    synth_voice_defaults(&m.instruments[1],SynthVoice::kBass);
+    for(int i=0;i<2;++i) {
+      m.instruments[i].volume=16;m.instruments[i].flags=kInstrumentEnvelope;
+      m.instruments[i].env_sustain=64;m.instruments[i].env_release_ms=50;
+    }
+    for(int nc=0;nc<columns;++nc) for(int r=0;r<4;++r) {
+      Note &n=nc ? extra[r*3+nc-1] : notes[r];
+      if(r==0) n=poly_note(uint8_t(13+nc*5),uint8_t(1+nc%2),0,0);
+      if(r==1) n=poly_note(0,uint8_t(2-nc%2),0,0); // instrument only
+      if(r==2) n=poly_note(uint8_t(15+nc*5),0,0,0); // inherits its own instrument
+      if(r==3 && nc==columns-1) n=poly_note(kNoteOff,0,0,0);
+    }
+    CHECK(module_columns_valid(&m));
+    uint8_t bytes[8192],again[8192];size_t size=0,size2=0;
+    CHECK(module_save(&m,bytes,sizeof bytes,&size));Module loaded;
+    CHECK(module_load(&loaded,bytes,size));CHECK(loaded.note_columns[0]==columns);
+    CHECK(bool(loaded.extra_notes)==(columns>1));
+    CHECK(module_save(&loaded,again,sizeof again,&size2));
+    CHECK(size==size2 && !memcmp(bytes,again,size));
+    for(int r=0;r<4;++r) for(int nc=0;nc<columns;++nc)
+      CHECK(!memcmp(module_note(&m,0,r,0,nc),module_note(&loaded,0,r,0,nc),sizeof(Note)));
+    Player p;CHECK(player_start_result(&p,&loaded)==PlayerStartResult::Ok);
+    for(int r=0;r<4;++r) {
+      p.row=r;player_row(&p,48000);
+      for(int nc=0;nc<columns;++nc) {
+        const Channel *v=player_voice(&p,0,nc);
+        CHECK(v->instrument==(r==0 ? 1+nc%2 : 2-nc%2));
+        CHECK(v->playing);
+        CHECK((v->env_stage==EnvStage::kRelease)==(r==3 && nc==columns-1));
+        if(r==2) CHECK(v->base_period==period_for(note_transposed(&loaded,v,15+nc*5),v->finetune));
+      }
+      for(int nc=columns;nc<4;++nc) CHECK(!player_voice(&p,0,nc)->playing);
+    }
+    // Predicting row boundaries must remain independent of voice layout. Split
+    // at the public countdown too, including its pending zero-frame boundary.
+    static mix::Mixer mx;
+    double reference[8192]={},current[8192]={};
+    // At speed one every executed tick is a row. Observe actual one-frame
+    // rendering, including loops returning to the same position, as the oracle.
+    Player oracle;CHECK(player_start_result(&oracle,&loaded)==PlayerStartResult::Ok);
+    uint32_t starts[6]={};int start_count=0;
+    for(uint32_t frame=0;frame<=4800;++frame) {
+      const uint64_t ticks=oracle.ticks_elapsed;double sink[2]={};
+      render_add(&oracle,sink,1,2,48000);
+      if(oracle.ticks_elapsed!=ticks && start_count<6) starts[start_count++]=frame;
+    }
+    CHECK(start_count==6);
+    for(int partition : {1,64,128,512,137}) {
+      CHECK(player_start_result(&p,&loaded)==PlayerStartResult::Ok);
+      mix::mixer_reset(&mx);CHECK(mix::mixer_config_read(&mx,&loaded));
+      memset(current,0,sizeof current);
+      int call=0;const int irregular[]={1,7,137,512,3,128,64};
+      for(int at=0;at<4096;) {
+        int run=partition==137 ? irregular[call++%7] : partition;
+        const uint32_t until=player_frames_until_row(&p,48000);
+        int next=0;while(next<start_count && starts[next]<uint32_t(at)) ++next;
+        CHECK(next<start_count);
+        if(next<start_count) CHECK(until==starts[next]-uint32_t(at));
+        if(until && until<uint32_t(run)) run=int(until);
+        if(run>4096-at)run=4096-at;
+        mix::mixer_render_add(&mx,&p,current+at*2,run,2,48000);at+=run;
+      }
+      if(partition==1) memcpy(reference,current,sizeof reference);
+      else CHECK(!memcmp(reference,current,sizeof reference));
+      double power=0;for(double value:current) {CHECK(std::isfinite(value));power+=value*value;}
+      CHECK(power>0.01);
+    }
+    Module primary=loaded;primary.note_columns[0]=1;primary.extra_notes=nullptr;
+    CHECK(player_start_result(&p,&primary)==PlayerStartResult::Ok);
+    mix::mixer_reset(&mx);CHECK(mix::mixer_config_read(&mx,&primary));memset(current,0,sizeof current);
+    mix::mixer_render_add(&mx,&p,current,4096,2,48000);
+    const bool lost=hash_stream(reference,8192)!=hash_stream(current,8192);
+    CHECK(lost==(columns>1));if(lost) ++missed;
+    if(columns>1) {
+      extra[0].effect=0xE;extra[0].param=0x50;CHECK(extra_note_reason(&m,extra[0])==NoteColumnReason::Ok);
+      extra[0].param=0x60;CHECK(extra_note_reason(&m,extra[0])==NoteColumnReason::PrimaryColumnOnly);
+      CHECK(!module_save(&m,again,sizeof again,&size2));
+    }
+  }
+  CHECK(missed==3);printf("primary-only control: legacy unchanged, %d polyphonic widths lose audio\n",missed);
+}
+
 // Shared native/WASM mixer suite: independently owned columns and wire format.
 static void test_note_columns() {
   test_note_column_layout();
+  test_note_column_widths();
   printf("bounded note columns: codec, lifetimes, mixing and block partition\n");
   Module m; uint8_t order[1]={0}; Note notes[8]={}; Note extra[24]={};
   int8_t wave[16]; for(int i=0;i<16;++i) wave[i]=i<8 ? 40 : -40;
@@ -158,21 +254,21 @@ static void test_note_columns() {
   channel_note_off(&m,player_voice(&p,0,1));CHECK(player_voice(&p,0,1)->env_stage==EnvStage::kRelease);
   CHECK(p.channels[0].playing);CHECK(p.channels[0].synth_age==bass_age);
   // Interactive rate changes and both tail policies visit every column.
-  for(bool carry : {false,true}) {
+  for(int columns=1;columns<=kMaxNoteColumns;++columns) for(bool carry : {false,true}) {
     ntrk_test::InteractiveFixture fixture(1,1,true,carry);
-    Note plane[12]={};fixture.module.note_columns[0]=4;fixture.module.extra_notes=plane;
-    for(int nc=0;nc<3;++nc) plane[nc]=poly_note(uint8_t(20+nc*3),1,0,0);
+    Note plane[12]={};fixture.module.note_columns[0]=uint8_t(columns);fixture.module.extra_notes=columns>1 ? plane : nullptr;
+    for(int nc=0;nc<columns-1;++nc) plane[nc]=poly_note(uint8_t(20+nc*3),1,0,0);
     RuntimeBinding binding;CHECK(binding.compile(fixture.module,7,fixture.caps,3)==Status::Ok);
     Runtime runtime;Player voices;mix::mixer_reset(&mx);
     CHECK(runtime.bind(binding,voices,mx,7,48000)==Status::Ok);
     double output[256]={};CHECK(runtime.render(output,64,2,48000)==Status::Ok);
-    double steps[4];for(int nc=0;nc<4;++nc) {CHECK(player_voice(&voices,0,nc)->playing);steps[nc]=player_voice(&voices,0,nc)->step;}
+    double steps[4];for(int nc=0;nc<columns;++nc) {CHECK(player_voice(&voices,0,nc)->playing);steps[nc]=player_voice(&voices,0,nc)->step;}
     CHECK(runtime.change_rate(96000)==Status::Ok);
-    for(int nc=0;nc<4;++nc) CHECK(player_voice(&voices,0,nc)->step==steps[nc]/2);
+    for(int nc=0;nc<columns;++nc) CHECK(player_voice(&voices,0,nc)->step==steps[nc]/2);
     CHECK(runtime.stop(carry)==Status::Ok);
     for(int nc=0;nc<4;++nc) CHECK(!player_voice(&voices,0,nc)->playing);
     CHECK(runtime.render(output,64,2,96000)==Status::Ok);
-    plane[0].effect=0xB;CHECK(binding.compile(fixture.module,8,fixture.caps,3)!=Status::Ok);
+    if(columns>1) {plane[0].effect=0xB;CHECK(binding.compile(fixture.module,8,fixture.caps,3)!=Status::Ok);}
   }
   // One-column default emits no NCOL; unused nonzero slots cannot be silently discarded.
   m.instruments[0].type=uint8_t(InstrumentType::kPcm8);

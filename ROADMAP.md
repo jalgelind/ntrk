@@ -44,6 +44,8 @@ reduced to that, it goes on the not-planned list instead.
       row, rendered and fingerprinted. The cross-target coverage module built by
       `ntrk_gen.cc` is the place to grow it, not a second file — it carries both
       effect planes, a macro lane, the voice filter, both sends, NAME and TUNE.
+      Its `--ncol` variant also covers one-to-four note columns with PCM/synth
+      voices, inheritance and independent release; the default stays a legacy control.
       **What it does not reach yet** is everything since: SLIC slices with SLC,
       S and slice stop, ITUN, SMUT, a stereo sample (NTRK-46..48), and MIXR's
       channel strip, routing into a Bus, master slots 2 and 3, the limiter and

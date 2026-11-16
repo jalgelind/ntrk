@@ -56,7 +56,13 @@ $(OUT)/test_ntrk_mix: test_ntrk_mix.cc $(HDRS) $(LIB_CC) $(wildcard test_support
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -O2 -I. -o $@ test_ntrk_mix.cc
 
-test-ntrk-mix: $(OUT)/test_ntrk_mix
+$(OUT)/ntrk_gen: ntrk_gen.cc $(HDRS)
+	@mkdir -p $(OUT)
+	$(CXX) $(CXXFLAGS) -Werror -O2 -I. -o $@ ntrk_gen.cc
+
+test-ntrk-mix: $(OUT)/test_ntrk_mix $(OUT)/ntrk_gen
+	@$(OUT)/ntrk_gen $(OUT)/coverage.ntrk
+	@$(OUT)/ntrk_gen $(OUT)/coverage-columns.ntrk --ncol
 	@$(OUT)/test_ntrk_mix
 
 # Its strongest check reads any real .mod or .xm under testdata/, addressed by a

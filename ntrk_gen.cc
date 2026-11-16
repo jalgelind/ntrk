@@ -2,6 +2,7 @@
 //
 //     c++ -std=c++11 -O2 -o ntrk_gen ntrk_gen.cc
 //     ./ntrk_gen coverage.ntrk
+//     ./ntrk_gen columns.ntrk --ncol
 //
 // **A coverage instrument, not music.** `assets/music/circuit.ntrk` is a v1
 // import: no synth voice, no envelope, no per-voice filter, no second effect
@@ -80,6 +81,7 @@ static const int kMacroSweep = 1;   // absolute: two cutoffs from one byte
 static const int kMacroPush = 2;    // delta: a per-tick step
 
 static ntrk::Note g_notes[kPatterns * kRows * kChannels];
+static ntrk::Note g_extra[kPatterns * kRows * kChannels * 3];
 static ntrk::FxCell g_fx[kPatterns * kRows * kLanes];
 static uint8_t g_order[kOrders];
 
@@ -353,10 +355,33 @@ build_patterns() {
   put_meta(1, 28, kMacroSweep, 0x60);
 }
 
+// Keep the legacy composition intact. Three neighbouring tracks add different
+// widths, instrument-only changes, inherited strikes and independent releases.
+static void
+build_note_columns(ntrk::Module *m) {
+  memset(g_extra, 0, sizeof g_extra);
+  m->extra_notes = g_extra;
+  for (int c = 1; c <= 3; ++c) {
+    m->note_columns[c] = (uint8_t) (c + 1);
+    for (int p = 0; p < kPatterns; ++p) for (int nc = 1; nc <= c; ++nc) {
+      const int instrument = nc == 2 ? kInsBass : kInsPcm;
+      for (int row = 0; row < kRows; row += 8) {
+        const size_t at = ((size_t(p) * kRows + row) * kChannels + c) * 3 + nc - 1;
+        g_extra[at].note = (uint8_t) (25 + nc * 4);
+        g_extra[at].instrument = (uint8_t) instrument;
+        g_extra[at + kChannels * 3].instrument = (uint8_t) instrument;
+        g_extra[at + 2 * kChannels * 3].note = (uint8_t) (27 + nc * 4);
+        g_extra[at + 6 * kChannels * 3].note = ntrk::kNoteOff;
+      }
+    }
+  }
+}
+
 int
 main(int argc, char **argv) {
-  if (argc < 2) {
-    fprintf(stderr, "usage: %s <out.ntrk>\n", argv[0]);
+  const bool columns = argc == 3 && strcmp(argv[2], "--ncol") == 0;
+  if (argc < 2 || argc > 3 || (argc == 3 && !columns)) {
+    fprintf(stderr, "usage: %s <out.ntrk> [--ncol]\n", argv[0]);
     return 2;
   }
 
@@ -394,6 +419,8 @@ main(int argc, char **argv) {
   build_instruments(&module);
   build_macros(&module);
   build_patterns();
+  if (columns)
+    build_note_columns(&module);
 
   size_t wrote = 0;
   if (!ntrk::module_save(&module, g_bytes, sizeof g_bytes, &wrote)) {
@@ -408,6 +435,15 @@ main(int argc, char **argv) {
   if (!ntrk::module_load(&check, g_bytes, wrote)) {
     fprintf(stderr, "the module this wrote does not load back\n");
     return 1;
+  }
+  // Check the additional plane as well as admission; dropping it must not turn
+  // a polyphonic fixture into a successful legacy generator run.
+  for (int c = 0; c < kChannels; ++c) {
+    if (check.note_columns[c] != module.note_columns[c]) return 1;
+    for (int p = 0; p < kPatterns; ++p) for (int r = 0; r < kRows; ++r)
+      for (int nc = 0; nc < module.note_columns[c]; ++nc)
+        if (memcmp(ntrk::module_note(&module,p,r,c,nc),
+                   ntrk::module_note(&check,p,r,c,nc),sizeof(ntrk::Note))) return 1;
   }
 
   FILE *out = fopen(argv[1], "wb");
