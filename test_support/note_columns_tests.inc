@@ -55,6 +55,15 @@ static void test_note_columns() {
   CHECK(module_load(&loaded,bytes,size));CHECK(loaded.note_columns[0]==4);
   CHECK(module_note(&loaded,0,0,0,3)->note==32);CHECK(!module_note(&loaded,0,0,0,4));
   CHECK(module_save(&loaded,again,sizeof again,&size2));CHECK(size==size2);CHECK(!memcmp(bytes,again,size));
+  // The primary keeps unknown-byte compatibility; an extra column does not.
+  notes[1].effect=0xff;
+  CHECK(module_save(&m,again,sizeof again,&size2));CHECK(module_load(&loaded,again,size2));
+  CHECK(module_note(&loaded,0,1,0)->effect==0xff);
+  extra[3]=poly_note(0,0,0xE,0x50);
+  CHECK(module_save(&m,again,sizeof again,&size2));
+  extra[3].param=0x60;CHECK(!module_save(&m,again,sizeof again,&size2));
+  extra[3].effect=0xff;CHECK(!module_save(&m,again,sizeof again,&size2));
+  extra[3]={};notes[1]={};
   const size_t directory=32+1+2*32+8*4+32;
   size_t nc_entry=0;
   for(int i=0;i<read_u16(bytes+26);++i) if(read_u16(bytes+directory+i*12)==kBlockNcol) nc_entry=directory+i*12;

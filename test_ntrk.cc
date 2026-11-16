@@ -9005,8 +9005,40 @@ static void test_imus() {
 
 }
 
+static void test_note_column_reasons() {
+  using namespace ntrk;
+  typedef NoteColumnReason R;
+  printf("note-column reasons: all effect bytes, parameters and legacy admission\n");
+  Module m; m.note_max=36; m.instrument_count=2;
+  const char base[]="1111111101101010", extended[]="1111110101111101";
+  for (int effect=0;effect<256;++effect) for (int param=0;param<256;++param) {
+    Note n;n.note=13;n.instrument=1;n.effect=uint8_t(effect);n.param=uint8_t(param);
+    const bool allowed=effect<16 ? (effect==14 ? extended[param>>4] : base[effect])=='1' : effect<=18;
+    CHECK(extra_note_valid(&m,n)==allowed);
+    CHECK((extra_note_reason(&m,n)==R::Ok)==allowed);
+    for (int column=0;column<4;++column) {
+      const R expected=column==0 || allowed ? R::Ok : effect>18 ? R::UnknownEffect : R::PrimaryColumnOnly;
+      CHECK(note_effect_reason(n.effect,n.param,column)==expected);
+    }
+  }
+  Note n;
+  CHECK(extra_note_reason(nullptr,n)==R::MissingModule); CHECK(!extra_note_valid(nullptr,n));
+  const int ceilings[]={36,96};
+  for (int ceiling : ceilings) {
+    m.note_max=ceiling;
+    n.note=uint8_t(ceiling); CHECK(extra_note_reason(&m,n)==R::Ok);
+    n.note=uint8_t(ceiling==96 ? 98 : ceiling+1); CHECK(extra_note_reason(&m,n)==R::NoteOutOfRange);
+    n.note=kNoteOff; CHECK(extra_note_reason(&m,n)==R::Ok);
+  }
+  n.instrument=2; CHECK(extra_note_reason(&m,n)==R::Ok);
+  n.instrument=3; CHECK(extra_note_reason(&m,n)==R::InstrumentOutOfRange);
+  m.instrument_count=0; n.instrument=0; CHECK(extra_note_reason(&m,n)==R::Ok);
+  n.instrument=1; CHECK(extra_note_reason(&m,n)==R::InstrumentOutOfRange);
+}
+
 int
 main(void) {
+  test_note_column_reasons();
   test_extensions_metadata_counts();
   test_loads();
   test_refusals();

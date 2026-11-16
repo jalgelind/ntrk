@@ -290,6 +290,11 @@ the name in a completion list and the mnemonic in the grid cannot come to mean
 different commands. A meta lane's macro invocations are not in it: a macro's
 name and targets belong to the module, and `macro_describe` is what reads one.
 
+Additional note-column admission is documented beside `extra_note_reason` and
+`note_effect_reason` in `ntrk_types.h`. `extra_note_valid` remains the boolean
+compatibility wrapper. Command enumeration remains independent of eligibility:
+compose a metadata row into its stored effect/parameter before querying it.
+
 ### Instrument parameters
 
 The same question again, one struct along: **what may go in this field.** An

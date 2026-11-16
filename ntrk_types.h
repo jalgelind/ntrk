@@ -810,11 +810,36 @@ inline const Note *module_note(const Module *m,int pattern,int row,int track,int
   const size_t at=(size_t(pattern)*m->rows+row)*m->channels+track;
   return column ? (m->extra_notes ? m->extra_notes+at*3+column-1 : nullptr) : (m->patterns ? m->patterns+at : nullptr);
 }
+// Additional-column admission, shared by cells and command pickers. No storage is
+// changed. The result is a fixed value: no allocation, locks or I/O.
+enum class NoteColumnReason {
+  Ok, MissingModule, NoteOutOfRange, InstrumentOutOfRange,
+  UnknownEffect, PrimaryColumnOnly
+};
+
+// Takes the STORED effect/parameter, not note_fx_table's E0..EF command ids.
+// column is a caller-checked ordinal (0..3); this checks command eligibility,
+// not geometry. Primary commands retain legacy byte masking, including unknown
+// effects. Additional columns require a known voice command. E's high parameter
+// nibble selects its subcommand, so query the fully composed destination cell.
+inline NoteColumnReason note_effect_reason(uint8_t effect,uint8_t param,int column) {
+  if (column==0) return NoteColumnReason::Ok;
+  if (effect>kFxLast) return NoteColumnReason::UnknownEffect;
+  if (effect==8 || effect==0xB || effect==0xD || effect==0xF ||
+      (effect==0xE && ((param>>4)==6 || (param>>4)==8 || (param>>4)==0xE)))
+    return NoteColumnReason::PrimaryColumnOnly;
+  return NoteColumnReason::Ok;
+}
+// Bounds are module-relative; zero inherits an instrument, and note-off is
+// permitted above note_max. With several faults, report the first in this order.
+inline NoteColumnReason extra_note_reason(const Module *m,const Note &n) {
+  if (!m) return NoteColumnReason::MissingModule;
+  if (n.note>m->note_max && n.note!=kNoteOff) return NoteColumnReason::NoteOutOfRange;
+  if (n.instrument>m->instrument_count) return NoteColumnReason::InstrumentOutOfRange;
+  return note_effect_reason(n.effect,n.param,1);
+}
 inline bool extra_note_valid(const Module *m,const Note &n) {
-  if (!m || n.effect>kFxLast || (n.note>m->note_max && n.note!=kNoteOff) || n.instrument>m->instrument_count) return false;
-  if (n.effect==8 || n.effect==0xB || n.effect==0xD || n.effect==0xF) return false;
-  if (n.effect==0xE && ((n.param>>4)==6 || (n.param>>4)==8 || (n.param>>4)==0xE)) return false;
-  return true;
+  return extra_note_reason(m,n)==NoteColumnReason::Ok;
 }
 // Bounded by the fixed track count; safe at audio initialization without reading cells.
 inline bool module_column_layout_valid(const Module *m) {

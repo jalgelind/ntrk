@@ -4598,6 +4598,8 @@ note_fx_describe_extended(TextOut *t, uint8_t param) {
 
 // One row of a command table: everything static about a command number.
 // `mix::CommandInfo` is this resolved for a lane and a mixer.
+// Eligibility is queried with note_effect_reason on the composed stored cell;
+// enumeration itself does not filter commands for a particular note column.
 //
 // **The mnemonic and the name sit in the same row on purpose.** They were two
 // lists before, and two lists of commands are two lists to keep in step.
