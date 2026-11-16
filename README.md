@@ -192,17 +192,13 @@ player.muted[2] = true;                             // mute a channel
 ```
 
 **A `Module` can point at memory you are editing.** `patterns` is a
-`const Note *` — const *pointer*, not const data — so an editor keeps its own
-mutable arrays and points a `Module` at them.
-
-**Cells, yes; counts, no.** Writing notes under a running player is safe by
-construction — the player reads a cell and never remembers one. `rows`,
-`channels`, `order_count` and `pattern_count` are what index the block, and the
-player carries a position built from them between calls. Stop the transport
-before any of them moves. `player_tick` clamps its position against the module it
-is holding rather than trusting it, so breaking the rule costs wrong notes
-instead of a read outside the pattern block — but the notes mean nothing, and it
-is not a licence.
+`const Note *`, a pointer to const data through this view; an editor may own
+mutable backing arrays. Follow the ordinary playback ownership and mutation
+contract above `player_start_ex` in [ntrk.h](ntrk.h): the host serializes access,
+and address stability is not concurrent access safety. That contract covers
+borrowed lifetimes, geometry changes (including note columns), and retirement.
+For Interactive playback, follow the stronger immutable-publication contract
+in [INTERACTIVE.md](INTERACTIVE.md).
 
 Two traps:
 

@@ -690,6 +690,10 @@ struct ExtensionBlock {
   uint32_t bytes = 0;
 };
 
+// A non-owning view: pointer fields borrow order, patterns, extra_notes, fx,
+// instrument data/slices, metadata, extension payloads and the IMUS payload.
+// Copying Module copies those pointers, not their storage or ownership.
+// See player_start_ex in ntrk.h for playback lifetime and mutation rules.
 struct Module {
   // A fresh `Module` already carries a mixer — `mix_default` — because the
   // mixer is no longer an optional feature a file may or may not have used;
@@ -1038,7 +1042,7 @@ struct Player {
   const Module *linear_preview_module = nullptr;
   const uint8_t *linear_preview_imus = nullptr;
   uint32_t linear_preview_bytes = 0;
-  const Module *module = nullptr;
+  const Module *module = nullptr; // borrowed; see player_start_ex's lifetime contract
   int order = 0;
   int row = 0;
   int tick = 0;

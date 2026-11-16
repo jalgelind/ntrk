@@ -2480,20 +2480,30 @@ player_pan_gains(const Player *p, bool stereo, float *left, float *right) {
 
 // Point a player at a module and play it from the top.
 //
-// **The module must outlive the player, and its geometry must not change while
-// the player is running.** `rows`, `channels`, `order_count` and
-// `pattern_count` are what index the pattern block, and the player carries a
-// position into it between calls — so shrinking any of them, or repointing
-// `order`/`patterns` at something smaller, moves the block out from under a
-// position that was legal when it was set. Editing *cells* is safe, and so is
-// anything that leaves the counts alone; only the geometry is dangerous. A
-// caller that reloads or resizes a module stops the transport first and starts
-// again afterwards, which is the whole of the contract.
-//
-// `player_tick` clamps its position against the module it is actually holding
-// rather than trusting it, so a caller that breaks the rule gets wrong notes
-// instead of a read outside the pattern block. That is a backstop, not a
-// licence: the notes it plays are meaningless.
+// Ordinary playback ownership and mutation contract:
+// - Player and Module provide no synchronization. The host must serialize
+//   access to a Player, and serialize writes to its Module or backing storage
+//   with every reader, including render/skip calls and other players/voices.
+//   Keeping these objects on one audio owner is one way to meet this contract.
+// - Valid in-place cell edits between serialized calls may preserve playback
+//   and pointer stability. Stable addresses alone do not make concurrent
+//   reads and writes safe; const views do not make the owner's data immutable.
+// - Player borrows the Module; Module's borrowed storage is listed in
+//   ntrk_types.h. Keep each referenced object and buffer alive at its address
+//   until all consumers have finished using it. player_stop/playing == false
+//   is not a reader-retirement handshake and does not clear Player::module.
+// - Geometry includes rows, channels, order_count, pattern_count, note_columns,
+//   fx_columns and meta_columns, with the corresponding order/patterns,
+//   extra_notes and fx storage. Resizing, replacing or repointing storage can
+//   invalidate borrowed pointers; changing geometry can invalidate positions
+//   and voice state even when addresses stay the same. Quiesce all consumers
+//   before such changes, then reinitialize affected playback state against
+//   valid storage before resuming. Sample/slice replacement also requires
+//   retirement of any voices or other readers that still use the old storage.
+// - Position clamps are defensive checks, not synchronization or protection
+//   against dangling pointers, invalid storage or concurrent mutation.
+// Interactive Runtime has the stronger immutable-publication and generation
+// contract in INTERACTIVE.md; ordinary serialized edits do not relax it.
 inline void
 player_start_ex(Player *player, const Module *module, PlaybackMode mode) {
   if (!player) return;
