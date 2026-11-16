@@ -311,27 +311,23 @@ public:
     const uint32_t grid=q==Quant::Row ? 1u : uint32_t(q==Quant::Beat ? player_->module->rows_per_beat : player_->module->rows_per_bar);
     const uint32_t qgrid=s ? (s->quantization==0 ? 1u : uint32_t(s->quantization==1 ? player_->module->rows_per_beat : player_->module->rows_per_bar)) : 1u;
     if (!grid) return none;
-    const double fpt=frames_per_tick(player_,rate_);
-    const int spd=player_->speed<1 ? 1 : player_->speed;
-    int t=player_->tick, extra=player_->extra_ticks;
-    double u=player_->until_tick; uint64_t f=0;
+    TickCountdown clock(player_,rate_);
     uint32_t k=first_ ? row_offset_ : row_offset_+1; // row that starts at the next tick==0 fire
     for (;;) {
-      const uint64_t w=u<=0.0 ? 0u : uint64_t(frames_until_tick(u));
-      f+=w; u-=double(w);
-      if (t==0) {
+      if (!clock.wait()) return none;
+      const uint64_t f=clock.frames;
+      if (clock.tick==0) {
         bool hit=!s;
         if (s) {
           const bool end=k>=len;
-          if (clock_+f>request_clock_ && pending_>=0 && (end || k%qgrid==0)) hit=true; // new section row 0
+          if ((clock_>request_clock_ || f>request_clock_-clock_) && pending_>=0 && (end || k%qgrid==0)) hit=true; // new section row 0
           else if (end) { if (!s->action) return none; hit=true; }                  // loop wrap row 0
           else hit=k%grid==0;
         }
         if (hit) return f>=none ? none-1 : uint32_t(f);
         ++k;
       }
-      u+=fpt;
-      if (++t>=spd) { if (extra>0) { --extra; t=spd-1; } else t=0; }
+      clock.fire();
     }
   }
 private:

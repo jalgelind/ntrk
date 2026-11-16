@@ -2696,6 +2696,43 @@ frames_per_tick(const Player *player, double sample_rate) {
   return sample_rate * 2.5 / bpm;
 }
 
+// The tick counter transition, shared by playback and clock lookahead. EEx
+// holds the final tick instead of advancing the arrangement.
+inline bool
+advance_tick(int &tick, int speed, int &extra) {
+  if (++tick < speed) return false;
+  if (extra > 0) { --extra; tick = speed - 1; return false; }
+  tick = 0;
+  return true;
+}
+
+// Local clock cursor for queries only. It repeats the render clock's rounding
+// and subtraction before each tick, retaining fractional carry between fires.
+// No Player copy (voices are large), callbacks or future row commands.
+struct TickCountdown {
+  int tick, extra, speed;
+  double residual, duration;
+  uint64_t frames;
+  TickCountdown(const Player *p, double rate)
+      : tick(p->tick), extra(p->extra_ticks), speed(p->speed),
+        residual(p->until_tick), duration(frames_per_tick(p, rate)), frames(0) {}
+  bool wait() {
+    // Keep the shared int ceil conversion defined. Reject nonfinite values too.
+    if (!(duration > 0.0 && duration <= 2147483647.0) ||
+        !(residual >= -2147483647.0 && residual <= 2147483647.0) || speed < 1 || tick < 0 || tick >= speed)
+      return false;
+    const uint64_t n = residual <= 0.0 ? 0u : uint64_t(frames_until_tick(residual));
+    if (frames > UINT64_MAX - n) return false;
+    frames += n;
+    residual -= double(n);
+    return true;
+  }
+  void fire() {
+    residual += duration;
+    advance_tick(tick, speed, extra);
+  }
+};
+
 // Equal temperament, computed, anchored on C-1's historical period.
 //
 // **The five entries that made ProTracker's table not derivable are exactly the
@@ -3715,47 +3752,73 @@ player_effects(Player *player, double sample_rate) {
   }
 }
 
-// Advance the row and, when the pattern runs out, the order. Jumps written by
-// this row are applied here, after it has played, so a break and a jump on the
-// same row combine the way a tracker's do.
+// Position selected by the final tick, before its audio has finished. A break
+// and jump on the same row combine; the next row is processed only after the
+// tick residual is spent. Shared by advancement and next-row stop prediction.
+inline bool
+player_next_position(const Player *player, int &order, int &row) {
+  const Module *m = player->module;
+  order = player->order;
+  row = player->row;
+  if (player->jump_order >= 0 || player->break_row >= 0) {
+    order = player->jump_order >= 0 ? player->jump_order : order + 1;
+    row = player->break_row >= 0 ? player->break_row : 0;
+    if (row >= m->rows) row = 0;
+  } else if (++row >= m->rows) {
+    row = 0;
+    ++order;
+  }
+  // The host's order loop wins over jumps, breaks and the end-of-song wrap.
+  if (player->loop_last >= 0 && (order > player->loop_last || order < player->loop_first)) {
+    order = player->loop_first;
+    row = 0;
+  }
+  if (order >= m->order_count) {
+    if (!player->loop) return false;
+    order = m->restart;
+    row = 0;
+  }
+  return true;
+}
+
 inline void
 player_advance(Player *player) {
+  int order, row;
+  const bool next = player_next_position(player, order, row);
+  player->order = order;
+  player->row = row;
+  player->jump_order = player->break_row = -1;
+  if (!next) player_stop(player);
+}
+
+// For an initialized Player, output frames until the next player_row call,
+// before that frame's audio.
+// Zero includes a pending startup/seek row; tick==0 with positive until_tick
+// still waits for the previous tick's audio. This is not a position-change test:
+// a one-row loop processes another row even when order and row stay unchanged.
+// UINT32_MAX means stopped, nonsequencing, invalid clock or no representable
+// next row (including a terminal advance). No arbitrary future rows are read.
+// Use the renderer's effective rate; a subsequent edit, seek, stop or rate
+// change invalidates the answer. Rendering must be authorized by the caller:
+// this query never calls runtime_allowed or grants a playback capability.
+// Const and allocation-free, but NOT cross-thread safe: the host serializes
+// access under player_start_result's ownership contract. It consumes nothing.
+inline uint32_t
+player_frames_until_row(const Player *player, double rate) {
+  if (!player || !player->module || !player->playing || !player->sequencing)
+    return UINT32_MAX;
   const Module *m = player->module;
-
-  if (player->jump_order >= 0 || player->break_row >= 0) {
-    const int next_order =
-        player->jump_order >= 0 ? player->jump_order : player->order + 1;
-    const int next_row = player->break_row >= 0 ? player->break_row : 0;
-    player->jump_order = -1;
-    player->break_row = -1;
-    player->order = next_order;
-    player->row = next_row >= m->rows ? 0 : next_row;
-  } else {
-    player->row++;
-    if (player->row >= m->rows) {
-      player->row = 0;
-      player->order++;
-    }
+  if (m->order_count < 1 || m->pattern_count < 1 || m->rows < 1 || m->channels < 1)
+    return UINT32_MAX;
+  if (player->tick != 0) {
+    int order, row;
+    if (!player_next_position(player, order, row)) return UINT32_MAX;
   }
-
-  // **The host's loop, and it wins over everything above.** A `Bxx` that jumps
-  // out of the section, a `Dxx` break at its last row, and the ordinary walk off
-  // the end all land here, and a section a jump could escape is not a section.
-  // Checked before the end-of-song wrap so a range ending on the last entry
-  // loops rather than restarting the tune.
-  if (player->loop_last >= 0 &&
-      (player->order > player->loop_last || player->order < player->loop_first)) {
-    player->order = player->loop_first;
-    player->row = 0;
-  }
-
-  if (player->order >= m->order_count) {
-    if (!player->loop) {
-      player_stop(player);
-      return;
-    }
-    player->order = m->restart;
-    player->row = 0;
+  TickCountdown clock(player, rate);
+  for (;;) {
+    if (!clock.wait() || clock.frames >= UINT32_MAX) return UINT32_MAX;
+    if (!clock.tick) return uint32_t(clock.frames);
+    clock.fire();
   }
 }
 
@@ -3789,22 +3852,8 @@ player_tick(Player *player, double sample_rate) {
   else
     player_effects(player, sample_rate);
 
-  player->tick++;
-
-  // EEx holds the row by extending it, so the effects on it keep running and
-  // the notes are not struck again. Spending the extra ticks here rather than
-  // repeating the row is what gets that: a repeat would call `player_row` and
-  // retrigger everything, which is a stutter and not a delay.
-  if (player->tick >= player->speed && player->extra_ticks > 0) {
-    player->extra_ticks--;
-    player->tick = player->speed - 1;
-    return;
-  }
-
-  if (player->tick >= player->speed) {
-    player->tick = 0;
+  if (advance_tick(player->tick, player->speed, player->extra_ticks))
     player_advance(player);
-  }
 }
 
 // One frame of an instrument, on the 8-bit scale the mixer's `1 / 128` expects.

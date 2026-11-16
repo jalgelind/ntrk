@@ -28,6 +28,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <initializer_list>
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -9103,8 +9104,109 @@ static void test_note_column_reasons() {
   n.instrument=1; CHECK(extra_note_reason(&m,n)==R::InstrumentOutOfRange);
 }
 
+// An ordinary row oracle observes a C10 command actually executed by player_row.
+// It does not infer starts from displayed indices (which lead the audio and can
+// stay unchanged through a loop), nor does it call the countdown under test.
+static void test_row_countdown() {
+  using namespace ntrk;
+  const int horizon = 24000;
+  static double reference[horizon * 2], rendered[horizon * 2];
+  static int next[horizon];
+  static bool starts[horizon];
+  const int partitions[] = {1, 64, 128, 512, 97};
+  const int irregular[] = {1, 7, 97, 512, 3, 128, 64};
+  uint64_t checks = 0, biased = 0, index_misses = 0;
+  for (int scenario = 0; scenario < 9; ++scenario) for (double rate : {44100., 48000.125, 96000., 100.}) {
+    Note notes[4 * kMaxChannels] = {};
+    uint8_t orders[] = {0, 0};
+    int8_t pcm[] = {90, -90, 40, -40};
+    Module m;
+    m.channels = kMaxChannels; m.rows = scenario == 1 || scenario == 3 ? 1 : 4;
+    m.pattern_count = 1; m.order_count = 2; m.patterns = notes; m.order = orders;
+    m.speed = scenario == 1 || scenario == 3 ? 1 : 3; m.bpm = 137;
+    m.instrument_count = 1;
+    m.instruments[0].data = pcm; m.instruments[0].length = 4; m.instruments[0].loop_len = 4;
+    m.instruments[0].volume = 48;
+    for (int r = 0; r < m.rows; ++r) {
+      notes[r * kMaxChannels].note = 25; notes[r * kMaxChannels].instrument = 1;
+      notes[r * kMaxChannels + 1].effect = 0xC; notes[r * kMaxChannels + 1].param = 16;
+    }
+    if (scenario == 2 || scenario == 3) { notes[0].effect = 0xE; notes[0].param = 0xE2; }
+    if (scenario == 4) { notes[3 * kMaxChannels].effect = 0xB; notes[3 * kMaxChannels].param = 0; }
+    if (scenario == 5) { notes[kMaxChannels].effect = 0xD; notes[kMaxChannels].param = 2; }
+    if (scenario == 8) {
+      notes[kMaxChannels].effect = 0xF; notes[kMaxChannels].param = 173;
+      notes[2 * kMaxChannels].effect = 0xF; notes[2 * kMaxChannels].param = 1;
+    }
+    const auto init = [&](Player &p) {
+      player_start(&p, &m);
+      if (scenario == 6) p.loop = false;
+      if (scenario == 7) CHECK(player_loop_range(&p, 0, 0));
+      if (scenario == 1) CHECK(player_loop_range(&p, 0, 0));
+    };
+    Player oracle; init(oracle);
+    memset(reference, 0, sizeof(reference));
+    for (int f = 0; f < horizon; ++f) {
+      oracle.channels[1].volume = 17;
+      const int row = oracle.row, order = oracle.order;
+      render_add(&oracle, reference + f * 2, 1, 2, rate);
+      starts[f] = oracle.channels[1].volume == 16;
+      if (starts[f] && row == oracle.row && order == oracle.order) ++index_misses;
+    }
+    int upcoming = -1;
+    for (int f = horizon - 1; f >= 0; --f) { if (starts[f]) upcoming = f; next[f] = upcoming; }
+    for (int partition : partitions) {
+      Player p; init(p); memset(rendered, 0, sizeof(rendered));
+      int call = 0;
+      for (int f = 0; f < horizon;) {
+        const uint64_t ticks = p.ticks_elapsed; const double residual = p.until_tick;
+        const uint32_t got = player_frames_until_row(&p, rate);
+        CHECK(ticks == p.ticks_elapsed && residual == p.until_tick);
+        if (next[f] >= 0) {
+          const uint32_t want = uint32_t(next[f] - f);
+          CHECK(got == want); ++checks;
+          if (got + 1 != want) ++biased; // the oracle must reject a one-frame error
+        } else if (!oracle.playing) { CHECK(got == UINT32_MAX); ++checks; }
+        int n = partition == 97 ? irregular[call++ % 7] : partition;
+        if (n > horizon - f) n = horizon - f;
+        render_add(&p, rendered + f * 2, n, 2, rate); f += n;
+      }
+      CHECK(memcmp(reference, rendered, sizeof(reference)) == 0);
+    }
+  }
+  CHECK(checks > 0 && biased > 0 && index_misses > 0);
+  Player p; CHECK(player_frames_until_row(nullptr, 48000) == UINT32_MAX);
+  CHECK(player_frames_until_row(&p, 48000) == UINT32_MAX);
+  Spec spec; build(spec, false); Module m; start_on(&m, &p);
+  CHECK(player_frames_until_row(&p, 48000) == 0);
+  double out[2] = {}; render_add(&p, out, 1, 2, 48000);
+  CHECK(player_seek(&p, 0, 1)); CHECK(player_frames_until_row(&p, 48000) == 0);
+  p.until_tick = .25; CHECK(player_frames_until_row(&p, 48000) == 1);
+  p.sequencing = false; CHECK(player_frames_until_row(&p, 48000) == UINT32_MAX); p.sequencing = true;
+  CHECK(player_frames_until_row(&p, 0) == UINT32_MAX);
+  CHECK(player_frames_until_row(&p, -1) == UINT32_MAX);
+  CHECK(player_frames_until_row(&p, HUGE_VAL) == UINT32_MAX);
+  CHECK(player_frames_until_row(&p, NAN) == UINT32_MAX);
+  p.until_tick = HUGE_VAL; CHECK(player_frames_until_row(&p, 48000) == UINT32_MAX);
+  p.until_tick = NAN; CHECK(player_frames_until_row(&p, 48000) == UINT32_MAX);
+  p.until_tick = 1; p.tick = 1; p.speed = 6;
+  CHECK(player_frames_until_row(&p, 1e11) == UINT32_MAX); // sum beyond the public range
+  player_stop(&p); CHECK(player_frames_until_row(&p, 48000) == UINT32_MAX);
+  CHECK(player_start_result(&p, &m) == PlayerStartResult::Ok);
+  int calls = 0;
+  p.runtime_cookie = &calls;
+  p.runtime_allowed = [](const Player *, const void *cookie) -> bool {
+    ++*static_cast<int *>(const_cast<void *>(cookie)); return false;
+  };
+  m.imus = g_bytes; m.imus_bytes = 1; // timing does not invoke playback authorization
+  CHECK(player_frames_until_row(&p, 48000) == 0 && calls == 0);
+  printf("row countdown: %llu oracle checks, %llu biased answers rejected, %llu same-position starts\n",
+      (unsigned long long)checks, (unsigned long long)biased, (unsigned long long)index_misses);
+}
+
 int
 main(void) {
+  test_row_countdown();
   test_player_start_result();
   test_note_column_reasons();
   test_extensions_metadata_counts();

@@ -189,6 +189,8 @@ static SyncRun sync_run(double rate,int speed,int bpm,int rpb,int chunk,uint64_t
       uint64_t want=~0ull;
       for (size_t i=0;i<starts.size();++i) if (starts[i].clock>=clock && starts[i].ro%grids[q]==0) { want=starts[i].clock-clock; break; }
       const uint32_t got=a.frames_until(qs[q])+bias;
+      // These sections loop; Row has no stop policy to override the Player clock.
+      if (q==0) CHECK(a.frames_until(qs[q])==player_frames_until_row(&pa,cur));
       res.hash^=got; res.hash*=1099511628211ull; ++res.checks;
       // A later request or rate change legitimately moves the boundary: only compare absent those.
       bool later=false; for (size_t i=0;i<acts.size();++i) if (acts[i].kind!=1 && acts[i].clock>clock && acts[i].clock<=clock+want) later=true;

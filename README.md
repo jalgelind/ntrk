@@ -202,6 +202,13 @@ borrowed lifetimes, geometry changes (including note columns), and retirement.
 For Interactive playback, follow the stronger immutable-publication contract
 in [INTERACTIVE.md](INTERACTIVE.md).
 
+`player_frames_until_row(&player, rate)` lets an ordinary host split audio at
+its next processed row, including a repeat at the same position. The exact
+clock, unavailable-result and serialized-access contract is in [ntrk.h](ntrk.h)
+above the query. Use the mixer's effective rate when rendering through the
+mixer. Interactive section, beat and bar policies remain with
+`Runtime::frames_until` in [INTERACTIVE.md](INTERACTIVE.md).
+
 Two traps:
 
 - **`player_seek` resets speed and tempo to the module's own.** Those are things
